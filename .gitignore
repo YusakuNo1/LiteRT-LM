@@ -1,2 +1,6 @@
+# Puget Voice
+build-puget-voice-macos-arm64/
+
+
 /MODULE.bazel.lock
 /bazel-*
