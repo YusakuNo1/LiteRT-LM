@@ -27,7 +27,7 @@ from litert_lm_cli import model
 
 try:
   # pylint: disable=g-import-not-at-top
-  from litert_lm.adb import adb_benchmark  # pytype: disable=import-error
+  from litert_lm.adb import adb_benchmark  # pyrefly: ignore[missing-import]
 
   _HAS_ADB = True
 except ImportError:
@@ -41,8 +41,7 @@ def run_benchmark(
     decode_tokens: int = 256,
     is_android: bool = False,
     backend: str | None = None,
-    speculative_decoding: bool | None = None,
-    enable_speculative_decoding: bool | None = None,
+    speculative_decoding: str | None = None,
     max_num_tokens: int | None = None,
     cache: str | None = None,
     cpu_thread_count: int | None = None,
@@ -54,9 +53,6 @@ def run_benchmark(
     skip_warmup: bool = False,
 ) -> None:
   """Benchmarks the model."""
-  if speculative_decoding is None:
-    speculative_decoding = enable_speculative_decoding
-
   if not model_obj.exists():
     click.echo(
         click.style(
@@ -68,8 +64,13 @@ def run_benchmark(
     return
 
   try:
-    speculative_decoding = model.resolve_config_option(
-        speculative_decoding, model_obj, "speculative_decoding"
+    speculative_decoding = common.normalize_speculative_decoding(
+        model.resolve_config_option(
+            speculative_decoding, model_obj, "speculative_decoding"
+        )
+    )
+    speculative_decoding_config = model.speculative_decoding_config_from_mode(
+        speculative_decoding
     )
     cache = model.resolve_config_option(cache, model_obj, "cache")
     activation_data_type_opt = model.resolve_config_option(
@@ -117,7 +118,7 @@ def run_benchmark(
           prefill_tokens=prefill_tokens,
           decode_tokens=decode_tokens,
           cache_dir=cache_dir_val,
-          enable_speculative_decoding=speculative_decoding,
+          speculative_decoding_config=speculative_decoding_config,
           max_num_tokens=max_num_tokens,
           activation_data_type=activation_data_type_val,
           use_ringbuffers_local_attention=ringbuffers_local_attention,
@@ -134,9 +135,7 @@ def run_benchmark(
     if max_num_tokens is not None:
       click.echo(f"Max number of tokens       : {max_num_tokens}")
 
-    spec_dec_str = "auto"
-    if speculative_decoding is not None:
-      spec_dec_str = "true" if speculative_decoding else "false"
+    spec_dec_str = speculative_decoding or "auto"
     click.echo(f"Cache                      : {cache or 'disk'}")
     click.echo(f"Speculative decoding       : {spec_dec_str}")
     if is_android:
@@ -144,14 +143,15 @@ def run_benchmark(
 
     info_list = []
 
-    if not skip_warmup:
-      click.echo("Running warmup..")
-      benchmark_obj.run()
+    with benchmark_obj:
+      if not skip_warmup:
+        click.echo("Running warmup..")
+        benchmark_obj.run()
 
-    for i in range(runs):
-      click.echo(f"Running iteration {i + 1} of {runs}..")
-      result = benchmark_obj.run()
-      info_list.append(result)
+      for i in range(runs):
+        click.echo(f"Running iteration {i + 1} of {runs}..")
+        result = benchmark_obj.run()
+        info_list.append(result)
 
     if not info_list:
       raise RuntimeError("No benchmark info collected")
@@ -246,8 +246,7 @@ def benchmark(
     decode_tokens: int = 256,
     backend: str | None = None,
     android: bool = False,
-    speculative_decoding: bool | None = None,
-    enable_speculative_decoding: bool | None = None,
+    speculative_decoding: str | None = None,
     verbose: bool = False,
     from_huggingface_repo: str | None = None,
     huggingface_token: str | None = None,
@@ -271,10 +270,8 @@ def benchmark(
     decode_tokens: The number of tokens to decode.
     backend: The backend to use (cpu, gpu or npu).
     android: Run on Android via ADB.
-    speculative_decoding: Speculative decoding mode (True, False, or None for
-      auto).
-    enable_speculative_decoding: Speculative decoding mode (True, False, or None
-      for auto).
+    speculative_decoding: Speculative decoding mode ("on", "off", "adaptive", or
+      None for the model's configured value).
     verbose: Whether to enable verbose logging.
     from_huggingface_repo: The HuggingFace repository ID.
     huggingface_token: The HuggingFace API token.
@@ -291,9 +288,6 @@ def benchmark(
     runs: The number of benchmarking iterations to run and average.
     skip_warmup: Skip the warmup run before benchmarking.
   """
-  if speculative_decoding is None:
-    speculative_decoding = enable_speculative_decoding
-
   if verbose:
     litert_lm.set_min_log_severity(litert_lm.LogSeverity.VERBOSE)
 
@@ -326,7 +320,7 @@ def benchmark(
       decode_tokens=decode_tokens,
       is_android=android,
       backend=backend,
-      enable_speculative_decoding=speculative_decoding,
+      speculative_decoding=speculative_decoding,
       max_num_tokens=max_num_tokens,
       cache=cache,
       cpu_thread_count=cpu_thread_count,

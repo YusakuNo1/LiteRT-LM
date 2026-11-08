@@ -32,8 +32,8 @@ namespace litert::lm {
 namespace {
 
 constexpr LazyRE2 kLoRAInputNamePattern = {
-    "^(?:(?:query|key|value|post)_w_prime_(?:left|right)|"
-    "lora_atten_(?:q|k|v|o)_(?:a|b)_prime_weight)_\\d+$|"
+    "^(?:(?:query|key|value|post)_w_prime_(?:left|right)_?\\d+|"
+    "lora_atten_(?:q|k|v|o)_(?:a|b)_prime_weight_\\d+)$|"
     "^transformer\\.layer_\\d+\\.attn\\."
     "(?:q|k|v|attn_vec_einsum)\\.w_prime_(?:left|right)$"};
 
@@ -81,6 +81,10 @@ MemoryMappedFileWithAutoAlignment::Create(ScopedFile::PlatformFile file,
 // "lora_atten_(q|k|v|o)_(a|b)_prime_weight_[0-num_layers)".
 bool IsLoRAInputName(absl::string_view name) {
   return RE2::FullMatch(name, *kLoRAInputNamePattern);
+}
+
+bool IsLoRABufferInputName(absl::string_view name) {
+  return IsLoRAInputName(name) || name == "lora_param_tensor";
 }
 
 }  // namespace litert::lm

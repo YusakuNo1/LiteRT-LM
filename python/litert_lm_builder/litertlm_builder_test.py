@@ -23,9 +23,13 @@ from litert_lm_builder import litertlm_builder
 from litert_lm_builder import litertlm_core
 from litert_lm_builder import litertlm_header_schema_py_generated as schema
 from litert_lm_builder import litertlm_peek
+from runtime.proto import any2any_metadata_pb2
 from runtime.proto import embedding_metadata_pb2
 from runtime.proto import executor_metadata_pb2
 from runtime.proto import llm_metadata_pb2
+from runtime.proto import speech2text_metadata_pb2
+from runtime.proto import text2image_metadata_pb2
+from runtime.proto import text2speech_metadata_pb2
 
 _TOML_TEMPLATE = """
 # A template for testing the TOML parser.
@@ -281,11 +285,43 @@ class LitertlmBuilderTest(parameterized.TestCase):
     with self.assertRaises(AssertionError):
       builder.add_executor_metadata(metadata_path)
 
+  def test_add_embedding_metadata_binary(self):
+    """Tests that Embedding metadata can be added from a binary proto file."""
+    embedding_metadata = embedding_metadata_pb2.EmbeddingMetadata()
+    embedding_metadata.embedding_model_type.embedding_gemma_v2.patch_width = 16
+    bin_proto = embedding_metadata.SerializeToString()
+    metadata_path = self._create_dummy_file("embedding.pb", bin_proto)
+
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self._add_system_metadata(builder)
+    builder.add_embedding_metadata(metadata_path)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("patch_width: 16", ss)
+    self.assertIn("Sections (1)", ss)
+
+  def test_add_embedding_metadata_text(self):
+    """Tests that Embedding metadata can be added from a text proto file."""
+    embedding_metadata = embedding_metadata_pb2.EmbeddingMetadata()
+    embedding_metadata.embedding_model_type.embedding_gemma_v2.patch_width = 16
+    text_proto = text_format.MessageToString(embedding_metadata)
+    metadata_path = self._create_dummy_file(
+        "embedding.textproto", text_proto.encode("utf-8")
+    )
+
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self._add_system_metadata(builder)
+    builder.add_embedding_metadata(metadata_path)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("patch_width: 16", ss)
+    self.assertIn("Sections (1)", ss)
+
   @parameterized.named_parameters(
-      ("prefill_decode", litertlm_builder.TfLiteModelType.PREFILL_DECODE),
-      ("mtp_drafter", litertlm_builder.TfLiteModelType.MTP_DRAFTER),
+      ("prefill_decode", "prefill_decode", "tf_lite_prefill_decode"),
+      ("mtp_drafter", "mtp_drafter", "tf_lite_mtp_drafter"),
+      ("uppercase", "PREFILL_DECODE", "tf_lite_prefill_decode"),
+      ("wire_string", "tf_lite_mtp_drafter", "tf_lite_mtp_drafter"),
   )
-  def test_add_tflite_model(self, model_type: litertlm_builder.TfLiteModelType):
+  def test_add_tflite_model(self, model_type: str, expected_wire_str: str):
     """Tests that a TFLite model can be added correctly."""
     tflite_path = self._create_dummy_file(
         "model.tflite", b"dummy tflite content"
@@ -307,7 +343,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     ss = self._build_and_read_litertlm(builder)
     self.assertIn("Sections (1)", ss)
     self.assertIn("Data Type:    TFLiteModel", ss)
-    self.assertIn(f"Key: model_type, Value (String): {model_type.value}", ss)
+    self.assertIn(f"Key: model_type, Value (String): {expected_wire_str}", ss)
     self.assertIn("Key: test_key, Value (String): test_value", ss)
 
   def test_add_tflite_model_with_backend_constraint(self):
@@ -320,7 +356,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     self._add_system_metadata(builder)
     builder.add_tflite_model(
         tflite_path,
-        litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+        "prefill_decode",
         backend_constraint="gpu",
     )
     ss = self._build_and_read_litertlm(builder)
@@ -339,7 +375,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     self._add_system_metadata(builder)
     builder.add_tflite_model(
         tflite_path,
-        litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+        "prefill_decode",
         backend_constraint="cpu, GPU",
     )
     ss = self._build_and_read_litertlm(builder)
@@ -360,7 +396,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "Invalid backend constraint"):
       builder.add_tflite_model(
           tflite_path,
-          litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+          "prefill_decode",
           backend_constraint="foo, bar",
       )
 
@@ -373,7 +409,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     self._add_system_metadata(builder)
     builder.add_tflite_model(
         tflite_path,
-        litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW,
+        "audio_encoder_hw",
         backend_constraint="cpu",
     )
 
@@ -381,9 +417,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     ss = self._build_and_read_litertlm(builder)
     self.assertIn("Key: backend_constraint, Value (String): npu", ss)
 
-    builder.remove_backend_constraint(
-        litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW
-    )
+    builder.remove_backend_constraint("audio_encoder_hw")
     ss = self._build_and_read_litertlm(builder)
     self.assertNotIn("Key: backend_constraint", ss)
 
@@ -403,7 +437,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     self._add_system_metadata(builder)
     builder.add_tflite_model(
         tflite_path,
-        litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+        "prefill_decode",
         prefer_activation_type="fp16",
     )
     ss = self._build_and_read_litertlm(builder)
@@ -427,7 +461,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     with self.assertRaises(ValueError):
       builder.add_tflite_model(
           tflite_path,
-          litertlm_builder.TfLiteModelType.EMBEDDER,
+          "embedder",
           additional_metadata=additional_metadata,
       )
 
@@ -441,7 +475,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     self._add_system_metadata(builder)
     builder.add_tflite_weights(
         tflite_weights_path,
-        litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+        "prefill_decode",
         additional_metadata=[
             litertlm_builder.Metadata(
                 key="test_key",
@@ -607,12 +641,8 @@ class LitertlmBuilderTest(parameterized.TestCase):
     builder = litertlm_builder.LitertLmFileBuilder()
     self._add_system_metadata(builder)
     builder.add_sentencepiece_tokenizer(sp_path)
-    builder.add_tflite_model(
-        tflite_path, model_type=litertlm_builder.TfLiteModelType.EMBEDDER
-    )
-    builder.add_tflite_model(
-        tflite_path, model_type=litertlm_builder.TfLiteModelType.PREFILL_DECODE
-    )
+    builder.add_tflite_model(tflite_path, model_type="embedder")
+    builder.add_tflite_model(tflite_path, model_type="prefill_decode")
     builder.add_llm_metadata(metadata_path)
     builder.add_executor_metadata(executor_metadata_path)
     ss = self._build_and_read_litertlm(builder)
@@ -719,9 +749,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     builder = litertlm_builder.LitertLmFileBuilder()
     self._add_system_metadata(builder)
     tflite_path = self._create_dummy_file("model.tflite", b"dummy content")
-    builder.add_tflite_model(
-        tflite_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
-    )
+    builder.add_tflite_model(tflite_path, "prefill_decode")
     litertlm_path = os.path.join(self.temp_dir, "test.litertlm")
     with litertlm_core.open_file(litertlm_path, "wb") as f:
       builder.build(f)
@@ -750,9 +778,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     builder = litertlm_builder.LitertLmFileBuilder()
     self._add_system_metadata(builder)
     tflite_path = self._create_dummy_file("model.tflite", b"dummy content")
-    builder.add_tflite_model(
-        tflite_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
-    )
+    builder.add_tflite_model(tflite_path, "prefill_decode")
     litertlm_path = os.path.join(self.temp_dir, "test_orig.litertlm")
     with litertlm_core.open_file(litertlm_path, "wb") as f:
       builder.build(f)
@@ -778,9 +804,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     builder = litertlm_builder.LitertLmFileBuilder()
     self._add_system_metadata(builder)
     tflite_path = self._create_dummy_file("model.tflite", b"dummy content")
-    builder.add_tflite_model(
-        tflite_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
-    )
+    builder.add_tflite_model(tflite_path, "prefill_decode")
     builder.add_llm_metadata(meta_path)
     orig_litertlm_path = os.path.join(self.temp_dir, "orig.litertlm")
     with litertlm_core.open_file(orig_litertlm_path, "wb") as f:
@@ -817,9 +841,7 @@ class LitertlmBuilderTest(parameterized.TestCase):
     tflite_path = self._create_dummy_file(
         "model_no_jinja.tflite", b"dummy content"
     )
-    builder.add_tflite_model(
-        tflite_path, litertlm_builder.TfLiteModelType.PREFILL_DECODE
-    )
+    builder.add_tflite_model(tflite_path, "prefill_decode")
     builder.add_llm_metadata(meta_path)
     model_path = os.path.join(self.temp_dir, "no_jinja.litertlm")
     with litertlm_core.open_file(model_path, "wb") as f:
@@ -873,79 +895,146 @@ data_path = "{tflite_name}"
       (
           "prefill_decode_lowercase",
           "prefill_decode",
-          litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+          "tf_lite_prefill_decode",
       ),
       (
           "prefill_decode_uppercase",
           "PREFILL_DECODE",
-          litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+          "tf_lite_prefill_decode",
       ),
       (
           "mtp_drafter",
           "mtp_drafter",
-          litertlm_builder.TfLiteModelType.MTP_DRAFTER,
+          "tf_lite_mtp_drafter",
       ),
       (
           "vision_encoder",
           "vision_encoder",
-          litertlm_builder.TfLiteModelType.VISION_ENCODER,
+          "tf_lite_vision_encoder",
       ),
   )
-  def test_get_enum_from_tf_free_value_without_prefix(
-      self, input_val: str, expected_enum: litertlm_builder.TfLiteModelType
+  def test_add_tflite_model_with_tf_free_string(
+      self, input_val: str, expected_wire_str: str
   ):
-    self.assertEqual(
-        litertlm_builder.TfLiteModelType.get_enum_from_tf_free_value(input_val),
-        expected_enum,
+    tflite_path = self._create_dummy_file(
+        "model.tflite", b"dummy tflite content"
     )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self._add_system_metadata(builder)
+    builder.add_tflite_model(tflite_path, input_val)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn(f"Key: model_type, Value (String): {expected_wire_str}", ss)
 
   @parameterized.named_parameters(
       (
           "prefill_decode_with_prefix",
           "tf_lite_prefill_decode",
-          litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+          "tf_lite_prefill_decode",
       ),
       (
           "prefill_decode_with_prefix_upper",
           "TF_LITE_PREFILL_DECODE",
-          litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+          "tf_lite_prefill_decode",
       ),
       (
           "embedder_with_prefix",
           "tf_lite_embedder",
-          litertlm_builder.TfLiteModelType.EMBEDDER,
+          "tf_lite_embedder",
       ),
       (
           "mtp_drafter_with_prefix",
           "tf_lite_mtp_drafter",
-          litertlm_builder.TfLiteModelType.MTP_DRAFTER,
+          "tf_lite_mtp_drafter",
       ),
   )
-  def test_get_enum_from_tf_free_value_with_prefix(
-      self, input_val: str, expected_enum: litertlm_builder.TfLiteModelType
+  def test_add_tflite_model_with_prefixed_string(
+      self, input_val: str, expected_wire_str: str
   ):
+    tflite_path = self._create_dummy_file(
+        "model.tflite", b"dummy tflite content"
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self._add_system_metadata(builder)
     with self.assertLogs(level="WARNING") as cm:
-      result = litertlm_builder.TfLiteModelType.get_enum_from_tf_free_value(
-          input_val
-      )
-    self.assertEqual(result, expected_enum)
+      builder.add_tflite_model(tflite_path, input_val)
     self.assertTrue(
         any(
             f"Input '{input_val}' already starts with 'tf_lite_'." in output
             for output in cm.output
         )
     )
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn(f"Key: model_type, Value (String): {expected_wire_str}", ss)
 
-  def test_get_enum_from_tf_free_value_invalid_raises_error(self):
+  def test_legacy_tflite_model_types_are_supported(self):
+    """Tests that every model type of the removed Python enum is supported."""
+    all_model_types = litertlm_builder.get_all_tflite_model_types()
+    for model_type in (
+        "prefill_decode",
+        "embedder",
+        "per_layer_embedder",
+        "aux",
+        "audio_frontend",
+        "audio_encoder_hw",
+        "audio_adapter",
+        "end_of_audio",
+        "vision_encoder",
+        "vision_adapter",
+        "end_of_vision",
+        "artisan_text_decoder",
+        "mtp_drafter",
+        "mtp_aux",
+        "text_encoder",
+    ):
+      with self.subTest(model_type=model_type):
+        self.assertIn(model_type, all_model_types)
+
+  def test_add_tflite_model_with_llm_proto_enum(self):
+    """Tests that an LlmMetadata proto enum value resolves to its wire string."""
+    tflite_path = self._create_dummy_file(
+        "model.tflite", b"dummy tflite content"
+    )
+    llm_metadata_path = self._create_dummy_file(
+        "llm_metadata.pb", llm_metadata_pb2.LlmMetadata().SerializeToString()
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self._add_system_metadata(builder)
+    builder.add_llm_metadata(llm_metadata_path)
+    builder.add_tflite_model(
+        tflite_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
+    )
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("Key: model_type, Value (String): tf_lite_prefill_decode", ss)
+
+  def test_add_tflite_model_with_unknown_model_type_raises_error(self):
+    """Tests that unknown model type strings are rejected."""
+    tflite_path = self._create_dummy_file(
+        "model.tflite", b"dummy tflite content"
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
     for invalid_val in (
         "nonexistent_model_type",
         "tf_lite_nonexistent_model_type",
     ):
       with self.subTest(invalid_val=invalid_val):
-        with self.assertRaises(ValueError):
-          litertlm_builder.TfLiteModelType.get_enum_from_tf_free_value(
-              invalid_val
-          )
+        with self.assertRaisesRegex(ValueError, "Unknown TfLiteModelType"):
+          builder.add_tflite_model(tflite_path, invalid_val)
+
+  def test_add_tflite_model_with_prefixed_string_logs_warning(self):
+    """Tests that a `tf_lite_`-prefixed model type string logs a warning."""
+    tflite_path = self._create_dummy_file(
+        "model.tflite", b"dummy tflite content"
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    with self.assertLogs(level="WARNING") as cm:
+      builder.add_tflite_model(tflite_path, "TF_LITE_PREFILL_DECODE")
+    self.assertTrue(
+        any(
+            "Input 'TF_LITE_PREFILL_DECODE' already starts with 'tf_lite_'."
+            in output
+            for output in cm.output
+        )
+    )
 
   def test_add_llm_metadata_with_min_runtime_version(self):
     """Tests that min_runtime_version is added to llm metadata."""
@@ -984,6 +1073,289 @@ min_runtime_version = "0.12.3"
     ss = self._build_and_read_litertlm(builder)
     self.assertIn("min_runtime_version: \"0.12.3\"", ss)
 
+  def test_add_llm_metadata_with_thinking_and_function_calling(self):
+    """Tests supports_thinking and supports_function_calling in llm metadata."""
+    meta_path = self._create_dummy_file(
+        "metadata.pb", llm_metadata_pb2.LlmMetadata().SerializeToString()
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self._add_system_metadata(builder)
+    builder.add_llm_metadata(
+        meta_path,
+        supports_thinking=True,
+        supports_function_calling=False,
+    )
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("supports_thinking: true", ss)
+    self.assertIn("supports_function_calling: false", ss)
+
+  def test_from_toml_file_with_vision_patch_metadata(self):
+    """Tests max_num_patches and pooling_kernel_size from TOML."""
+    metadata_path = self._create_dummy_file("metadata.pbtext", b"")
+    metadata_filename = os.path.basename(metadata_path)
+    toml_content = f"""
+[[section]]
+section_type = "LlmMetadata"
+data_path = "{metadata_filename}"
+supports_thinking = true
+supports_function_calling = true
+max_num_patches = 4
+pooling_kernel_size = 2
+"""
+    toml_path = self._create_dummy_file(
+        "capabilities_vision.toml", toml_content.encode()
+    )
+    builder = litertlm_builder.LitertLmFileBuilder.from_toml_file(toml_path)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("supports_thinking: true", ss)
+    self.assertIn("supports_function_calling: true", ss)
+    self.assertIn("max_num_patches: 4", ss)
+    self.assertIn("pooling_kernel_size: 2", ss)
+
+  def test_is_llm_model(self):
+    """Tests is_llm_model property detection."""
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self.assertFalse(builder.is_llm_model)
+
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    self.assertTrue(builder.is_llm_model)
+
+  def test_validate_metadata_llm_missing_fields(self):
+    """Tests validate_metadata raises ValueError when LLM fields are missing."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    meta_path = self._create_dummy_file(
+        "metadata.pb", llm_metadata_pb2.LlmMetadata().SerializeToString()
+    )
+
+    # Missing both supports_thinking and supports_function_calling
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_llm_metadata(meta_path)
+    with self.assertRaisesRegex(ValueError, "supports_thinking"):
+      builder.validate_metadata()
+
+    # Missing supports_function_calling
+    builder2 = litertlm_builder.LitertLmFileBuilder()
+    builder2.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder2.add_llm_metadata(meta_path, supports_thinking=True)
+    with self.assertRaisesRegex(ValueError, "supports_function_calling"):
+      builder2.validate_metadata()
+
+    # Valid LLM metadata passes validation
+    builder3 = litertlm_builder.LitertLmFileBuilder()
+    builder3.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder3.add_llm_metadata(
+        meta_path,
+        supports_thinking=False,
+        supports_function_calling=True,
+    )
+    builder3.validate_metadata()
+
+  def test_validate_metadata_requires_llm_metadata(self):
+    """Tests validate_metadata raises when an LLM model has no LlmMetadata."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    with self.assertRaisesRegex(ValueError, "LlmMetadata"):
+      builder.validate_metadata()
+
+  def test_validate_metadata_skipped_for_non_llm_model(self):
+    """Tests validate_metadata is a no-op when no LLM model is present."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "vision_adapter")
+    self.assertFalse(builder.is_llm_model)
+    builder.validate_metadata()
+
+  def test_is_vision_model(self):
+    """Tests is_vision_model property detection."""
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self.assertFalse(builder.is_vision_model)
+
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    builder.add_tflite_model(dummy_tflite, "vision_adapter")
+    self.assertTrue(builder.is_vision_model)
+
+  def test_is_vision_transformer_model(self):
+    """Tests is_vision_transformer_model property detection."""
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self.assertFalse(builder.is_vision_transformer_model)
+
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_tflite_model(dummy_tflite, "vision_adapter")
+
+    # Gemma3N is not a vision transformer
+    meta_gemma3n = llm_metadata_pb2.LlmMetadata()
+    meta_gemma3n.llm_model_type.gemma3n.SetInParent()
+    path_gemma3n = self._create_dummy_file(
+        "meta_gemma3n.pb", meta_gemma3n.SerializeToString()
+    )
+    builder.add_llm_metadata(path_gemma3n)
+    self.assertFalse(builder.is_vision_transformer_model)
+
+    # Gemma4 is a vision transformer
+    builder2 = litertlm_builder.LitertLmFileBuilder()
+    builder2.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder2.add_tflite_model(dummy_tflite, "vision_adapter")
+    meta_gemma4 = llm_metadata_pb2.LlmMetadata()
+    meta_gemma4.llm_model_type.gemma4.SetInParent()
+    path_gemma4 = self._create_dummy_file(
+        "meta_gemma4.pb", meta_gemma4.SerializeToString()
+    )
+    builder2.add_llm_metadata(path_gemma4)
+    self.assertTrue(builder2.is_vision_transformer_model)
+
+  def test_validate_metadata_vision_missing_fields(self):
+    """Tests validate_metadata raises for missing Vision Transformer fields."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    meta = llm_metadata_pb2.LlmMetadata()
+    meta.llm_model_type.gemma4.SetInParent()
+    meta_path = self._create_dummy_file(
+        "metadata_gemma4.pb", meta.SerializeToString()
+    )
+
+    # Missing max_num_patches and pooling_kernel_size
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_tflite_model(dummy_tflite, "vision_adapter")
+    builder.add_llm_metadata(
+        meta_path,
+        supports_thinking=True,
+        supports_function_calling=True,
+    )
+    with self.assertRaisesRegex(ValueError, "max_num_patches"):
+      builder.validate_metadata()
+
+    # Missing pooling_kernel_size
+    builder2 = litertlm_builder.LitertLmFileBuilder()
+    builder2.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder2.add_tflite_model(dummy_tflite, "vision_adapter")
+    builder2.add_llm_metadata(
+        meta_path,
+        supports_thinking=True,
+        supports_function_calling=True,
+        max_num_patches=4,
+    )
+    with self.assertRaisesRegex(ValueError, "pooling_kernel_size"):
+      builder2.validate_metadata()
+
+    # Valid vision transformer metadata passes validation
+    builder3 = litertlm_builder.LitertLmFileBuilder()
+    builder3.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder3.add_tflite_model(dummy_tflite, "vision_adapter")
+    builder3.add_llm_metadata(
+        meta_path,
+        supports_thinking=True,
+        supports_function_calling=True,
+        max_num_patches=4,
+        pooling_kernel_size=2,
+    )
+    builder3.validate_metadata()
+
+  def test_validate_metadata_vision_non_transformer_passes(self):
+    """Tests non-vision-transformer models (e.g. Gemma3N) pass validation."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    meta = llm_metadata_pb2.LlmMetadata()
+    meta.llm_model_type.gemma3n.image_tensor_height = 768
+    meta.llm_model_type.gemma3n.image_tensor_width = 768
+    meta_path = self._create_dummy_file(
+        "metadata_gemma3n.pb", meta.SerializeToString()
+    )
+
+    # Missing supports_thinking raises
+    builder_missing_thinking = litertlm_builder.LitertLmFileBuilder()
+    builder_missing_thinking.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder_missing_thinking.add_tflite_model(dummy_tflite, "vision_adapter")
+    builder_missing_thinking.add_llm_metadata(meta_path)
+    with self.assertRaisesRegex(ValueError, "supports_thinking"):
+      builder_missing_thinking.validate_metadata()
+
+    # Valid Gemma3N vision model passes without patch parameters
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_tflite_model(dummy_tflite, "vision_adapter")
+    builder.add_tflite_model(dummy_tflite, "vision_encoder")
+    builder.add_llm_metadata(
+        meta_path,
+        supports_thinking=True,
+        supports_function_calling=True,
+    )
+    self.assertTrue(builder.is_llm_model)
+    self.assertTrue(builder.is_vision_model)
+    self.assertFalse(builder.is_vision_transformer_model)
+    builder.validate_metadata()
+
+    path = os.path.join(self.temp_dir, "gemma3n.litertlm")
+    with litertlm_core.open_file(path, "wb") as f:
+      builder.build(f, validate_metadata=True)
+    stream = io.StringIO()
+    litertlm_peek.peek_litertlm_file(path, self.temp_dir, stream)
+    ss = stream.getvalue()
+    self.assertIn("image_tensor_height: 768", ss)
+    self.assertIn("supports_thinking: true", ss)
+
+  def test_validate_metadata_vision_generic_model(self):
+    """Tests validation for GenericModel with and without patch parameters."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    meta = llm_metadata_pb2.LlmMetadata()
+    meta.llm_model_type.generic_model.image_tensor_height = 256
+    meta.llm_model_type.generic_model.image_tensor_width = 256
+    meta_path = self._create_dummy_file(
+        "metadata_generic.pb", meta.SerializeToString()
+    )
+
+    # GenericModel without patchify passes
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_tflite_model(dummy_tflite, "vision_adapter")
+    builder.add_llm_metadata(
+        meta_path,
+        supports_thinking=True,
+        supports_function_calling=True,
+    )
+    builder.validate_metadata()
+
+    # GenericModel with max_num_patches but missing pooling_kernel_size raises
+    builder2 = litertlm_builder.LitertLmFileBuilder()
+    builder2.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder2.add_tflite_model(dummy_tflite, "vision_adapter")
+    builder2.add_llm_metadata(
+        meta_path,
+        supports_thinking=True,
+        supports_function_calling=True,
+        max_num_patches=4,
+    )
+    with self.assertRaisesRegex(ValueError, "pooling_kernel_size"):
+      builder2.validate_metadata()
+
+    # GenericModel with both passes
+    builder3 = litertlm_builder.LitertLmFileBuilder()
+    builder3.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder3.add_tflite_model(dummy_tflite, "vision_adapter")
+    builder3.add_llm_metadata(
+        meta_path,
+        supports_thinking=True,
+        supports_function_calling=True,
+        max_num_patches=4,
+        pooling_kernel_size=2,
+    )
+    builder3.validate_metadata()
+
+  def test_build_with_validate_metadata(self):
+    """Tests that builder.build(stream, validate_metadata=True) triggers validation."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    # validate_metadata=False (default) does not raise
+    with io.BytesIO() as buf:
+      builder.build(buf)
+    # validate_metadata=True triggers validation and raises ValueError
+    with io.BytesIO() as buf:
+      with self.assertRaisesRegex(ValueError, "LlmMetadata"):
+        builder.build(buf, validate_metadata=True)
+
   def test_add_multiple_tokenizers(self):
     """Tests that multiple tokenizers with different model types can be added."""
     sp_prefill = self._create_dummy_file(
@@ -997,11 +1369,11 @@ min_runtime_version = "0.12.3"
     self._add_system_metadata(builder)
     builder.add_sentencepiece_tokenizer(
         sp_prefill,
-        model_type=litertlm_builder.TfLiteModelType.PREFILL_DECODE,
+        model_type="prefill_decode",
     )
     builder.add_sentencepiece_tokenizer(
         sp_embedder,
-        model_type=litertlm_builder.TfLiteModelType.EMBEDDER,
+        model_type="embedder",
     )
     ss = self._build_and_read_litertlm(builder)
     self.assertIn("Sections (2)", ss)
@@ -1012,7 +1384,7 @@ min_runtime_version = "0.12.3"
     with self.assertRaises(ValueError):
       builder.add_sentencepiece_tokenizer(
           sp_embedder,
-          model_type=litertlm_builder.TfLiteModelType.EMBEDDER,
+          model_type="embedder",
       )
 
     # Adding duplicate via additional_metadata without tf_lite_ prefix fails
@@ -1027,6 +1399,836 @@ min_runtime_version = "0.12.3"
               )
           ],
       )
+
+  def _create_llm_metadata_file(
+      self,
+      filename: str,
+      model_type: str,
+      supports_thinking: bool = True,
+      supports_function_calling: bool = True,
+      max_num_patches: int | None = None,
+      pooling_kernel_size: int | None = None,
+  ) -> str:
+    meta = llm_metadata_pb2.LlmMetadata()
+    meta.supports_thinking = supports_thinking
+    meta.supports_function_calling = supports_function_calling
+    sub_msg = getattr(meta.llm_model_type, model_type)
+    sub_msg.SetInParent()
+    if max_num_patches is not None:
+      sub_msg.max_num_patches = max_num_patches
+    if pooling_kernel_size is not None:
+      sub_msg.pooling_kernel_size = pooling_kernel_size
+    return self._create_dummy_file(filename, meta.SerializeToString())
+
+  def _create_embedding_metadata_file(
+      self,
+      filename: str,
+      is_vision: bool = False,
+      max_num_patches: int | None = None,
+      pooling_kernel_size: int | None = None,
+  ) -> str:
+    meta = embedding_metadata_pb2.EmbeddingMetadata()
+    eg = meta.embedding_model_type.embedding_gemma_v2
+    eg.SetInParent()
+    if is_vision:
+      eg.start_of_image_token.token_str = "<|image>"
+      eg.end_of_image_token.token_str = "<image|>"
+      eg.patch_width = 16
+      eg.patch_height = 16
+      if max_num_patches is not None:
+        eg.max_num_patches = max_num_patches
+      if pooling_kernel_size is not None:
+        eg.pooling_kernel_size = pooling_kernel_size
+    return self._create_dummy_file(filename, meta.SerializeToString())
+
+  def test_validate_metadata_embedding_vit_valid(self):
+    """Tests valid embedding ViT model passes validation."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    meta_path = self._create_embedding_metadata_file(
+        "emb_valid.pb",
+        is_vision=True,
+        max_num_patches=1260,
+        pooling_kernel_size=3,
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "embedder")
+    builder.add_tflite_model(dummy_tflite, "text_encoder")
+    builder.add_tflite_model(dummy_tflite, "vision_encoder")
+    builder.add_embedding_metadata(meta_path)
+    self.assertTrue(builder.is_embedding_vision_transformer_model)
+    self.assertTrue(builder.is_vision_transformer_model)
+    builder.validate_metadata()
+
+  def test_validate_metadata_embedding_vit_missing_patches(self):
+    """Tests embedding ViT missing max_num_patches raises ValueError."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    meta_path = self._create_embedding_metadata_file(
+        "emb_no_patches.pb",
+        is_vision=True,
+        max_num_patches=None,
+        pooling_kernel_size=3,
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "embedder")
+    builder.add_tflite_model(dummy_tflite, "text_encoder")
+    builder.add_tflite_model(dummy_tflite, "vision_encoder")
+    builder.add_embedding_metadata(meta_path)
+    with self.assertRaisesRegex(ValueError, "max_num_patches"):
+      builder.validate_metadata()
+
+  def test_validate_metadata_embedding_vit_missing_pooling_kernel_size(self):
+    """Tests embedding ViT missing pooling_kernel_size raises ValueError."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    meta_path = self._create_embedding_metadata_file(
+        "emb_no_kernel.pb",
+        is_vision=True,
+        max_num_patches=1260,
+        pooling_kernel_size=None,
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "embedder")
+    builder.add_tflite_model(dummy_tflite, "text_encoder")
+    builder.add_tflite_model(dummy_tflite, "vision_encoder")
+    builder.add_embedding_metadata(meta_path)
+    with self.assertRaisesRegex(ValueError, "pooling_kernel_size"):
+      builder.validate_metadata()
+
+  def test_validate_metadata_embedding_vit_empty_fields_with_encoder(self):
+    """Tests embedding with vision encoder but unpopulated vision fields raises."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    meta_path = self._create_embedding_metadata_file(
+        "emb_empty_vision.pb", is_vision=False
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "embedder")
+    builder.add_tflite_model(dummy_tflite, "text_encoder")
+    builder.add_tflite_model(dummy_tflite, "vision_encoder")
+    builder.add_embedding_metadata(meta_path)
+    with self.assertRaisesRegex(ValueError, "max_num_patches"):
+      builder.validate_metadata()
+
+  def test_validate_metadata_hybrid_non_vit_llm_and_vit_embedding(self):
+    """Tests non-ViT LLM (Gemma3) + ViT embedding passes without conflict."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    meta_llm = llm_metadata_pb2.LlmMetadata(
+        supports_thinking=True,
+        supports_function_calling=True,
+    )
+    meta_llm.llm_model_type.gemma3.image_tensor_height = 768
+    meta_llm.llm_model_type.gemma3.image_tensor_width = 768
+    llm_path = self._create_dummy_file(
+        "llm_gemma3.pb", meta_llm.SerializeToString()
+    )
+    emb_path = self._create_embedding_metadata_file(
+        "emb_vit.pb",
+        is_vision=True,
+        max_num_patches=1260,
+        pooling_kernel_size=3,
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_tflite_model(dummy_tflite, "embedder")
+    builder.add_tflite_model(dummy_tflite, "text_encoder")
+    builder.add_tflite_model(dummy_tflite, "vision_encoder")
+    builder.add_llm_metadata(llm_path)
+    builder.add_embedding_metadata(emb_path)
+    self.assertFalse(builder.is_llm_vision_transformer_model)
+    self.assertTrue(builder.is_embedding_vision_transformer_model)
+    self.assertTrue(builder.is_vision_transformer_model)
+    builder.validate_metadata()
+
+  def test_validate_metadata_hybrid_vit_llm_and_text_embedding(self):
+    """Tests ViT LLM (Gemma4) + pure text embedding passes without conflict."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    llm_path = self._create_llm_metadata_file(
+        "llm_gemma4.pb", "gemma4", max_num_patches=4, pooling_kernel_size=2
+    )
+    emb_path = self._create_embedding_metadata_file(
+        "emb_text.pb", is_vision=False
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_tflite_model(dummy_tflite, "embedder")
+    builder.add_tflite_model(dummy_tflite, "text_encoder")
+    builder.add_tflite_model(dummy_tflite, "vision_encoder")
+    builder.add_llm_metadata(llm_path)
+    builder.add_embedding_metadata(emb_path)
+    self.assertTrue(builder.is_llm_vision_transformer_model)
+    self.assertFalse(builder.is_embedding_vision_transformer_model)
+    self.assertTrue(builder.is_vision_transformer_model)
+    builder.validate_metadata()
+
+  def test_validate_metadata_hybrid_vit_llm_and_vit_embedding_both_valid(self):
+    """Tests both ViT LLM and ViT embedding valid passes."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    llm_path = self._create_llm_metadata_file(
+        "llm_gemma4.pb", "gemma4", max_num_patches=4, pooling_kernel_size=2
+    )
+    emb_path = self._create_embedding_metadata_file(
+        "emb_vit.pb",
+        is_vision=True,
+        max_num_patches=1260,
+        pooling_kernel_size=3,
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_tflite_model(dummy_tflite, "embedder")
+    builder.add_tflite_model(dummy_tflite, "text_encoder")
+    builder.add_tflite_model(dummy_tflite, "vision_encoder")
+    builder.add_llm_metadata(llm_path)
+    builder.add_embedding_metadata(emb_path)
+    self.assertTrue(builder.is_llm_vision_transformer_model)
+    self.assertTrue(builder.is_embedding_vision_transformer_model)
+    builder.validate_metadata()
+
+  def test_validate_metadata_hybrid_vit_llm_and_vit_embedding_emb_invalid(self):
+    """Tests hybrid catches missing patch parameters in embedding."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    llm_path = self._create_llm_metadata_file(
+        "llm_gemma4.pb", "gemma4", max_num_patches=4, pooling_kernel_size=2
+    )
+    emb_path = self._create_embedding_metadata_file(
+        "emb_vit_bad.pb",
+        is_vision=True,
+        max_num_patches=None,
+        pooling_kernel_size=3,
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_tflite_model(dummy_tflite, "embedder")
+    builder.add_tflite_model(dummy_tflite, "text_encoder")
+    builder.add_tflite_model(dummy_tflite, "vision_encoder")
+    builder.add_llm_metadata(llm_path)
+    builder.add_embedding_metadata(emb_path)
+    with self.assertRaisesRegex(ValueError, "max_num_patches"):
+      builder.validate_metadata()
+
+  def test_validate_metadata_hybrid_vit_llm_and_vit_embedding_llm_invalid(self):
+    """Tests hybrid catches missing patch parameters in LLM."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy")
+    llm_path = self._create_llm_metadata_file(
+        "llm_gemma4_bad.pb",
+        "gemma4",
+        max_num_patches=None,
+        pooling_kernel_size=2,
+    )
+    emb_path = self._create_embedding_metadata_file(
+        "emb_vit.pb",
+        is_vision=True,
+        max_num_patches=1260,
+        pooling_kernel_size=3,
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_tflite_model(dummy_tflite, "embedder")
+    builder.add_tflite_model(dummy_tflite, "text_encoder")
+    builder.add_tflite_model(dummy_tflite, "vision_encoder")
+    builder.add_llm_metadata(llm_path)
+    builder.add_embedding_metadata(emb_path)
+    with self.assertRaisesRegex(ValueError, "max_num_patches"):
+      builder.validate_metadata()
+
+  def test_hybrid_llm_and_embedding_roundtrip(self):
+    """Tests build, unpack, and rebuild of hybrid container."""
+    dummy_tflite = self._create_dummy_file("model.tflite", b"dummy tflite")
+    dummy_sp = self._create_dummy_file("sp.model", b"dummy sp")
+    llm_path = self._create_llm_metadata_file(
+        "llm.pb",
+        "gemma3n",
+        supports_thinking=True,
+        supports_function_calling=True,
+    )
+    emb_path = self._create_embedding_metadata_file("emb.pb", is_vision=False)
+
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self._add_system_metadata(builder)
+    builder.add_tflite_model(dummy_tflite, "prefill_decode")
+    builder.add_tflite_model(dummy_tflite, "embedder")
+    builder.add_tflite_model(dummy_tflite, "text_encoder")
+    builder.add_sentencepiece_tokenizer(dummy_sp)
+    builder.add_llm_metadata(llm_path)
+    builder.add_embedding_metadata(emb_path)
+
+    out_file = os.path.join(self.temp_dir, "hybrid.litertlm")
+    with open(out_file, "wb") as f:
+      builder.build(f, validate_metadata=True)
+
+    # Unpack and verify
+    unpack_dir = os.path.join(self.temp_dir, "unpacked_hybrid")
+    unpacked_builder = litertlm_builder.LitertLmFileBuilder.unpack(
+        out_file, unpack_dir
+    )
+    self.assertTrue(unpacked_builder._has_llm_metadata)
+    self.assertTrue(unpacked_builder._has_embedding_metadata)
+
+    # Verify model.toml has both sections
+    with open(os.path.join(unpack_dir, "model.toml"), "r") as f:
+      toml_text = f.read()
+    self.assertIn('section_type = "LlmMetadata"', toml_text)
+    self.assertIn('section_type = "EmbeddingMetadata"', toml_text)
+
+    # Rebuild from unpacked
+    rebuild_file = os.path.join(self.temp_dir, "rebuilt_hybrid.litertlm")
+    with open(rebuild_file, "wb") as f:
+      unpacked_builder.build(f, validate_metadata=True)
+    self.assertGreater(os.path.getsize(rebuild_file), 0)
+
+  def test_from_toml_with_speech2text_metadata(self):
+    """Tests that TOML with Speech2TextMetadata and capability model types builds properly."""
+    asr_meta = speech2text_metadata_pb2.Speech2TextMetadata()
+    asr_meta_path = self._create_dummy_file(
+        "asr_meta.pb", asr_meta.SerializeToString()
+    )
+    enc_dec_path = self._create_dummy_file(
+        "enc_dec.tflite", b"dummy enc_dec tflite"
+    )
+
+    toml_content = f"""
+[system_metadata]
+entries = [
+  {{ key = "author", value_type = "String", value = "ODML" }}
+]
+
+[[section]]
+section_type = "Speech2TextMetadata"
+data_path = "{asr_meta_path}"
+
+[[section]]
+section_type = "TFLiteModel"
+model_type = "ENCODER_DECODER"
+data_path = "{enc_dec_path}"
+"""
+    builder = litertlm_builder.LitertLmFileBuilder.from_toml_str(toml_content)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("Sections (2)", ss)
+    self.assertIn("Data Type:    Speech2TextMetadataProto", ss)
+    self.assertIn(
+        "Key: model_type, Value (String): tf_lite_encoder_decoder", ss
+    )
+
+  def test_from_toml_with_text2speech_metadata(self):
+    """Tests that TOML with Text2SpeechMetadata and capability model types builds properly."""
+    tts_meta = text2speech_metadata_pb2.Text2SpeechMetadata(
+        output_sample_rate=24000, supported_languages=["en-US"]
+    )
+    tts_meta_path = self._create_dummy_file(
+        "tts_meta.textproto",
+        text_format.MessageToString(tts_meta).encode("utf-8"),
+    )
+    acoustic_path = self._create_dummy_file(
+        "acoustic.tflite", b"dummy acoustic tflite"
+    )
+    vocoder_path = self._create_dummy_file(
+        "vocoder.tflite", b"dummy vocoder tflite"
+    )
+
+    toml_content = f"""
+[system_metadata]
+entries = [
+  {{ key = "author", value_type = "String", value = "ODML" }}
+]
+
+[[section]]
+section_type = "Text2SpeechMetadata"
+data_path = "{tts_meta_path}"
+
+[[section]]
+section_type = "TFLiteModel"
+model_type = "ACOUSTIC"
+data_path = "{acoustic_path}"
+
+[[section]]
+section_type = "TFLiteModel"
+model_type = "TF_LITE_VOCODER"
+data_path = "{vocoder_path}"
+"""
+    builder = litertlm_builder.LitertLmFileBuilder.from_toml_str(toml_content)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("Sections (3)", ss)
+    self.assertIn("Data Type:    Text2SpeechMetadataProto", ss)
+    self.assertIn("output_sample_rate: 24000", ss)
+    self.assertIn("Key: model_type, Value (String): tf_lite_acoustic", ss)
+    self.assertIn("Key: model_type, Value (String): tf_lite_vocoder", ss)
+
+  def test_from_toml_with_text2image_metadata(self):
+    """Tests that TOML with Text2ImageMetadata and capability model types builds properly."""
+    text2image_meta_content = """
+    image_gen_model_type {
+      bonsai_flux2 {
+        flux2_params {
+          img_size: 256
+          default_steps: 4
+          packed_ch: 128
+          seq_len: 128
+        }
+      }
+    }
+    """
+    text2image_meta_path = self._create_dummy_file(
+        "text2image_meta.textproto", text2image_meta_content.encode()
+    )
+    text_enc_path = self._create_dummy_file(
+        "textenc.tflite", b"dummy textenc tflite"
+    )
+    dit_path = self._create_dummy_file("dit.tflite", b"dummy dit tflite")
+    vae_path = self._create_dummy_file("vae.tflite", b"dummy vae tflite")
+
+    toml_content = f"""
+[system_metadata]
+entries = [
+  {{ key = "author", value_type = "String", value = "ODML" }}
+]
+
+[[section]]
+section_type = "Text2ImageMetadata"
+data_path = "{text2image_meta_path}"
+
+[[section]]
+section_type = "TFLiteModel"
+model_type = "TF_LITE_TEXT_ENCODER"
+data_path = "{text_enc_path}"
+
+[[section]]
+section_type = "TFLiteModel"
+model_type = "IMAGE_DENOISER"
+data_path = "{dit_path}"
+
+[[section]]
+section_type = "TFLiteModel"
+model_type = "IMAGE_DECODER"
+data_path = "{vae_path}"
+"""
+    builder = litertlm_builder.LitertLmFileBuilder.from_toml_str(toml_content)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("Sections (4)", ss)
+    self.assertIn("Data Type:    Text2ImageMetadataProto", ss)
+    self.assertIn("Key: model_type, Value (String): tf_lite_text_encoder", ss)
+    self.assertIn("Key: model_type, Value (String): tf_lite_image_denoiser", ss)
+    self.assertIn("Key: model_type, Value (String): tf_lite_image_decoder", ss)
+
+  def test_from_toml_with_any2any_metadata(self):
+    """Tests that TOML with Any2AnyMetadata and capability model types builds properly."""
+    any2any_meta_content = """
+    input_sample_rate_hz: 16000
+    output_sample_rate_hz: 24000
+    supported_languages: "en-US"
+    any2any_model_type {
+      minicpm_o {
+        llm_hidden_size: 3584
+        tts_hidden_size: 768
+      }
+    }
+    """
+    any2any_meta_path = self._create_dummy_file(
+        "any2any_meta.textproto", any2any_meta_content.encode()
+    )
+    vision_enc_path = self._create_dummy_file(
+        "vision.tflite", b"dummy vision tflite"
+    )
+    llm_path = self._create_dummy_file("llm.tflite", b"dummy llm tflite")
+    vocoder_path = self._create_dummy_file(
+        "vocoder.tflite", b"dummy vocoder tflite"
+    )
+
+    toml_content = f"""
+[system_metadata]
+entries = [
+  {{ key = "author", value_type = "String", value = "ODML" }}
+]
+
+[[section]]
+section_type = "Any2AnyMetadata"
+data_path = "{any2any_meta_path}"
+
+[[section]]
+section_type = "TFLiteModel"
+model_type = "TF_LITE_VISION_ENCODER"
+data_path = "{vision_enc_path}"
+
+[[section]]
+section_type = "TFLiteModel"
+model_type = "LLM_BACKBONE"
+data_path = "{llm_path}"
+
+[[section]]
+section_type = "TFLiteModel"
+model_type = "AUDIO_VOCODER"
+data_path = "{vocoder_path}"
+"""
+    builder = litertlm_builder.LitertLmFileBuilder.from_toml_str(toml_content)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("Sections (4)", ss)
+    self.assertIn("Data Type:    Any2AnyMetadataProto", ss)
+    self.assertIn("input_sample_rate_hz: 16000", ss)
+    self.assertIn("output_sample_rate_hz: 24000", ss)
+    self.assertIn("Key: model_type, Value (String): tf_lite_vision_encoder", ss)
+    self.assertIn("Key: model_type, Value (String): tf_lite_llm_backbone", ss)
+    self.assertIn("Key: model_type, Value (String): tf_lite_audio_vocoder", ss)
+
+  def test_capability_tflite_model_type_int_enum_resolution(self):
+    """Tests resolving capability proto enum ints for ASR, TTS, Text2Image, and Any2Any."""
+    tflite_path = self._create_dummy_file("m.tflite", b"dummy")
+    asr_path = self._create_dummy_file(
+        "asr.pb",
+        speech2text_metadata_pb2.Speech2TextMetadata().SerializeToString(),
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_speech2text_metadata(asr_path)
+    builder.add_tflite_model(
+        tflite_path,
+        speech2text_metadata_pb2.Speech2TextMetadata.TF_LITE_AUDIO_ENCODER,
+    )
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("Key: model_type, Value (String): tf_lite_audio_encoder", ss)
+
+    tts_path = self._create_dummy_file(
+        "tts.pb",
+        text2speech_metadata_pb2.Text2SpeechMetadata().SerializeToString(),
+    )
+    builder_tts = litertlm_builder.LitertLmFileBuilder()
+    builder_tts.add_text2speech_metadata(tts_path)
+    builder_tts.add_tflite_model(
+        tflite_path,
+        text2speech_metadata_pb2.Text2SpeechMetadata.TF_LITE_ACOUSTIC,
+    )
+    ss_tts = self._build_and_read_litertlm(builder_tts)
+    self.assertIn("Key: model_type, Value (String): tf_lite_acoustic", ss_tts)
+
+    img_path = self._create_dummy_file(
+        "img.pb",
+        text2image_metadata_pb2.Text2ImageMetadata().SerializeToString(),
+    )
+    builder_img = litertlm_builder.LitertLmFileBuilder()
+    builder_img.add_text2image_metadata(img_path)
+    builder_img.add_tflite_model(
+        tflite_path,
+        text2image_metadata_pb2.Text2ImageMetadata.TF_LITE_DIFFUSION_TRANSFORMER_INITIAL,
+    )
+    ss_img = self._build_and_read_litertlm(builder_img)
+    self.assertIn(
+        "Key: model_type, Value (String):"
+        " tf_lite_diffusion_transformer_initial",
+        ss_img,
+    )
+
+    any2any_path = self._create_dummy_file(
+        "any2any.pb",
+        any2any_metadata_pb2.Any2AnyMetadata().SerializeToString(),
+    )
+    builder_any2any = litertlm_builder.LitertLmFileBuilder()
+    builder_any2any.add_any2any_metadata(any2any_path)
+    builder_any2any.add_tflite_model(
+        tflite_path,
+        any2any_metadata_pb2.Any2AnyMetadata.TF_LITE_LLM_BACKBONE,
+    )
+    ss_any2any = self._build_and_read_litertlm(builder_any2any)
+    self.assertIn(
+        "Key: model_type, Value (String): tf_lite_llm_backbone",
+        ss_any2any,
+    )
+    self.assertNotIn(
+        "unspecified", litertlm_builder.get_all_tflite_model_types()
+    )
+
+    builder_no_cap = litertlm_builder.LitertLmFileBuilder()
+    builder_no_cap.add_tflite_model(
+        tflite_path,
+        speech2text_metadata_pb2.Speech2TextMetadata.TF_LITE_AUDIO_ENCODER,
+    )
+    with self.assertRaisesRegex(
+        ValueError, "Capability metadata must be added before resolving"
+    ):
+      self._build_and_read_litertlm(builder_no_cap)
+
+    with self.assertRaisesRegex(ValueError, "TF_LITE_MODEL_TYPE_UNSPECIFIED"):
+      builder_img.add_tflite_model(
+          tflite_path,
+          text2image_metadata_pb2.Text2ImageMetadata.TF_LITE_MODEL_TYPE_UNSPECIFIED,
+      )
+
+  def test_int_model_type_before_llm_metadata_resolves_at_build(self):
+    """Tests proto enum model types added before LlmMetadata."""
+    tflite_path = self._create_dummy_file("m.tflite", b"dummy")
+    weights_path = self._create_dummy_file("w.bin", b"weights")
+    sp_path = self._create_dummy_file("sp.model", b"dummy sp")
+    llm_path = self._create_llm_metadata_file("llm.pb", "gemma3n")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(
+        tflite_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
+    )
+    builder.add_tflite_weights(
+        weights_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
+    )
+    builder.add_tflite_model(
+        tflite_path,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW,
+        backend_constraint="cpu",
+    )
+    builder.add_sentencepiece_tokenizer(
+        sp_path, model_type=llm_metadata_pb2.LlmMetadata.TF_LITE_EMBEDDER
+    )
+    builder.add_llm_metadata(llm_path)
+
+    out_path = os.path.join(self.temp_dir, "llm.litertlm")
+    with litertlm_core.open_file(out_path, "wb") as f:
+      builder.build(f, validate_metadata=True)
+    stream = io.StringIO()
+    litertlm_peek.peek_litertlm_file(out_path, self.temp_dir, stream)
+    ss = stream.getvalue()
+    self.assertEqual(
+        ss.count("Key: model_type, Value (String): tf_lite_prefill_decode"), 2
+    )
+    self.assertIn(
+        "Key: model_type, Value (String): tf_lite_audio_encoder_hw", ss
+    )
+    self.assertIn("Key: model_type, Value (String): tf_lite_embedder", ss)
+    # Building again is a no-op for already resolved model types.
+    self.assertEqual(
+        self._build_and_read_litertlm(builder).count(
+            "Key: model_type, Value (String): tf_lite_prefill_decode"
+        ),
+        2,
+    )
+
+  def test_int_model_type_before_embedding_metadata_resolves_at_build(self):
+    """Tests that a pending int resolves against EmbeddingMetadata, not LLM."""
+    tflite_path = self._create_dummy_file("m.tflite", b"dummy")
+    emb_path = self._create_embedding_metadata_file("emb.pb")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    # EmbeddingMetadata.TF_LITE_TEXT_ENCODER shares enum value 1 with
+    # LlmMetadata.TF_LITE_PREFILL_DECODE.
+    builder.add_tflite_model(
+        tflite_path,
+        embedding_metadata_pb2.EmbeddingMetadata.TF_LITE_TEXT_ENCODER,
+    )
+    builder.add_tflite_model(
+        tflite_path, embedding_metadata_pb2.EmbeddingMetadata.TF_LITE_EMBEDDER
+    )
+    self.assertFalse(builder.is_llm_model)
+    builder.add_embedding_metadata(emb_path)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("Key: model_type, Value (String): tf_lite_text_encoder", ss)
+    self.assertIn("Key: model_type, Value (String): tf_lite_embedder", ss)
+    self.assertNotIn("tf_lite_prefill_decode", ss)
+
+  def test_int_model_type_after_capability_metadata_resolves_eagerly(self):
+    """Tests that ints added after capability metadata resolve immediately."""
+    tflite_path = self._create_dummy_file("m.tflite", b"dummy")
+    llm_path = self._create_llm_metadata_file("llm.pb", "gemma3n")
+    emb_path = self._create_embedding_metadata_file("emb.pb")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_llm_metadata(llm_path)
+    builder.add_tflite_model(
+        tflite_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
+    )
+    # Adding a second capability does not change already resolved sections.
+    builder.add_embedding_metadata(emb_path)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("Key: model_type, Value (String): tf_lite_prefill_decode", ss)
+    # With two capabilities, a new int is ambiguous and fails eagerly.
+    with self.assertRaisesRegex(ValueError, "Ambiguous integer model_type"):
+      builder.add_tflite_model(
+          tflite_path, llm_metadata_pb2.LlmMetadata.TF_LITE_EMBEDDER
+      )
+
+  def test_int_model_type_without_capability_metadata_raises_at_build(self):
+    """Tests a clear build error when an int model type cannot be resolved."""
+    tflite_path = self._create_dummy_file("m.tflite", b"dummy")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self._add_system_metadata(builder)
+    builder.add_tflite_model(
+        tflite_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        "Cannot resolve integer model_type 1 at build time: Capability metadata"
+        " must be added",
+    ):
+      builder.build(io.BytesIO())
+
+  def test_int_model_type_resolved_when_first_capability_metadata_added(self):
+    """Tests that pending ints resolve when the first capability is added."""
+    tflite_path = self._create_dummy_file("m.tflite", b"dummy")
+    llm_path = self._create_llm_metadata_file("llm.pb", "gemma3n")
+    emb_path = self._create_embedding_metadata_file("emb.pb")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    self._add_system_metadata(builder)
+    builder.add_tflite_model(
+        tflite_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
+    )
+    builder.add_llm_metadata(llm_path)
+    # Pending int was resolved against llm when add_llm_metadata was called,
+    # so subsequently adding embedding metadata succeeds at build time.
+    builder.add_embedding_metadata(emb_path)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("Key: model_type, Value (String): tf_lite_prefill_decode", ss)
+
+  def test_pending_int_out_of_range_for_capability_raises_on_metadata_add(self):
+    """Tests that out-of-range pending ints do not break boolean properties."""
+    tflite_path = self._create_dummy_file("m.tflite", b"dummy")
+    emb_path = self._create_embedding_metadata_file("emb.pb")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(
+        tflite_path, llm_metadata_pb2.LlmMetadata.TF_LITE_MTP_DRAFTER
+    )
+    # MTP_DRAFTER (13) is valid for LlmMetadata, not EmbeddingMetadata.
+    with self.assertRaisesRegex(
+        ValueError, "Cannot resolve integer model_type 13"
+    ):
+      builder.add_embedding_metadata(emb_path)
+    # Capability rollback leaves boolean properties safe to inspect.
+    self.assertFalse(builder.is_llm_model)
+    self.assertFalse(builder.is_vision_model)
+
+  def test_invalid_int_model_type_raises_eagerly(self):
+    """Tests that invalid ints fail at add time even without capability."""
+    tflite_path = self._create_dummy_file("m.tflite", b"dummy")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    with self.assertRaisesRegex(ValueError, "TF_LITE_MODEL_TYPE_UNSPECIFIED"):
+      builder.add_tflite_model(tflite_path, 0)
+    with self.assertRaisesRegex(ValueError, "Unknown TfLiteModelType enum"):
+      builder.add_tflite_model(tflite_path, 9999)
+    self.assertEmpty(builder._sections)
+
+  def test_pending_int_model_type_properties(self):
+    """Tests is_llm_model / is_vision_model with pending int model types."""
+    tflite_path = self._create_dummy_file("m.tflite", b"dummy")
+    llm_path = self._create_llm_metadata_file("llm.pb", "gemma3n")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(
+        tflite_path, llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER
+    )
+    builder.add_tflite_model(
+        tflite_path, llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
+    )
+    # The capability is not known yet, so the ints cannot be interpreted.
+    self.assertFalse(builder.is_vision_model)
+    builder.add_llm_metadata(llm_path)
+    self.assertTrue(builder.is_vision_model)
+    self.assertTrue(builder.is_llm_model)
+
+  def test_set_backend_constraint_with_pending_int_model_type(self):
+    """Tests set/remove_backend_constraint on sections with pending ints."""
+    tflite_path = self._create_dummy_file("m.tflite", b"dummy")
+    llm_path = self._create_llm_metadata_file("llm.pb", "gemma3n")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_tflite_model(
+        tflite_path,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW,
+        backend_constraint="cpu",
+    )
+    builder.add_tflite_model(
+        tflite_path,
+        llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER,
+        backend_constraint="cpu",
+    )
+    # An int target matches pending int sections before the capability is known.
+    builder.set_backend_constraint(
+        llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW, "npu"
+    )
+    # A string target cannot be compared with a pending int section yet.
+    with self.assertRaisesRegex(ValueError, "Cannot match an integer"):
+      builder.set_backend_constraint("audio_encoder_hw", "gpu")
+    with self.assertRaises(KeyError):
+      builder.set_backend_constraint(
+          llm_metadata_pb2.LlmMetadata.TF_LITE_END_OF_AUDIO, "npu"
+      )
+    # Mixed-representation sections: a string-typed section can still be matched
+    # by string while another section has a pending int model_type.
+    builder.add_tflite_model(
+        tflite_path, "text_encoder", backend_constraint="cpu"
+    )
+    builder.set_backend_constraint("text_encoder", "gpu")
+    builder.remove_backend_constraint("text_encoder")
+
+    builder.add_llm_metadata(llm_path)
+    # Once the capability is known, strings and ints match pending sections.
+    builder.set_backend_constraint("audio_encoder_hw", "gpu")
+    builder.remove_backend_constraint(
+        llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER
+    )
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn(
+        "Key: model_type, Value (String): tf_lite_audio_encoder_hw", ss
+    )
+    self.assertEqual(ss.count("Key: backend_constraint"), 1)
+    self.assertIn("Key: backend_constraint, Value (String): gpu", ss)
+
+  def test_tokenizer_with_pending_int_model_type(self):
+    """Tests tokenizer uniqueness checks with pending int model types."""
+    sp_path = self._create_dummy_file("sp.model", b"dummy sp")
+    llm_path = self._create_llm_metadata_file("llm.pb", "gemma3n")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_sentencepiece_tokenizer(
+        sp_path, model_type=llm_metadata_pb2.LlmMetadata.TF_LITE_EMBEDDER
+    )
+    # The same pending int is a duplicate right away.
+    with self.assertRaisesRegex(ValueError, "Tokenizer already added"):
+      builder.add_sentencepiece_tokenizer(
+          sp_path, model_type=llm_metadata_pb2.LlmMetadata.TF_LITE_EMBEDDER
+      )
+    # The same pending int via additional_metadata is a duplicate as well.
+    with self.assertRaisesRegex(ValueError, "Tokenizer already added"):
+      builder.add_hf_tokenizer(
+          self._create_dummy_file("tokenizer.json", b"{}"),
+          additional_metadata=[
+              litertlm_builder.Metadata(
+                  key="model_type",
+                  value=llm_metadata_pb2.LlmMetadata.TF_LITE_EMBEDDER,
+                  dtype=litertlm_builder.DType.STRING,
+              )
+          ],
+      )
+    builder.add_llm_metadata(llm_path)
+    ss = self._build_and_read_litertlm(builder)
+    self.assertIn("Key: model_type, Value (String): tf_lite_embedder", ss)
+
+  def test_tokenizer_pending_int_conflict_detected_on_metadata_add(self):
+    """Tests that a pending int resolving to a duplicate tokenizer fails."""
+    sp_path = self._create_dummy_file("sp.model", b"dummy sp")
+    llm_path = self._create_llm_metadata_file("llm.pb", "gemma3n")
+    builder = litertlm_builder.LitertLmFileBuilder()
+    # The default tokenizer is the prefill_decode tokenizer.
+    builder.add_sentencepiece_tokenizer(sp_path)
+    builder.add_sentencepiece_tokenizer(
+        sp_path, model_type=llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE
+    )
+    with self.assertRaisesRegex(ValueError, "Tokenizer already added"):
+      builder.add_llm_metadata(llm_path)
+
+  def test_multiple_capability_metadata_raises_error(self):
+    """Tests that adding conflicting capability metadata raises ValueError."""
+    llm_meta_path = self._create_dummy_file(
+        "llm.textproto", b"max_num_tokens: 10\n"
+    )
+    asr_meta_path = self._create_dummy_file("asr.textproto", b"")
+    tts_meta_path = self._create_dummy_file(
+        "tts.textproto", b"output_sample_rate: 24000\n"
+    )
+    text2image_meta_path = self._create_dummy_file(
+        "text2image.textproto", b"image_gen_model_type { bonsai_flux2 {} }\n"
+    )
+    any2any_meta_path = self._create_dummy_file(
+        "any2any.textproto", b"any2any_model_type { minicpm_o {} }\n"
+    )
+    builder = litertlm_builder.LitertLmFileBuilder()
+    builder.add_llm_metadata(llm_meta_path)
+    with self.assertRaisesRegex(
+        ValueError, "can contain only one top-level capability metadata section"
+    ):
+      builder.add_speech2text_metadata(asr_meta_path)
+    with self.assertRaisesRegex(
+        ValueError, "can contain only one top-level capability metadata section"
+    ):
+      builder.add_text2speech_metadata(tts_meta_path)
+    with self.assertRaisesRegex(
+        ValueError, "can contain only one top-level capability metadata section"
+    ):
+      builder.add_text2image_metadata(text2image_meta_path)
+    with self.assertRaisesRegex(
+        ValueError, "can contain only one top-level capability metadata section"
+    ):
+      builder.add_any2any_metadata(any2any_meta_path)
 
 
 if __name__ == "__main__":

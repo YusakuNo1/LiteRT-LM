@@ -78,9 +78,31 @@ class Slice {
 }
 
 /**
+ * Result returned by ReadableStreamDataStreamWrapper methods to C++ Emval.
+ */
+export declare interface ReadableStreamDataStreamResult {
+  error?: Error;
+}
+
+/**
+ * Extern interface for ReadableStreamDataStreamWrapper methods invoked by C++.
+ */
+export declare interface ReadableStreamDataStreamWrapperInterface {
+  readAndDiscard(
+      destAddress: number, offset: number|bigint,
+      count: number|bigint): Promise<ReadableStreamDataStreamResult>;
+  readAndPreserve(
+      destAddress: number, offset: number|bigint,
+      count: number|bigint): Promise<ReadableStreamDataStreamResult>;
+  discard(offset: number|bigint, count: number|bigint):
+      ReadableStreamDataStreamResult;
+}
+
+/**
  * Wraps a ReadableStream for use in LiteRT LM C++ streamed model loading.
  */
-export class ReadableStreamDataStreamWrapper {
+export class ReadableStreamDataStreamWrapper implements
+    ReadableStreamDataStreamWrapperInterface {
   private slices: Slice[] = [];
   private streamDone = false;
   private globalPosition = 0;
@@ -107,9 +129,11 @@ export class ReadableStreamDataStreamWrapper {
 
   private * getViews(start: number, end: number): IterableIterator<{
     getView: () => Uint8Array<ArrayBuffer>,
+    getUncheckedView: () => Uint8Array<ArrayBuffer>| undefined,
     discardView: () => void,
     setView: (view: Uint8Array<ArrayBuffer>) => void,
     checkReadable: () => void,
+    viewLength: number,
   }> {
     if (start >= end) {
       return;
@@ -128,9 +152,10 @@ export class ReadableStreamDataStreamWrapper {
 
       let slice = this.slices[sliceIndex];
       if (!slice) {
-        if (!previousSlice || !previousSlice.fullyDiscarded) {
+        if (!scratchBuffer || !previousSlice ||
+            !previousSlice.fullyDiscarded) {
           // Make a new scratch buffer since the old one was assigned to the
-          // previous slice (or there is no previous slice).
+          // previous slice (or there is no previous slice or scratch buffer).
           scratchBuffer = new Uint8Array(this.bytesPerSlice);
         }
         slice = new Slice(this.bytesPerSlice);
@@ -177,11 +202,25 @@ export class ReadableStreamDataStreamWrapper {
             slice.data!.byteOffset + viewLength);
       };
 
+      // Returns a view into the slice's buffer without checking for discarded
+      // regions, or undefined if the slice was fully discarded (and its buffer
+      // released).
+      const getUncheckedView = () => {
+        if (!slice.data) {
+          return undefined;
+        }
+        return new Uint8Array(
+            slice.data.buffer, slice.data.byteOffset + slicePosition,
+            viewLength);
+      };
+
       yield {
         getView,
+        getUncheckedView,
         discardView,
         setView,
         checkReadable,
+        viewLength,
       };
 
       previousSlice = slice;
@@ -197,14 +236,33 @@ export class ReadableStreamDataStreamWrapper {
     }
     this.isReading = true;
     try {
-      // 1. Read and cache all unfetched data before the requested region.
-      for (const {getView, setView, checkReadable} of this.getViews(
+      // 1. Read all unfetched data before the requested region from the
+      // stream. It's cached for later reads, except for data that was already
+      // discarded before being fetched (e.g. the unread end of a section that
+      // is no longer needed), which is read and dropped.
+      let dropBuffer: ArrayBuffer|undefined;
+      for (const {getUncheckedView, setView, viewLength} of this.getViews(
                this.globalPosition, offset)) {
-        checkReadable();
         // We do not discard or change destAddress here as this is before the
         // requested region.
-        const newView = await this.fillBufferFromStream(getView());
-        setView(newView);
+        const cacheView = getUncheckedView();
+        let readView: Uint8Array<ArrayBuffer>;
+        if (cacheView) {
+          readView = cacheView;
+        } else {
+          if (!dropBuffer || dropBuffer.byteLength < viewLength) {
+            dropBuffer = new ArrayBuffer(this.bytesPerSlice);
+          }
+          readView = new Uint8Array(dropBuffer, 0, viewLength);
+        }
+        const newView = await this.fillBufferFromStream(readView);
+        if (cacheView) {
+          setView(newView);
+        } else {
+          // The BYOB reader may have detached the buffer, so reuse the one it
+          // returned.
+          dropBuffer = newView.buffer;
+        }
         if (newView.length === 0) {
           break;  // Hit EOF early
         }
@@ -327,7 +385,7 @@ export class ReadableStreamDataStreamWrapper {
 
   async readAndDiscard(
       destAddress: number, offset: number|bigint,
-      count: number|bigint): Promise<{error?: Error}> {
+      count: number|bigint): Promise<ReadableStreamDataStreamResult> {
     try {
       await this.readInternal(
           destAddress >>> 0, toNumber(offset), toNumber(count), true);
@@ -339,7 +397,7 @@ export class ReadableStreamDataStreamWrapper {
 
   async readAndPreserve(
       destAddress: number, offset: number|bigint,
-      count: number|bigint): Promise<{error?: Error}> {
+      count: number|bigint): Promise<ReadableStreamDataStreamResult> {
     try {
       await this.readInternal(
           destAddress >>> 0, toNumber(offset), toNumber(count), false);
@@ -349,7 +407,8 @@ export class ReadableStreamDataStreamWrapper {
     }
   }
 
-  discard(offset: number|bigint, count: number|bigint): {error?: Error} {
+  discard(offset: number|bigint, count: number|bigint):
+      ReadableStreamDataStreamResult {
     try {
       this.doDiscard(toNumber(offset), toNumber(count));
       return {};

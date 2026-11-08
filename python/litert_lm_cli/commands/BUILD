@@ -141,14 +141,13 @@ pytype_strict_library(
     srcs = ["run.py"],
     imports = [".."],
     deps = [
-        ":convert",
         "//python/litert_lm",
-        "//python/litert_lm_builder:litertlm_builder",
         "//python/litert_lm_cli:cli_helpers",
         "//python/litert_lm_cli:common",
         "//python/litert_lm_cli:help_formatter",
         "//python/litert_lm_cli:huggingface_download",
         "//python/litert_lm_cli:model",
+        "//runtime/proto:llm_metadata_py_pb2",
         requirement("click"),
         requirement("prompt_toolkit"),
     ] + select({

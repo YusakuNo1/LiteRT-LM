@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import abc
 import collections.abc
+import ctypes
 import dataclasses
 from importlib import resources
 import json
@@ -28,7 +29,9 @@ import sys
 from typing import Any
 
 from ._ffi import ActivationDataType
+from ._ffi import get_checked
 from ._ffi import LiteRtLmConstraintProviderType
+from ._ffi import SpeculativeDecodingMode
 from ._messages import Contents
 from ._messages import Message
 
@@ -116,7 +119,7 @@ class NPU(Backend):
         )
 
       try:
-        import openvino as ov  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+        import openvino as ov  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-import]
       except ImportError as e:
         raise RuntimeError(
             "NPU is supported only for Intel OpenVINO on Windows. Failed to"
@@ -142,7 +145,13 @@ class NPU(Backend):
       # openvino package place the NPU libs in "libs".
       # Includes to PATH so Windows can load it.
       libs_dir = os.path.join(os.path.dirname(ov.__file__), "libs")
-      os.environ["PATH"] = os.environ["PATH"] + ";" + libs_dir
+      current_path = os.environ.get("PATH", "")
+      if libs_dir not in current_path.split(os.pathsep):
+        os.environ["PATH"] = (
+            f"{current_path}{os.pathsep}{libs_dir}"
+            if current_path
+            else libs_dir
+        )
 
     if not self.litert_dispatch_lib_dir:
       raise RuntimeError(
@@ -374,6 +383,31 @@ class ConstrainedDecodingConfig:
   provider: LiteRtLmConstraintProviderType | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class SpeculativeDecodingConfig:
+  """Speculative decoding (e.g. MTP) configuration.
+
+  Set on the engine (`speculative_decoding_config`) as the default of its
+  conversations and sessions, and on `create_conversation` / `create_session`
+  as an override. Fields left None inherit the engine's values (on the engine:
+  the runtime defaults).
+
+  Attributes:
+      mode: How speculative decoding is used. The runtime default is
+        `SpeculativeDecodingMode.OFF`.
+  """
+
+  mode: SpeculativeDecodingMode | None = None
+
+  def __post_init__(self):
+    if self.mode is not None and not isinstance(
+        self.mode, SpeculativeDecodingMode
+    ):
+      raise ValueError(
+          f"mode must be a SpeculativeDecodingMode or None, got {self.mode!r}"
+      )
+
+
 @dataclasses.dataclass(kw_only=True)
 class AbstractEngine(abc.ABC):
   """Abstract base class for LiteRT-LM engines.
@@ -389,10 +423,15 @@ class AbstractEngine(abc.ABC):
         the engine's default.
       vision_backend: The hardware backend used for vision encoding.
       audio_backend: The hardware backend used for audio encoding.
-      enable_speculative_decoding: Whether to enable speculative decoding. If
-        None, use the model's default. If True, enable speculative decoding; an
-        error will be thrown if the model does not support it. If False, disable
-        it.
+      enable_speculative_decoding: Deprecated; use `speculative_decoding_config`
+        instead. Passing a value other than None emits a `DeprecationWarning`.
+        Read only when `speculative_decoding_config` sets no mode: True is mode
+        `SpeculativeDecodingMode.ON` and False is `SpeculativeDecodingMode.OFF`.
+      speculative_decoding_config: The default speculative decoding
+        configuration of the engine's conversations and sessions; each of them
+        can override any field. Fields left None use the runtime defaults (mode
+        `SpeculativeDecodingMode.OFF`). Modes ON and ADAPTIVE load the drafter
+        when the engine is created.
       lora_rank_config: Configuration for LoRA ranks.
       bos_token_id: The BOS token id for the model if one is configured.
       eos_token_ids: Stop token sequences configured for the model.
@@ -403,6 +442,15 @@ class AbstractEngine(abc.ABC):
         instant rewinding at higher memory cost.
       enable_ynnpack: Whether YNNPACK should delegate supported operations
         before XNNPACK. If None, use the native engine's default.
+      max_vision_tokens_per_image: Maximum number of vision tokens per image.
+        When set, the engine only loads the vision encoder/adapter signatures
+        that fit this limit. This does not downscale input images: pass a
+        `visual_token_budget` no larger than this limit to
+        `create_conversation`, otherwise images are processed with the model's
+        default token limit, which may require a signature that was not loaded.
+        Image downscaling is currently only supported by Gemma4 models, whose
+        budget options are 70, 140, 280, 560, or 1120. If None, use the model's
+        default.
   """
 
   model_path: str
@@ -413,10 +461,12 @@ class AbstractEngine(abc.ABC):
   vision_backend: Backend | None = None
   audio_backend: Backend | None = None
   enable_speculative_decoding: bool | None = None
+  speculative_decoding_config: SpeculativeDecodingConfig | None = None
   lora_rank_config: LoraRankConfig | None = None
   activation_data_type: ActivationDataType | None = None
   use_ringbuffers_local_attention: bool | None = None
   enable_ynnpack: bool | None = None
+  max_vision_tokens_per_image: int | None = None
 
   def __enter__(self) -> AbstractEngine:
     """Initializes the engine resources."""
@@ -449,6 +499,7 @@ class AbstractEngine(abc.ABC):
       max_output_tokens: int | None = None,
       chat_template: str | None = None,
       enable_speculative_decoding: bool | None = None,
+      speculative_decoding_config: SpeculativeDecodingConfig | None = None,
   ) -> AbstractConversation:
     """Creates a new conversation for this engine.
 
@@ -474,15 +525,14 @@ class AbstractEngine(abc.ABC):
           the final response tokens count towards this limit.
         chat_template: The Jinja chat template content to use for formatting. If
           not set, use the default provided by the model or the engine.
-        enable_speculative_decoding: Whether to enable speculative decoding for
-          this conversation. - If None (default): Inherits the engine's
-          speculative decoding setting. - If True: Explicitly enables
-          speculative decoding for this conversation. If the engine was
-          initialized without speculative decoding enabled, requesting True
-          triggers lazy initialization of the speculative decoding drafter (e.g.
-          MTP) on first use. - If False: Explicitly disables speculative
-          decoding for this conversation even if the engine was initialized with
-          speculative decoding enabled.
+        enable_speculative_decoding: Deprecated; use
+          `speculative_decoding_config` instead (True is mode
+          `SpeculativeDecodingMode.ON`; False is `SpeculativeDecodingMode.OFF`).
+          Passing a value other than None emits a `DeprecationWarning`. Ignored
+          if `speculative_decoding_config` sets a mode.
+        speculative_decoding_config: The speculative decoding configuration for
+          this conversation, which overrides the engine's. Fields left None (or
+          a None config, the default) inherit the engine's configuration.
     """
 
   @abc.abstractmethod
@@ -493,6 +543,7 @@ class AbstractEngine(abc.ABC):
       sampler_config: SamplerConfig | None = None,
       lora_config: LoraConfig | None = None,
       enable_speculative_decoding: bool | None = None,
+      speculative_decoding_config: SpeculativeDecodingConfig | None = None,
   ) -> AbstractSession:
     """Creates a new session for this engine.
 
@@ -502,14 +553,14 @@ class AbstractEngine(abc.ABC):
         sampler_config: Configuration for the sampling process. If None, then
           uses the engine's default values.
         lora_config: Configuration for LoRA adapters.
-        enable_speculative_decoding: Whether to enable speculative decoding for
-          this session. - If None (default): Inherits the engine's speculative
-          decoding setting. - If True: Explicitly enables speculative decoding
-          for this session. If the engine was initialized without speculative
-          decoding enabled, requesting True triggers lazy initialization of the
-          speculative decoding drafter (e.g. MTP) on first use. - If False:
-          Explicitly disables speculative decoding for this session even if the
-          engine was initialized with speculative decoding enabled.
+        enable_speculative_decoding: Deprecated; use
+          `speculative_decoding_config` instead (True is mode
+          `SpeculativeDecodingMode.ON`; False is `SpeculativeDecodingMode.OFF`).
+          Passing a value other than None emits a `DeprecationWarning`. Ignored
+          if `speculative_decoding_config` sets a mode.
+        speculative_decoding_config: The speculative decoding configuration for
+          this session, which overrides the engine's. Fields left None (or a
+          None config, the default) inherit the engine's configuration.
 
     Returns:
         A new session instance for low-level interaction with the model.
@@ -664,7 +715,7 @@ class AbstractConversation(abc.ABC):
       max_output_tokens: int | None = None,
       thinking_config: ThinkingConfig | None = None,
       response_format: ResponseFormat | None = None,
-  ) -> collections.abc.Mapping[str, Any]:
+  ) -> Message:
     """Sends a message and returns the response.
 
     Args:
@@ -686,8 +737,7 @@ class AbstractConversation(abc.ABC):
           response will be constrained to this format.
 
     Returns:
-        A dictionary containing the model's response. The structure is:
-        {"role": "assistant", "content": [{"type": "text", "text": "..."}]}
+        A Message containing the model's response.
     """
 
   @abc.abstractmethod
@@ -701,7 +751,7 @@ class AbstractConversation(abc.ABC):
       max_output_tokens: int | None = None,
       thinking_config: ThinkingConfig | None = None,
       response_format: ResponseFormat | None = None,
-  ) -> collections.abc.Iterator[collections.abc.Mapping[str, Any]]:
+  ) -> collections.abc.Iterator[Message]:
     """Sends a message and streams the response.
 
     Args:
@@ -723,8 +773,7 @@ class AbstractConversation(abc.ABC):
           response will be constrained to this format.
 
     Returns:
-        An iterator yielding dictionaries containing chunks of the model's
-        response.
+        An iterator yielding Message chunks of the model's response.
     """
 
   @abc.abstractmethod
@@ -750,6 +799,15 @@ class AbstractConversation(abc.ABC):
   @abc.abstractmethod
   def token_count(self) -> int:
     """The number of tokens in the KV Cache (prefill + decode)."""
+
+  @abc.abstractmethod
+  def clone(self) -> AbstractConversation:
+    """Clones the conversation, copying its state for independent use.
+
+    Returns:
+        A new conversation instance with the same message history, KV cache
+        state, and configuration.
+    """
 
   @abc.abstractmethod
   def get_benchmark_info(self) -> BenchmarkInfo:
@@ -794,42 +852,68 @@ class BenchmarkInfo:
 
 def create_benchmark_info(lib: Any, info_ptr: Any) -> BenchmarkInfo:
   """Creates a BenchmarkInfo object from a C API pointer."""
-  num_prefill_turns = lib.litert_lm_benchmark_info_get_num_prefill_turns(
-      info_ptr
+  num_prefill_turns = get_checked(
+      lib,
+      "litert_lm_benchmark_info_get_num_prefill_turns",
+      ctypes.c_size_t,
+      info_ptr,
   )
   if num_prefill_turns > 0:
-    last_prefill_count = (
-        lib.litert_lm_benchmark_info_get_prefill_token_count_at(
-            info_ptr, num_prefill_turns - 1
-        )
+    last_prefill_count = get_checked(
+        lib,
+        "litert_lm_benchmark_info_get_prefill_token_count_at",
+        ctypes.c_size_t,
+        info_ptr,
+        num_prefill_turns - 1,
     )
-    last_prefill_tps = (
-        lib.litert_lm_benchmark_info_get_prefill_tokens_per_sec_at(
-            info_ptr, num_prefill_turns - 1
-        )
+    last_prefill_tps = get_checked(
+        lib,
+        "litert_lm_benchmark_info_get_prefill_tokens_per_sec_at",
+        ctypes.c_double,
+        info_ptr,
+        num_prefill_turns - 1,
     )
   else:
     last_prefill_count = 0
     last_prefill_tps = 0.0
 
-  num_decode_turns = lib.litert_lm_benchmark_info_get_num_decode_turns(info_ptr)
+  num_decode_turns = get_checked(
+      lib,
+      "litert_lm_benchmark_info_get_num_decode_turns",
+      ctypes.c_size_t,
+      info_ptr,
+  )
   if num_decode_turns > 0:
-    last_decode_count = lib.litert_lm_benchmark_info_get_decode_token_count_at(
-        info_ptr, num_decode_turns - 1
+    last_decode_count = get_checked(
+        lib,
+        "litert_lm_benchmark_info_get_decode_token_count_at",
+        ctypes.c_size_t,
+        info_ptr,
+        num_decode_turns - 1,
     )
-    last_decode_tps = lib.litert_lm_benchmark_info_get_decode_tokens_per_sec_at(
-        info_ptr, num_decode_turns - 1
+    last_decode_tps = get_checked(
+        lib,
+        "litert_lm_benchmark_info_get_decode_tokens_per_sec_at",
+        ctypes.c_double,
+        info_ptr,
+        num_decode_turns - 1,
     )
   else:
     last_decode_count = 0
     last_decode_tps = 0.0
 
   return BenchmarkInfo(
-      init_time_in_second=lib.litert_lm_benchmark_info_get_total_init_time_in_second(
-          info_ptr
+      init_time_in_second=get_checked(
+          lib,
+          "litert_lm_benchmark_info_get_total_init_time_in_second",
+          ctypes.c_double,
+          info_ptr,
       ),
-      time_to_first_token_in_second=lib.litert_lm_benchmark_info_get_time_to_first_token(
-          info_ptr
+      time_to_first_token_in_second=get_checked(
+          lib,
+          "litert_lm_benchmark_info_get_time_to_first_token",
+          ctypes.c_double,
+          info_ptr,
       ),
       last_prefill_token_count=last_prefill_count,
       last_prefill_tokens_per_second=last_prefill_tps,
@@ -850,10 +934,14 @@ class AbstractBenchmark(abc.ABC):
       max_num_tokens: Maximum number of tokens for the KV cache. If None, use
         the engine/model's default.
       cache_dir: Directory for caching compiled model artifacts.
-      enable_speculative_decoding: Whether to enable speculative decoding. If
-        None, use the model's default. If True, enable speculative decoding; an
-        error will be thrown if the model does not support it. If False, disable
-        it.
+      enable_speculative_decoding: Deprecated; use `speculative_decoding_config`
+        instead. Passing a value other than None to `Benchmark` emits a
+        `DeprecationWarning`. Read only when `speculative_decoding_config` sets
+        no mode: True is mode `SpeculativeDecodingMode.ON` and False is
+        `SpeculativeDecodingMode.OFF`.
+      speculative_decoding_config: The speculative decoding configuration of the
+        benchmarked engine. Fields left None use the runtime defaults (mode
+        `SpeculativeDecodingMode.OFF`).
       bos_token_id: The BOS token id for the model if one is configured.
       eos_token_ids: Stop token sequences configured for the model.
       prompt: The custom prompt string to tokenize and run. If the tokenized
@@ -875,10 +963,23 @@ class AbstractBenchmark(abc.ABC):
   max_num_tokens: int | None = None
   cache_dir: str | None = None
   enable_speculative_decoding: bool | None = None
+  speculative_decoding_config: SpeculativeDecodingConfig | None = None
   prompt: str = "How are you"
   activation_data_type: ActivationDataType | None = None
   use_ringbuffers_local_attention: bool | None = None
   enable_ynnpack: bool | None = None
+
+  def __enter__(self) -> AbstractBenchmark:
+    """Initializes the benchmark resources."""
+    return self
+
+  def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    """Releases the benchmark resources."""
+    del exc_type, exc_val, exc_tb
+    self.close()
+
+  def close(self) -> None:
+    """Releases any underlying benchmark resources."""
 
   @abc.abstractmethod
   def run(self) -> BenchmarkInfo:
@@ -917,7 +1018,6 @@ class Responses:
   token_scores: list[list[float]] = dataclasses.field(default_factory=list)
 
 
-# TODO(b/482060476): Add clone() API once switching to advanced engine.
 class AbstractSession(abc.ABC):
   """Abstract base class for managing LiteRT-LM sessions."""
 
@@ -931,6 +1031,14 @@ class AbstractSession(abc.ABC):
   def __exit__(self, exc_type, exc_val, exc_tb) -> None:
     """Releases the session."""
     del exc_type, exc_val, exc_tb
+
+  @abc.abstractmethod
+  def clone(self) -> AbstractSession:
+    """Clones the session, copying its state for independent use.
+
+    Returns:
+        A new session instance with the same KV cache state and configuration.
+    """
 
   @abc.abstractmethod
   def run_prefill(self, contents: list[str]) -> None:

@@ -39,19 +39,23 @@
 #include "absl/strings/match.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/strings/strip.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/c/litert_any.h"  // from @litert
 #include "litert/c/litert_common.h"  // from @litert
 #include "litert/c/litert_compiled_model.h"  // from @litert
 #include "litert/c/litert_metrics.h"  // from @litert
+#include "litert/c/options/litert_gpu_options.h"  // from @litert
 #include "litert/cc/litert_element_type.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_expected.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_model.h"  // from @litert
+#include "litert/cc/litert_model_types.h"  // from @litert
 #include "litert/cc/litert_options.h"  // from @litert
 #include "litert/cc/litert_ranked_tensor_type.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "litert/cc/litert_tensor_buffer_types.h"  // from @litert
 #include "litert/cc/options/litert_cpu_options.h"  // from @litert
 #include "litert/cc/options/litert_gpu_options.h"  // from @litert
 #include "runtime/components/embedding_lookup/embedding_lookup_manager.h"
@@ -63,6 +67,7 @@
 #include "runtime/components/model_resources_litert_lm.h"  // IWYU pragma: keep
 #include "runtime/components/model_resources_task.h"
 #include "runtime/executor/executor_settings_base.h"
+#include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/file_format_util.h"
 #include "runtime/util/file_util.h"
@@ -72,6 +77,7 @@
 #include "runtime/util/tensor_buffer_util.h"
 #include "schema/core/litertlm_header_schema_generated.h"
 #include "tflite/delegates/xnnpack/xnnpack_delegate.h"  // from @litert
+#include "tflite/schema/schema_generated.h"  // from @litert
 #include "tflite/types/half.h"  // from @litert
 
 namespace litert::lm {
@@ -80,6 +86,14 @@ namespace {
 
 // The name of the prefill decode model in the task bundle.
 constexpr char kPrefilDecodeModelNameInTaskBundle[] = "TF_LITE_PREFILL_DECODE";
+// External buffer group name of a model's own TFLiteWeights section. The same
+// name followed by kWeightGroupModelTypeSeparator and a model type (e.g.
+// "tflite_weights:tf_lite_prefill_decode") references that model's
+// TFLiteWeights section instead. This lets a model reuse a payload stored once
+// for several models (such as a token embedding table that is also the tied
+// output projection).
+constexpr absl::string_view kModelWeightGroupName = "tflite_weights";
+constexpr absl::string_view kWeightGroupModelTypeSeparator = ":";
 // Possible input tokens names:
 constexpr std::array<absl::string_view, 2> kInputTokensNames = {"token_ids",
                                                                 "tokens"};
@@ -153,8 +167,9 @@ BuildModelResourcesFromLitertLmFormat(const ModelAssets& model_assets,
   // models omit TF_LITE_AUX and must remain buffer-backed so their flatbuffer
   // can be mutated in place.
   if (!enable_file_backed_model_loading && enable_file_backed_for_aot_npu) {
-    auto aux_section = loader->GetSectionLocation(BufferKey(
-        schema::AnySectionDataType_TFLiteModel, ModelType::kTfLiteAux));
+    auto aux_section = loader->GetSectionLocation(
+        BufferKey(schema::AnySectionDataType_TFLiteModel,
+                  proto::LlmMetadata::TF_LITE_AUX));
     enable_file_backed_model_loading =
         aux_section.ok() && aux_section->second > aux_section->first;
   }
@@ -324,6 +339,27 @@ void FillRingBufferDecodeAttentionMask(litert::ElementType elem_type,
   }
 }
 
+// Returns the names of the external buffer groups declared by a serialized
+// TFLite model, in declaration order. Returns an empty vector when the model
+// has no external buffers (the common case for models with embedded weights).
+std::vector<std::string> GetExternalBufferGroupNames(
+    absl::string_view model_buffer) {
+  std::vector<std::string> names;
+  const tflite::Model* model = tflite::GetModel(model_buffer.data());
+  if (model == nullptr || model->external_buffer_groups() == nullptr) {
+    return names;
+  }
+  for (const tflite::ExternalBufferGroup* group :
+       *model->external_buffer_groups()) {
+    if (group == nullptr || group->name() == nullptr ||
+        group->name()->empty()) {
+      continue;
+    }
+    names.push_back(group->name()->str());
+  }
+  return names;
+}
+
 }  // namespace
 
 absl::StatusOr<ModelSignatures> GetModelSignaturesFromInputOutputNames(
@@ -414,11 +450,16 @@ absl::Status GetKVCacheRootNames(std::vector<absl::string_view> input_names,
       return absl::OkStatus();
     }
   }
-  // Fall back to conv cache if no standard key/value cache names exist.
+  // Fall back to linear attention (conv / recurrent) cache if no standard
+  // key/value cache names exist.
   for (auto input_name : input_names) {
     if (absl::StartsWith(input_name, "kv_cache_c_")) {
       k_root_name = "kv_cache_c_";
       v_root_name = "kv_cache_c_";
+      return absl::OkStatus();
+    } else if (absl::StartsWith(input_name, "kv_cache_r_")) {
+      k_root_name = "kv_cache_r_";
+      v_root_name = "kv_cache_r_";
       return absl::OkStatus();
     }
   }
@@ -427,23 +468,46 @@ absl::Status GetKVCacheRootNames(std::vector<absl::string_view> input_names,
       k_root_name = "kv_cache_c_";
       v_root_name = "kv_cache_c_";
       return absl::OkStatus();
+    } else if (absl::StartsWith(output_name, "kv_cache_r_")) {
+      k_root_name = "kv_cache_r_";
+      v_root_name = "kv_cache_r_";
+      return absl::OkStatus();
     }
   }
   return absl::FailedPreconditionError("No KV cache inputs found.");
 }
 
-absl::StatusOr<SortedPrefillSignatureMap> GetPrefillRunnerSetFromModel(
-    const ::litert::Model& model, absl::string_view signature_name_base,
-    absl::string_view input_positions_name) {
+bool IsLinearAttentionStateName(absl::string_view name) {
+  static constexpr absl::string_view kLinearAttentionStatePrefixes[] = {
+      "kv_cache_c_",  // Convolution state.
+      "kv_cache_r_",  // Recurrent state.
+  };
+  for (absl::string_view prefix : kLinearAttentionStatePrefixes) {
+    if (absl::StartsWith(name, prefix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+namespace {
+
+absl::StatusOr<SortedPrefillSignatureMap> GetPrefillRunnerSetFromSignatures(
+    absl::Span<const SimpleSignature> signatures,
+    absl::string_view signature_name_base,
+    absl::string_view input_positions_name,
+    absl::Span<const std::string> selected_signatures) {
   SortedPrefillSignatureMap prefill_runner_set;
-  auto signatures = model.GetSignatures();
-  for (auto& signature : *signatures) {
+  for (const auto& signature : signatures) {
+    if (!selected_signatures.empty() &&
+        absl::c_find(selected_signatures, signature.Key()) ==
+            selected_signatures.end()) {
+      continue;
+    }
     if (auto signature_key = signature.Key();
         absl::StartsWith(signature_key, signature_name_base)) {
-      LITERT_ASSIGN_OR_RETURN(auto input_positions_tensor,
-                              signature.InputTensor(input_positions_name));
       LITERT_ASSIGN_OR_RETURN(auto ranked_tensor_type,
-                              input_positions_tensor.RankedTensorType());
+                              signature.InputTensorType(input_positions_name));
       if (ranked_tensor_type.Layout().Rank() == 2) {
         // [batch_size, max_seq_len]
         prefill_runner_set[ranked_tensor_type.Layout().Dimensions()[1]] =
@@ -459,6 +523,28 @@ absl::StatusOr<SortedPrefillSignatureMap> GetPrefillRunnerSetFromModel(
     }
   }
   return prefill_runner_set;
+}
+
+}  // namespace
+
+absl::StatusOr<SortedPrefillSignatureMap> GetPrefillRunnerSetFromModel(
+    const ::litert::Model& model, absl::string_view signature_name_base,
+    absl::string_view input_positions_name,
+    absl::Span<const std::string> selected_signatures) {
+  LITERT_ASSIGN_OR_RETURN(auto signatures, model.GetSignatures());
+  return GetPrefillRunnerSetFromSignatures(signatures, signature_name_base,
+                                           input_positions_name,
+                                           selected_signatures);
+}
+
+absl::StatusOr<SortedPrefillSignatureMap> GetPrefillRunnerSetFromModel(
+    CompiledModel& model, absl::string_view signature_name_base,
+    absl::string_view input_positions_name,
+    absl::Span<const std::string> selected_signatures) {
+  LITERT_ASSIGN_OR_RETURN(auto signatures, model.GetSignatures());
+  return GetPrefillRunnerSetFromSignatures(signatures, signature_name_base,
+                                           input_positions_name,
+                                           selected_signatures);
 }
 
 absl::StatusOr<std::vector<std::pair<std::string, int>>>
@@ -679,6 +765,71 @@ AttentionMaskParams GetAttentionMaskParams(
     }
   }
   return params;
+}
+
+namespace {
+
+// Returns true if `buffer` is a boolean mask that fell back to host memory,
+// i.e. no GPU consumer registered buffer requirements for it.
+bool IsPrunedBoolHostMask(const ::litert::TensorBuffer* buffer) {
+  if (buffer == nullptr || !*buffer) {
+    return false;
+  }
+  auto tensor_type = buffer->TensorType();
+  if (!tensor_type.HasValue() ||
+      tensor_type->ElementType() != ::litert::ElementType::Bool) {
+    return false;
+  }
+  auto buffer_type = buffer->BufferType();
+  return buffer_type.HasValue() &&
+         *buffer_type == ::litert::TensorBufferType::kHostMemory;
+}
+
+bool IsBidirectionalMaskType(proto::AttentionMaskType type) {
+  return type == proto::ATTENTION_MASK_TYPE_BIDIRECTIONAL ||
+         type == proto::ATTENTION_MASK_TYPE_VISION_BIDIRECTIONAL;
+}
+
+}  // namespace
+
+bool ShouldSkipGlobalCausalAttentionMask(
+    Backend backend, bool gpu_optimized_single_buffer_cache,
+    const ModelSignatures& signatures, const AttentionMaskParams& attn_params,
+    const ::litert::TensorBuffer* attn_mask_buffer,
+    const ::litert::TensorBuffer* attn_mask_local_buffer) {
+  if (backend != Backend::GPU || !gpu_optimized_single_buffer_cache ||
+      !signatures.input_attn_mask.has_value() ||
+      !signatures.input_int32_param.has_value() ||
+      IsBidirectionalMaskType(attn_params.global_type)) {
+    return false;
+  }
+  // When the GPU delegate consumes the attention mask, it registers GPU buffer
+  // requirements for `input_attn_mask`, so `CreateInputBuffer` allocates a
+  // device buffer (e.g., Metal, OpenCL, or WebGPU). When all SDPA nodes in the
+  // subgraph compute causal masking directly from `param_tensor` and prune the
+  // boolean mask consumer from the GPU graph, no GPU buffer requirement is
+  // registered and `CreateInputBuffer` falls back to `kHostMemory`.
+  //
+  // The fallback host buffer is still allocated (`posix_memalign`), but once
+  // this returns true the executor never locks, initializes, or fills it, and
+  // the GPU graph never reads it. Its pages are therefore never touched and do
+  // not become resident, so the cost is address space rather than physical
+  // memory. Previously the same buffer was zeroed and filled on every prefill
+  // chunk and decode step (e.g. 1024 x 32768 bytes = 32 MB per prefill call),
+  // which did commit it.
+  if (!IsPrunedBoolHostMask(attn_mask_buffer)) {
+    return false;
+  }
+  // Models without a local mask leave `input_attn_mask_local` unset and pass
+  // `attn_mask_local_buffer == nullptr`, which still skips the global mask.
+  // When `input_attn_mask_local` is present, the executor initializes and fills
+  // both masks under the same guard, so the local mask must also be causal and
+  // pruned from the GPU graph.
+  if (signatures.input_attn_mask_local.has_value()) {
+    return !IsBidirectionalMaskType(attn_params.local_type) &&
+           IsPrunedBoolHostMask(attn_mask_local_buffer);
+  }
+  return true;
 }
 
 absl::Status FillAttentionMask(
@@ -929,6 +1080,9 @@ absl::Status SetCommonGpuOptions(
 #endif  // !__APPLE__
   gpu_options.SetMadviseOriginalSharedTensors(true);
   gpu_options.SetConvertWeightsOnGpu(true);
+  // "default" (unset) currently resolves to disabled.
+  LrtSetGpuOptionsUseIrModel(gpu_options.Get(),
+                             executor_settings.UseIrModel().value_or(false));
   return absl::OkStatus();
 }
 
@@ -1090,19 +1244,58 @@ absl::StatusOr<GpuModelCacheData> GetGpuModelCacheData(
 }
 
 absl::StatusOr<ExternalWeightResources> GetExternalWeightResources(
-    ModelResources& resources, ModelType model_type) {
+    ModelResources& resources, absl::string_view model_type_str) {
   ExternalWeightResources external_weights;
-  auto section_offset = resources.GetWeightsSectionOffset(model_type);
-  if (!section_offset.ok()) {
-    if (!absl::IsNotFound(section_offset.status()) &&
-        !absl::IsUnimplemented(section_offset.status())) {
-      return section_offset.status();
+
+  // Determine the external buffer groups the serialized model references. When
+  // the serialized model is not available (e.g. a resource format that does
+  // not expose model buffers), fall back to the model's own weights group.
+  std::vector<std::string> group_names;
+  auto model_buffer = resources.GetTFLiteModelBuffer(model_type_str);
+  if (model_buffer.ok()) {
+    group_names = GetExternalBufferGroupNames(*model_buffer);
+  } else if (absl::IsNotFound(model_buffer.status()) ||
+             absl::IsUnimplemented(model_buffer.status())) {
+    group_names.emplace_back(kModelWeightGroupName);
+  } else {
+    return model_buffer.status();
+  }
+
+  for (const std::string& group_name : group_names) {
+    absl::StatusOr<std::pair<size_t, size_t>> section_offset;
+    absl::string_view other_model_type = group_name;
+    if (group_name == kModelWeightGroupName) {
+      section_offset = resources.GetWeightsSectionOffset(model_type_str);
+    } else if (absl::ConsumePrefix(&other_model_type, kModelWeightGroupName) &&
+               absl::ConsumePrefix(&other_model_type,
+                                   kWeightGroupModelTypeSeparator)) {
+      section_offset = resources.GetWeightsSectionOffset(other_model_type);
+    } else {
+      ABSL_LOG(WARNING) << "Model " << model_type_str
+                        << " references unsupported external buffer group '"
+                        << group_name << "'.";
+      continue;
     }
+    if (!section_offset.ok()) {
+      if (!absl::IsNotFound(section_offset.status()) &&
+          !absl::IsUnimplemented(section_offset.status())) {
+        return section_offset.status();
+      }
+      if (group_name != kModelWeightGroupName) {
+        ABSL_LOG(WARNING) << "Model " << model_type_str
+                          << " references external buffer group '" << group_name
+                          << "' but the model container has no matching"
+                             " TFLiteWeights section.";
+      }
+      continue;
+    }
+    external_weights.sections[group_name] = {
+        section_offset->first, section_offset->second - section_offset->first};
+  }
+  if (external_weights.sections.empty()) {
     return external_weights;
   }
 
-  external_weights.sections["tflite_weights"] = {
-      section_offset->first, section_offset->second - section_offset->first};
   LITERT_ASSIGN_OR_RETURN(auto scoped_file, resources.GetScopedFile());
   LITERT_ASSIGN_OR_RETURN(auto duplicated_scoped_file,
                           scoped_file.get().Duplicate());
@@ -1111,22 +1304,22 @@ absl::StatusOr<ExternalWeightResources> GetExternalWeightResources(
 }
 
 absl::Status SetExternalWeightOptions(ModelResources& resources,
-                                      ModelType model_type,
+                                      absl::string_view model_type_str,
                                       litert::Options& compilation_options) {
-  if (const auto* weight_map = resources.GetWeightInMemoryMap(model_type);
+  if (const auto* weight_map = resources.GetWeightInMemoryMap(model_type_str);
       weight_map != nullptr) {
     compilation_options.SetWeightInMemoryMap(weight_map);
   }
   ABSL_ASSIGN_OR_RETURN(auto external_weights,
-                        GetExternalWeightResources(resources, model_type));
+                        GetExternalWeightResources(resources, model_type_str));
   if (!external_weights.scoped_file.has_value()) {
     return absl::OkStatus();
   }
-  ABSL_VLOG(1) << "External weights for model type "
-               << static_cast<int>(model_type) << ": offset "
-               << external_weights.sections["tflite_weights"].offset
-               << ", length "
-               << external_weights.sections["tflite_weights"].length;
+  for (const auto& [group_name, section] : external_weights.sections) {
+    ABSL_VLOG(1) << "External weights for model type " << model_type_str
+                 << ", group " << group_name << ": offset " << section.offset
+                 << ", length " << section.length;
+  }
   compilation_options.SetExternalWeightScopedFile(*external_weights.scoped_file,
                                                   external_weights.sections);
   return absl::OkStatus();
@@ -1139,7 +1332,7 @@ absl::Status InitializeEmbeddingLookups(
   absl::flat_hash_map<int, const Model*> end_of_multi_modal_embedding_models;
   {
     auto end_of_audio_model =
-        resources.GetTFLiteModel(ModelType::kTfLiteEndOfAudio);
+        resources.GetTFLiteModel(proto::LlmMetadata::TF_LITE_END_OF_AUDIO);
     if (end_of_audio_model.ok()) {
       end_of_multi_modal_embedding_models.insert(
           {ExecutorAudioData::kEndToken, end_of_audio_model.value()});
@@ -1147,7 +1340,7 @@ absl::Status InitializeEmbeddingLookups(
   }
   {
     auto end_of_vision_model =
-        resources.GetTFLiteModel(ModelType::kTfLiteEndOfVision);
+        resources.GetTFLiteModel(proto::LlmMetadata::TF_LITE_END_OF_VISION);
     if (end_of_vision_model.ok()) {
       end_of_multi_modal_embedding_models.insert(
           {ExecutorVisionData::kEndToken, end_of_vision_model.value()});
@@ -1155,19 +1348,20 @@ absl::Status InitializeEmbeddingLookups(
   }
 
 #ifdef __EMSCRIPTEN__
-  extern void SetCurrentlyCompilingModel(ModelType model_type)
+  extern void SetCurrentlyCompilingModel(absl::string_view model_type_str)
       __attribute__((weak));
 #endif
 
   auto text_embedder_model =
-      resources.GetTFLiteModel(ModelType::kTfLiteEmbedder);
+      resources.GetTFLiteModel(proto::LlmMetadata::TF_LITE_EMBEDDER);
   if (text_embedder_model.ok()) {
-    ABSL_ASSIGN_OR_RETURN(
-        auto external_weights,
-        GetExternalWeightResources(resources, ModelType::kTfLiteEmbedder));
+    ABSL_ASSIGN_OR_RETURN(auto external_weights,
+                          GetExternalWeightResources(
+                              resources, proto::LlmMetadata::TF_LITE_EMBEDDER));
 #ifdef __EMSCRIPTEN__
     if (SetCurrentlyCompilingModel) {
-      SetCurrentlyCompilingModel(ModelType::kTfLiteEmbedder);
+      SetCurrentlyCompilingModel(
+          TfLiteModelTypeToWireString(proto::LlmMetadata::TF_LITE_EMBEDDER));
     }
 #endif
     auto status_or_embedding_lookup = EmbeddingLookupManager::Create(
@@ -1175,10 +1369,10 @@ absl::Status InitializeEmbeddingLookups(
         /*fully_supports_multi_modal=*/true,
         /*signature_key=*/std::nullopt, std::move(external_weights.scoped_file),
         std::move(external_weights.sections),
-        resources.GetWeightInMemoryMap(ModelType::kTfLiteEmbedder));
+        resources.GetWeightInMemoryMap(proto::LlmMetadata::TF_LITE_EMBEDDER));
 #ifdef __EMSCRIPTEN__
     if (SetCurrentlyCompilingModel) {
-      SetCurrentlyCompilingModel(ModelType::kUnknown);
+      SetCurrentlyCompilingModel("");
     }
 #endif
     ABSL_ASSIGN_OR_RETURN(embedding_lookup,
@@ -1187,14 +1381,16 @@ absl::Status InitializeEmbeddingLookups(
 
   // Create per layer embedding lookups from the resources.
   auto per_layer_embedder_model =
-      resources.GetTFLiteModel(ModelType::kTfLitePerLayerEmbedder);
+      resources.GetTFLiteModel(proto::LlmMetadata::TF_LITE_PER_LAYER_EMBEDDER);
   if (per_layer_embedder_model.ok()) {
-    ABSL_ASSIGN_OR_RETURN(auto external_weights,
-                          GetExternalWeightResources(
-                              resources, ModelType::kTfLitePerLayerEmbedder));
+    ABSL_ASSIGN_OR_RETURN(
+        auto external_weights,
+        GetExternalWeightResources(
+            resources, proto::LlmMetadata::TF_LITE_PER_LAYER_EMBEDDER));
 #ifdef __EMSCRIPTEN__
     if (SetCurrentlyCompilingModel) {
-      SetCurrentlyCompilingModel(ModelType::kTfLitePerLayerEmbedder);
+      SetCurrentlyCompilingModel(TfLiteModelTypeToWireString(
+          proto::LlmMetadata::TF_LITE_PER_LAYER_EMBEDDER));
     }
 #endif
     auto status_or_per_layer_embedding_lookup = EmbeddingLookupManager::Create(
@@ -1202,10 +1398,11 @@ absl::Status InitializeEmbeddingLookups(
         /*fully_supports_multi_modal=*/false,
         /*signature_key=*/std::nullopt, std::move(external_weights.scoped_file),
         std::move(external_weights.sections),
-        resources.GetWeightInMemoryMap(ModelType::kTfLitePerLayerEmbedder));
+        resources.GetWeightInMemoryMap(
+            proto::LlmMetadata::TF_LITE_PER_LAYER_EMBEDDER));
 #ifdef __EMSCRIPTEN__
     if (SetCurrentlyCompilingModel) {
-      SetCurrentlyCompilingModel(ModelType::kUnknown);
+      SetCurrentlyCompilingModel("");
     }
 #endif
     ABSL_ASSIGN_OR_RETURN(per_layer_embedding_lookup,

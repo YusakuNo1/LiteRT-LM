@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import {Engine, getOrLoadGlobalLiteRtLm} from '@litert-lm/core';
+import {Engine, getOrLoadGlobalLiteRtLm, Message} from '@litert-lm/core';
 import {EngineFake} from '@litert-lm/core/testing';
 
 import {ChatSessionStore} from './chat_session_store.js';
@@ -190,13 +190,13 @@ describe('ChatSessionStore', () => {
          // idx: 3
        ];
 
-       const extractText = await chatSessionStore.rewindAndEdit(2);
+       const extractParts = await chatSessionStore.rewindAndEdit(2);
 
        expect(chatSessionStore.messages.length)
            .toBe(2);  // array was truncated right before the user message
-       expect(extractText)
-           .toEqual('Please edit me');  // the target user message is extracted
-                                        // correctly
+       expect(extractParts).toEqual([
+         {type: 'text', text: 'Please edit me'}
+       ]);  // the target user message is extracted correctly
      });
 
   it('creates conversation session cleanly', async () => {
@@ -213,8 +213,102 @@ describe('ChatSessionStore', () => {
 
     expect(chatSessionStore.messages.length).toBe(2);
     expect(chatSessionStore.messages[0].text).toBe('Hello model');
+    expect(chatSessionStore.messages[0].parts).toBeUndefined();
     expect(chatSessionStore.messages[1].text).toBe('hello from fake');
     expect(chatSessionStore.isGenerating).toBeFalse();
+  });
+
+  it('sendMessage sends media in the order they were placed', async () => {
+    await chatSessionStore.createConversationSession();
+    const imageBlob =
+        new Blob([new Uint8Array([1, 2, 3])], {type: 'image/png'});
+    const audioBlob =
+        new Blob([new Uint8Array([4, 5, 6])], {type: 'audio/wav'});
+    const image = chatSessionStore.createMedia('image', 'cat.png', imageBlob);
+    const audio = chatSessionStore.createMedia('audio', 'meow.wav', audioBlob);
+    const sendSpy =
+        spyOn(chatSessionStore.activeConversation!, 'sendMessageStreaming')
+            .and.callThrough();
+
+    await chatSessionStore.sendMessage([
+      {type: 'text', text: '  Is '},
+      {type: 'media', media: image},
+      {type: 'text', text: ' making this sound: '},
+      {type: 'media', media: audio},
+      {type: 'text', text: '?  '},
+    ]);
+
+    const expectedMessage: Message = {
+      role: 'user',
+      content: [
+        {type: 'text', text: 'Is '},
+        {type: 'image', data: imageBlob},
+        {type: 'text', text: ' making this sound: '},
+        {type: 'audio', data: audioBlob},
+        {type: 'text', text: '?'},
+      ],
+    };
+    expect(sendSpy.calls.mostRecent().args[0]).toEqual(expectedMessage);
+    const userMsg = chatSessionStore.messages[0];
+    expect(userMsg.text)
+        .toBe('Is [image: cat.png] making this sound: [audio: meow.wav]?');
+    expect(userMsg.parts).toEqual([
+      {type: 'text', text: 'Is '},
+      {type: 'image', id: image.id, name: 'cat.png'},
+      {type: 'text', text: ' making this sound: '},
+      {type: 'audio', id: audio.id, name: 'meow.wav'},
+      {type: 'text', text: '?'},
+    ]);
+
+    // Only media references are persisted, not media bytes.
+    const history = window.localStorage.getItem(
+        `litertlm-chat-history-${chatSessionStore.activeSavedConvId}`);
+    expect(history).toContain(image.id);
+    expect(history).toContain(audio.id);
+  });
+
+  it('restores media from memory and placeholders otherwise', () => {
+    const image = chatSessionStore.createMedia(
+        'image', 'cat.png', new Blob([], {type: 'image/png'}));
+    const parts = chatSessionStore.getMessageParts({
+      role: 'user',
+      text: '',
+      senderName: 'User',
+      parts: [
+        {type: 'image', id: image.id, name: 'cat.png'},
+        {type: 'text', text: ' and '},
+        {type: 'image', id: 'gone', name: 'dog.png'},
+        {type: 'audio', id: 'gone too', name: 'bark.wav'},
+      ],
+    });
+
+    expect(parts).toEqual([
+      {type: 'media', media: image},
+      {type: 'text', text: ' and '},
+      {type: 'text', text: '[image: dog.png]'},
+      {type: 'text', text: '[audio: bark.wav]'},
+    ]);
+  });
+
+  it('redoResponse resends media', async () => {
+    const audio = chatSessionStore.createMedia(
+        'audio', 'meow.wav', new Blob([], {type: 'audio/wav'}));
+    chatSessionStore.messages = [
+      {
+        role: 'user',
+        text: '[audio: meow.wav]',
+        parts: [{type: 'audio', id: audio.id, name: 'meow.wav'}],
+        senderName: 'User'
+      },
+      {role: 'assistant', text: 'A cat', senderName: 'Assistant'},
+    ];
+    spyOn(chatSessionStore, 'sendMessage').and.returnValue(Promise.resolve());
+
+    await chatSessionStore.redoResponse(1);
+
+    expect(chatSessionStore.sendMessage).toHaveBeenCalledWith([
+      {type: 'media', media: audio}
+    ]);
   });
 
   it('sendMessage processes simulated function calls correctly', async () => {

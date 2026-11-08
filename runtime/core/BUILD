@@ -47,12 +47,30 @@ package_group(
     ],
 )
 
-ENGINE_IMPL_COMMON_DEPS = [
+cc_library(
+    name = "engine_vision_utils",
+    srcs = ["engine_vision_utils.cc"],
+    hdrs = ["engine_vision_utils.h"],
+    deps = [
+        "@com_google_absl//absl/base:nullability",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/strings",
+        "//runtime/components:model_resources",
+        "//runtime/engine:engine_settings",
+        "//runtime/executor:model_signature_utils",
+        "//runtime/proto:llm_metadata_cc_proto",
+    ],
+)
+
+ENGINE_IMPL_BASE_DEPS = [
     ":audio_session_advanced",
+    ":engine_vision_utils",
     ":session_advanced",
     ":cached_session",
     "@com_google_absl//absl/base:core_headers",
     "@com_google_absl//absl/base:no_destructor",
+    "@com_google_absl//absl/cleanup",
     "@com_google_absl//absl/log",
     "@com_google_absl//absl/log:absl_check",
     "@com_google_absl//absl/log:absl_log",
@@ -66,7 +84,9 @@ ENGINE_IMPL_COMMON_DEPS = [
     "@com_google_absl//absl/time",
     "@litert//litert/cc:litert_macros",
     "//runtime/components:model_resources",
+    "//runtime/components:model_resources_streaming",
     "//support/tokenizer",
+    "//support/tokenizer:sentencepiece_tokenizer",
     "//runtime/engine:engine_factory",
     "//runtime/engine:engine_interface",
     "//runtime/engine:engine_settings",
@@ -75,34 +95,64 @@ ENGINE_IMPL_COMMON_DEPS = [
     "//runtime/executor:audio_executor_settings",
     "//runtime/executor:audio_executor_utils",
     "//runtime/executor:audio_litert_compiled_model_executor",
+    "//runtime/executor:executor_backend_registry",
     "//runtime/executor:executor_settings_base",
     "//runtime/executor:litert_compiled_model_executor_utils",
     "//runtime/executor:llm_executor",
     "//runtime/executor:llm_executor_settings",
+    "//runtime/executor:llm_executor_settings_utils",
     "//runtime/executor:llm_litert_compiled_model_executor",
     "//runtime/executor:llm_litert_compiled_model_executor_factory",
+    "//runtime/executor:llm_litert_mtp_drafter",
     "//runtime/executor:magic_number_configs_helper",
     "//runtime/executor:model_signature_utils",
+    "//runtime/executor:speculative_decoding_mode",
     "//runtime/executor:vision_executor",
     "//runtime/executor:vision_executor_settings",
     "//runtime/executor:vision_executor_utils",
     "//runtime/executor:vision_litert_compiled_model_executor",
     "//runtime/framework:threadpool",
     "//runtime/framework/resource_management:execution_manager",
-    "//runtime/framework/resource_management:serial_execution_manager",
-    "//runtime/framework/resource_management:threaded_execution_manager",
+    "//runtime/proto:executor_metadata_cc_proto",
     "//runtime/proto:llm_metadata_cc_proto",
     "//runtime/proto:sampler_params_cc_proto",
-    "//runtime/util:file_format_util",
+    "//runtime/util:data_stream",
+    "//runtime/util:file_data_stream",
+    "//runtime/util:litert_lm_streaming_loader",
     "//runtime/util:litert_status_util",
     "//runtime/util:litert_util",
     "//runtime/util:logging",
+    "//runtime/util:streamed_weights_manager",
+    "//schema/core:litertlm_header_schema",
+    "//schema/core:litertlm_read",
+    "@litert//litert/cc:litert_buffer_ref",
+    "@litert//litert/cc:litert_compiled_model",
     "@litert//litert/cc:litert_environment",
-    "@litert//litert/cc:litert_environment_options",
+    "@litert//litert/cc:litert_model",
+]
+
+ENGINE_IMPL_COMMON_DEPS = ENGINE_IMPL_BASE_DEPS + [
+    "//runtime/components:model_resources_litert_lm",
+    "//runtime/framework/resource_management:serial_execution_manager",
+    "//runtime/framework/resource_management:threaded_execution_manager",
+] + select({
+    "//build_config:disable_huggingface_tokenizer": [
+        "//support/tokenizer:huggingface_tokenizer_noop",
+    ],
+    "//conditions:default": [
+        "//support/tokenizer:huggingface_tokenizer",
+    ],
+})
+
+ENGINE_IMPL_LITE_COMMON_DEPS = ENGINE_IMPL_BASE_DEPS + [
+    "//runtime/components:model_resources_litert_lm",
+    "//runtime/framework/resource_management:serial_execution_manager_lite",
+    "//runtime/framework/resource_management:threaded_execution_manager_lite",
+    "//support/tokenizer:huggingface_tokenizer_noop",
 ]
 
 cc_library(
-    name = "engine_advanced_impl",
+    name = "engine_advanced_impl_common",
     srcs = ["engine_advanced_impl.cc"],
     local_defines = select({
         "//conditions:default": [],
@@ -112,7 +162,63 @@ cc_library(
         ],
         "//conditions:default": [],
     }),
-    deps = ENGINE_IMPL_COMMON_DEPS + [
+    visibility = ["//visibility:private"],
+    deps = ENGINE_IMPL_COMMON_DEPS + select({
+        "//conditions:default": [],
+    }) + select({
+        "//runtime/util:litert_lm_debugger_enabled": [
+            "//runtime/util:runtime_debugger",
+        ],
+        "//conditions:default": [],
+    }),
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "engine_advanced_impl",
+    deps = [
+        ":engine_advanced_impl_common",
+        "//runtime/components:default_static_gpu_samplers",
+        "//runtime/executor:default_static_gpu_accelerator",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "engine_advanced_impl_cpu_only",
+    deps = [
+        ":engine_advanced_impl_common",
+    ],
+    alwayslink = 1,
+)
+
+# Lightweight Engine implementation ("LiteRT-LM Lite" profile) for
+# binary-size-constrained clients.
+#
+# Excluded heavy dependencies by default:
+#   - Legacy Artisan GPU/Audio executors (:resource_manager_lite)
+#   - HuggingFace Rust tokenizer (:huggingface_tokenizer_noop weak stubs are used
+#     unless //support/tokenizer:huggingface_tokenizer
+#     is explicitly linked).
+#
+# Usage expectations:
+#   1. Pair `:engine_advanced_impl_lite` (or `:engine_advanced_impl_cpu_only_lite`)
+#      with `//runtime/conversation:conversation_lite`.
+#   2. Do NOT link both `:engine_advanced_impl` and `:engine_advanced_impl_lite`
+#      (or both `:resource_manager` and `:resource_manager_lite`) in the same
+#      binary, as they provide competing link-time definitions for the same symbols.
+cc_library(
+    name = "engine_advanced_impl_lite",
+    srcs = ["engine_advanced_impl.cc"],
+    local_defines = select({
+        "//conditions:default": [],
+    }) + select({
+        "//runtime/util:litert_lm_debugger_enabled": [
+            "LITERT_LM_DEBUGGER_ENABLED=1",
+        ],
+        "//conditions:default": [],
+    }),
+    deps = ENGINE_IMPL_LITE_COMMON_DEPS + [
         "//runtime/components:default_static_gpu_samplers",
         "//runtime/executor:default_static_gpu_accelerator",
     ] + select({
@@ -127,7 +233,7 @@ cc_library(
 )
 
 cc_library(
-    name = "engine_advanced_impl_cpu_only",
+    name = "engine_advanced_impl_cpu_only_lite",
     srcs = ["engine_advanced_impl.cc"],
     local_defines = select({
         "//runtime/util:litert_lm_debugger_enabled": [
@@ -135,7 +241,7 @@ cc_library(
         ],
         "//conditions:default": [],
     }),
-    deps = ENGINE_IMPL_COMMON_DEPS + select({
+    deps = ENGINE_IMPL_LITE_COMMON_DEPS + select({
         "//runtime/util:litert_lm_debugger_enabled": [
             "//runtime/util:runtime_debugger",
         ],
@@ -147,9 +253,14 @@ cc_library(
 cc_test(
     name = "engine_advanced_impl_test",
     srcs = ["engine_advanced_impl_test.cc"],
-    data = ["//runtime/testdata"],
+    data = [
+        "//runtime/testdata",
+    ],
     defines = ["ENGINE_ADVANCED"],
-    tags = ["requires-mac-inputs:hard"],
+    tags = [
+        "nowindows",
+        "requires-mac-inputs:hard",
+    ],
     deps = [
         ":engine_advanced_impl",  # buildcleaner: keep
         "@com_google_googletest//:gtest_main",
@@ -164,9 +275,83 @@ cc_test(
         "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
+        "//runtime/executor:executor_backend_registry",
         "//runtime/executor:executor_settings_base",
+        "//runtime/executor:llm_executor",
         "//runtime/executor:llm_executor_settings",
-        "//runtime/proto:sampler_params_cc_proto",
+        "//runtime/util:file_data_stream",
+        "//runtime/util:litert_status_util",
+        "//runtime/util:scoped_file",
+        "//runtime/util:test_utils",
+    ],
+)
+
+cc_test(
+    name = "engine_advanced_impl_lite_test",
+    srcs = ["engine_advanced_impl_test.cc"],
+    data = [
+        "//runtime/testdata",
+    ],
+    defines = ["ENGINE_ADVANCED"],
+    tags = [
+        "nowindows",
+        "requires-mac-inputs:hard",
+    ],
+    deps = [
+        ":engine_advanced_impl_lite",  # buildcleaner: keep
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "//runtime/components:model_resources",
+        "//runtime/engine:engine_factory",
+        "//runtime/engine:engine_interface",
+        "//runtime/engine:engine_settings",
+        "//runtime/engine:io_types",
+        "//runtime/executor:executor_backend_registry",
+        "//runtime/executor:executor_settings_base",
+        "//runtime/executor:llm_executor",
+        "//runtime/executor:llm_executor_settings",
+        "//runtime/util:file_data_stream",
+        "//runtime/util:litert_status_util",
+        "//runtime/util:scoped_file",
+        "//runtime/util:test_utils",
+    ],
+)
+
+cc_test(
+    name = "engine_advanced_impl_cpu_only_lite_test",
+    srcs = ["engine_advanced_impl_test.cc"],
+    data = [
+        "//runtime/testdata",
+    ],
+    defines = ["ENGINE_ADVANCED"],
+    tags = [
+        "nowindows",
+        "requires-mac-inputs:hard",
+    ],
+    deps = [
+        ":engine_advanced_impl_cpu_only_lite",  # buildcleaner: keep
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "//runtime/components:model_resources",
+        "//runtime/engine:engine_factory",
+        "//runtime/engine:engine_interface",
+        "//runtime/engine:engine_settings",
+        "//runtime/engine:io_types",
+        "//runtime/executor:executor_backend_registry",
+        "//runtime/executor:executor_settings_base",
+        "//runtime/executor:llm_executor",
+        "//runtime/executor:llm_executor_settings",
+        "//runtime/util:file_data_stream",
         "//runtime/util:litert_status_util",
         "//runtime/util:scoped_file",
         "//runtime/util:test_utils",
@@ -279,6 +464,7 @@ cc_library(
         "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
+        "//runtime/executor:llm_executor_io_types",
         "//runtime/framework/resource_management:execution_manager",
         "//runtime/proto:sampler_params_cc_proto",
         "//runtime/util:litert_status_util",
@@ -415,6 +601,9 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_ranked_tensor_type",
+        "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
         "//runtime/util:litert_status_util",
@@ -438,9 +627,11 @@ cc_test(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@litert//litert/cc:litert_tensor_buffer",
         "@litert//litert/test:matchers",
+        "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
         "//runtime/proto:sampler_params_cc",
@@ -465,6 +656,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
+        "@litert//litert/cc:litert_common",
         "@litert//litert/cc:litert_element_type",
         "@litert//litert/cc:litert_macros",
         "@litert//litert/cc:litert_tensor_buffer",
@@ -481,12 +673,15 @@ cc_library(
         "//runtime/components/constrained_decoding:suppress_tokens_config",
         "//runtime/components/constrained_decoding:suppress_tokens_constraint",
         "//runtime/components/constrained_decoding:thinking_budget_constraint",
+        "//runtime/engine:engine_defaults",
         "//runtime/engine:io_types",
+        "//runtime/executor:executor_settings_base",
+        "//runtime/executor:executor_stats",
         "//runtime/executor:llm_executor",
         "//runtime/executor:llm_executor_io_types",
         "//runtime/executor:llm_executor_settings",
         "//runtime/executor:llm_litert_compiled_model_executor",
-        "//runtime/proto:sampler_params_cc",
+        "//runtime/executor:speculative_decoding_mode",
         "//runtime/util:convert_tensor_buffer",
         "//runtime/util:litert_status_util",
         "//support/tokenizer",
@@ -516,8 +711,10 @@ cc_test(
         "//runtime/components/constrained_decoding:repetition_penalty_config",
         "//runtime/components/constrained_decoding:suppress_tokens_config",
         "//runtime/engine:io_types",
+        "//runtime/executor:executor_stats",
         "//runtime/executor:fake_llm_executor",
         "//runtime/executor:llm_executor_io_types",
+        "//runtime/executor:speculative_decoding_mode",
         "//runtime/framework:threadpool",
         "//runtime/util:convert_tensor_buffer",
         "//runtime/util:litert_status_util",
@@ -611,6 +808,7 @@ cc_library(
     hdrs = ["embedding_engine_impl.h"],
     visibility = [":engine_impl_users"],
     deps = [
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
@@ -660,7 +858,13 @@ cc_library(
         "//support/preprocessor:image_preprocessor_impl",  # buildcleaner: keep
         "//support/tokenizer",
         "//support/util:io_types",
-    ],
+    ] + select({
+        "//build_config:disable_huggingface_tokenizer": [],
+        "@platforms//os:chromiumos": [],
+        "//conditions:default": [
+            "//support/tokenizer:huggingface_tokenizer",
+        ],
+    }),
 )
 
 cc_test(
@@ -704,6 +908,7 @@ cc_test(
         "//runtime/executor:vision_executor",
         "//runtime/proto:embedding_metadata_cc_proto",
         "//runtime/proto:embedding_model_type_cc_proto",
+        "//runtime/proto:llm_metadata_cc_proto",
         "//runtime/proto:token_cc_proto",
         "//runtime/util:convert_tensor_buffer",
         "//runtime/util:file_data_stream",

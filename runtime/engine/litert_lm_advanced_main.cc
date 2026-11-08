@@ -47,6 +47,7 @@
 #include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/engine/litert_lm_lib.h"
 #include "runtime/engine/shared_flags.h"
+#include "runtime/executor/executor_settings_base.h"
 #include "runtime/proto/litert_lm_metrics.pb.h"
 #include "runtime/util/logging.h"
 #include "runtime/util/metrics_util.h"
@@ -66,6 +67,11 @@ ABSL_FLAG(
 ABSL_FLAG(std::string, input_prompt, "",
           "Input prompt to use for testing LLM execution.");
 ABSL_FLAG(std::string, input_prompt_file, "", "File path to the input prompt.");
+ABSL_FLAG(std::vector<std::string>, selected_signatures, {},
+          "Optional comma-separated main-model signatures to initialize. "
+          "Uses LiteRT runtime signature selection to prune inactive "
+          "graphs. Empty keeps all signatures. Include decode and a prefill "
+          "signature; include verify when using speculative decoding.");
 ABSL_FLAG(std::string, metric_proto_file_path, "",
           "Path to the file where the benchmark metrics will be saved in "
           "protobuf format. Only collected when --benchmark is true.");
@@ -217,6 +223,7 @@ absl::Status MainHelper(int argc, char** argv) {
            "[--score_target_text=<target_text>] "
            "[--gpu_madvise_original_shared_tensors=<true|false>] "
            "[--gpu_enable_metal_residency_set=<true|false>] "
+           "[--gpu_use_ir_model=<enabled|disabled|default>] "
            "[--preferred_device_substr=<device_substr>] "
            "[--num_threads_to_upload=<num_threads_to_upload>] "
            "[--num_threads_to_compile=<num_threads_to_compile>] "
@@ -240,7 +247,9 @@ absl::Status MainHelper(int argc, char** argv) {
            "[--no_repeat_ngram_window_size=<no_repeat_ngram_window_size>] "
            "[--suppress_tokens=<token1,token2,...>] "
            "[--constraint_regex=<constraint_regex>] "
-           "[--enable_speculative_decoding=<true|false>]";
+           "[--speculative_decoding=<on|off|adaptive>] "
+           "[--sampler_top_k=<k>] [--sampler_top_p=<p>] "
+           "[--sampler_temperature=<t>] [--sampler_seed=<seed>]";
     ABSL_LOG(INFO)
         << "To provide data for multimodality, use [image:/path/to/image.jpg] "
            "or [audio:/path/to/audio.wav] in the input prompt. e.g. \"Describe "
@@ -260,6 +269,7 @@ absl::Status MainHelper(int argc, char** argv) {
   settings.load_model_from_descriptor =
       absl::GetFlag(FLAGS_load_model_from_descriptor);
   settings.input_prompt = GetInputPrompt();
+  settings.selected_signatures = absl::GetFlag(FLAGS_selected_signatures);
   settings.expected_output = absl::GetFlag(FLAGS_expected_output);
   settings.log_sink_file = absl::GetFlag(FLAGS_log_sink_file);
   settings.max_num_tokens = absl::GetFlag(FLAGS_max_num_tokens);
@@ -298,6 +308,9 @@ absl::Status MainHelper(int argc, char** argv) {
       absl::GetFlag(FLAGS_gpu_madvise_original_shared_tensors);
   settings.gpu_enable_metal_residency_set =
       absl::GetFlag(FLAGS_gpu_enable_metal_residency_set);
+  ABSL_ASSIGN_OR_RETURN(settings.gpu_use_ir_model,
+                        litert::lm::GetUseIrModelFromString(
+                            absl::GetFlag(FLAGS_gpu_use_ir_model)));
   settings.disable_cache = absl::GetFlag(FLAGS_disable_cache);
   settings.disable_weight_cache = absl::GetFlag(FLAGS_disable_weight_cache);
   settings.disable_gpu_program_cache =
@@ -330,8 +343,24 @@ absl::Status MainHelper(int argc, char** argv) {
       GetSuppressTokensConfig(absl::GetFlag(FLAGS_suppress_tokens));
   settings.constraint_regex = absl::GetFlag(FLAGS_constraint_regex);
   settings.use_submodel = absl::GetFlag(FLAGS_use_submodel);
+  ABSL_ASSIGN_OR_RETURN(settings.speculative_decoding_mode,
+                        litert::lm::ParseSpeculativeDecodingFlag(
+                            absl::GetFlag(FLAGS_speculative_decoding)));
   settings.enable_speculative_decoding =
       absl::GetFlag(FLAGS_enable_speculative_decoding);
+  settings.mtp_gating_half_life = absl::GetFlag(FLAGS_mtp_gating_half_life);
+  settings.mtp_gating_deadband = absl::GetFlag(FLAGS_mtp_gating_deadband);
+  settings.mtp_gating_margin = absl::GetFlag(FLAGS_mtp_gating_margin);
+  settings.mtp_gating_probe_interval =
+      absl::GetFlag(FLAGS_mtp_gating_probe_interval);
+  settings.mtp_gating_probe_length =
+      absl::GetFlag(FLAGS_mtp_gating_probe_length);
+  settings.mtp_gating_forced_switch_period =
+      absl::GetFlag(FLAGS_mtp_gating_forced_switch_period);
+  settings.sampler_top_k = absl::GetFlag(FLAGS_sampler_top_k);
+  settings.sampler_top_p = absl::GetFlag(FLAGS_sampler_top_p);
+  settings.sampler_temperature = absl::GetFlag(FLAGS_sampler_temperature);
+  settings.sampler_seed = absl::GetFlag(FLAGS_sampler_seed);
   settings.enable_neon_for_npu_greedy_sampling =
       absl::GetFlag(FLAGS_enable_neon_for_npu_greedy_sampling);
   settings.use_hw_masking_for_npu = absl::GetFlag(FLAGS_use_hw_masking_for_npu);
@@ -343,15 +372,13 @@ absl::Status MainHelper(int argc, char** argv) {
   settings.disable_input_prompt_as_hint =
       absl::GetFlag(FLAGS_disable_input_prompt_as_hint);
 
-  // Adjust max_num_tokens and prefill_batch_size if not set on benchmark mode.
-  if (settings.benchmark && settings.benchmark_prefill_tokens > 0) {
-    if (settings.max_num_tokens == 0 && settings.benchmark_decode_tokens > 0) {
-      settings.max_num_tokens =
-          settings.benchmark_prefill_tokens + settings.benchmark_decode_tokens;
-    }
-    if (settings.prefill_batch_sizes.empty()) {
-      settings.prefill_batch_sizes.insert(settings.benchmark_prefill_tokens);
-    }
+  // Match the prefill signature to the benchmarked prefill length if not set on
+  // benchmark mode. max_num_tokens (the KV cache size) is not derived from the
+  // benchmark tokens: pass --max_num_tokens explicitly to benchmark with a
+  // specific KV cache size, otherwise the model or engine default is used.
+  if (settings.benchmark && settings.benchmark_prefill_tokens > 0 &&
+      settings.prefill_batch_sizes.empty()) {
+    settings.prefill_batch_sizes.insert(settings.benchmark_prefill_tokens);
   }
 
   std::vector<litert::lm::LitertLmMetrics> metrics;

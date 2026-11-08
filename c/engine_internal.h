@@ -28,6 +28,7 @@
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/executor/speculative_decoding_mode.h"
 #include "runtime/proto/token.pb.h"
 
 struct LiteRtLmInputData {
@@ -55,6 +56,10 @@ struct LiteRtLmRepetitionPenaltyConfig {
 
 struct LiteRtLmNoRepeatNgramConfig {
   litert::lm::NoRepeatNgramConfig no_repeat_ngram_config;
+};
+
+struct LiteRtLmSpeculativeDecodingConfig {
+  litert::lm::SpeculativeDecodingConfig config;
 };
 
 struct LiteRtLmSuppressTokensConfig {
@@ -100,7 +105,9 @@ struct LiteRtLmTokenUnion {
 };
 
 struct LiteRtLmTokenUnions {
-  std::vector<litert::lm::proto::TokenUnion> tokens;
+  // Holds the C type so that each element has a stable address that
+  // `litert_lm_token_unions_get_token_at` can lend out.
+  std::vector<LiteRtLmTokenUnion> tokens;
 };
 
 #endif  // THIRD_PARTY_ODML_LITERT_LM_C_ENGINE_INTERNAL_H_

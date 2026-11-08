@@ -53,12 +53,12 @@ endif()
 include_directories(SYSTEM "${LITERTLM_VENV_DIR}/include")
 
 message(STATUS "Using isolated Python: ${Python3_EXECUTABLE}")
-set(LITERTLM_ENV_WRAPPER 
+set(LITERTLM_ENV_WRAPPER
 "VIRTUAL_ENV=${LITERTLM_VENV_DIR}"
 "PATH=${LITERTLM_VENV_DIR}/bin:$ENV{PATH}"
 CACHE INTERNAL "LiteRT-LM: Environment variables for uv virtual environment"
 )
-set(LITERTLM_UV_ARGS 
+set(LITERTLM_UV_ARGS
 "-DPython3_ROOT_DIR=${LITERTLM_VENV_DIR}"
 "-DPython3_FIND_VIRTUALENV=FIRST")
 
@@ -66,7 +66,7 @@ if(NOT LITERTLM_PROJECT_ROOT)
     message(WARNING "LITERTLM_PROJECT_ROOT is not defined. Setting LITERTLM_PROJECT_ROOT to ${CMAKE_CURRENT_SOURCE_DIR}/../../..}")
     set(LITERTLM_PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." CACHE PATH "LiteRT-LM: Absolute path to the repository root")
 endif()
-set(CMAKE_SOURCE_DIR ${LITERTLM_PROJECT_ROOT} CACHE PATH 
+set(CMAKE_SOURCE_DIR ${LITERTLM_PROJECT_ROOT} CACHE PATH
     "Reset to repo root" FORCE)
 message(DEBUG "[LiteRTLM] CMAKE_SOURCE_DIR: ${CMAKE_SOURCE_DIR}")
 
@@ -75,7 +75,7 @@ set(LITERTLM_ENV_WRAPPER "${LITERTLM_ENV_WRAPPER}" CACHE INTERNAL
     "LiteRT-LM: Environment variables for UV virtual environment")
 set(LITERTLM_UV_ARGS "${LITERTLM_UV_ARGS}" CACHE INTERNAL
     "LiteRT-LM: Arguments for UV virtual environment")
-set(LITERTLM_VENV_DIR "${LITERTLM_VENV_DIR}" CACHE PATH 
+set(LITERTLM_VENV_DIR "${LITERTLM_VENV_DIR}" CACHE PATH
     "LiteRT-LM: Path to the uv virtual environment")
 set(LITERTLM_BUILD_COMMAND_ARGS "${LITERTLM_BUILD_COMMAND_ARGS}" CACHE INTERNAL
     "LiteRT-LM: Arguments for the build command")
@@ -98,13 +98,13 @@ set(LITERTLM_PATCHES_DIR "${LITERTLM_CMAKE_DIR}/patches"
 set(LITERTLM_SCRIPTS_DIR "${LITERTLM_CMAKE_DIR}/scripts"
     CACHE PATH "LiteRT-LM: Directory for internal build and automation scripts")
 
-set(LITERTLM_GENERATED_SRC_DIR "${CMAKE_BINARY_DIR}" 
+set(LITERTLM_GENERATED_SRC_DIR "${CMAKE_BINARY_DIR}"
     CACHE PATH "Root for generated code")
-set(LITERTLM_STAGING_DIR "${CMAKE_BINARY_DIR}/../tmp/lib" 
+set(LITERTLM_STAGING_DIR "${CMAKE_BINARY_DIR}/../tmp/lib"
     CACHE PATH "")
 set(LITERTLM_THIRD_PARTY_DIR "${CMAKE_BINARY_DIR}/third_party"
     CACHE PATH "")
-set(LITERTLM_EXTERNAL_PROJECT_BIN_DIR "${CMAKE_BINARY_DIR}/external" 
+set(LITERTLM_EXTERNAL_PROJECT_BIN_DIR "${CMAKE_BINARY_DIR}/external"
     CACHE PATH "LiteRT-LM: Root directory for external projects")
 set(LITERTLM_IMPORTED_SRC_DIR "${LITERTLM_CMAKE_DIR}/import/src" CACHE PATH "")
 set(LITERTLM_IMPORTED_LITERT_SRC_DIR "${LITERTLM_IMPORTED_SRC_DIR}/litert" )
@@ -113,8 +113,8 @@ set(LITERTLM_INCLUDE_PATHS
   "${CMAKE_BINARY_DIR}"
   CACHE PATH "")
 
-set(LITERTLM_TARGET_MAP_PATH 
-    "${LITERTLM_CMAKE_PACKAGES_DIR}/litert_lm/${LITERTLM_ORCHESTRATION_PHASE}_target_map.cmake" 
+set(LITERTLM_TARGET_MAP_PATH
+    "${LITERTLM_CMAKE_PACKAGES_DIR}/litert_lm/${LITERTLM_ORCHESTRATION_PHASE}_target_map.cmake"
     CACHE PATH "")
 
 list(APPEND CMAKE_MODULE_PATH   "${LITERTLM_MODULES_DIR}")
@@ -141,13 +141,25 @@ if(DEFINED LITERTLM_RUST_LINKER_OVERRIDE AND DEFINED LITERTLM_CORROSION_LINKER_V
 endif()
 
 set(LITERTLM_PROTO_FILES
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/any2any_metadata.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/any2any_model_type.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/any2any_session_config.proto"
   "${LITERTLM_PROJECT_ROOT}/runtime/proto/embedding_metadata.proto"
   "${LITERTLM_PROJECT_ROOT}/runtime/proto/embedding_model_type.proto"
   "${LITERTLM_PROJECT_ROOT}/runtime/proto/engine.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/image_gen_model_type.proto"
   "${LITERTLM_PROJECT_ROOT}/runtime/proto/litert_lm_metrics.proto"
   "${LITERTLM_PROJECT_ROOT}/runtime/proto/llm_metadata.proto"
   "${LITERTLM_PROJECT_ROOT}/runtime/proto/llm_model_type.proto"
   "${LITERTLM_PROJECT_ROOT}/runtime/proto/sampler_params.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/speech2text_metadata.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/speech2text_model_type.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/speech2text_session_config.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/text2image_metadata.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/text2image_session_config.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/text2speech_metadata.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/text2speech_model_type.proto"
+  "${LITERTLM_PROJECT_ROOT}/runtime/proto/text2speech_session_config.proto"
   "${LITERTLM_PROJECT_ROOT}/runtime/proto/token.proto"
   "${LITERTLM_PROJECT_ROOT}/runtime/executor/proto/constrained_decoding_options.proto"
   "${LITERTLM_PROJECT_ROOT}/runtime/proto/executor_metadata.proto"
@@ -165,6 +177,44 @@ file(MAKE_DIRECTORY "${LITERTLM_STAGING_DIR}")
 file(MAKE_DIRECTORY "${LITERTLM_GENERATED_SRC_DIR}")
 file(MAKE_DIRECTORY "${LITERTLM_EXTERNAL_PROJECT_BIN_DIR}")
 
+# --- Feature Flags ---
+option(LITERT_LM_ENABLE_SENTENCEPIECE_TOKENIZER
+    "Enable SentencePiece tokenizer support"
+    ON)
+option(LITERT_LM_ENABLE_HUGGINGFACE_TOKENIZER
+    "Enable HuggingFace BPE tokenizer support"
+    ON)
+option(LITERT_LM_ENABLE_MINIJINJA_TEMPLATE
+    "Enable Minijinja prompt template engine"
+    ON)
+option(LITERT_LM_ENABLE_CONSTRAINED_DECODING
+    "Enable constrained decoding support"
+    ON)
+option(LITERT_LM_ENABLE_LLGUIDANCE
+    "Enable LlGuidance constrained decoding backend"
+    ON)
+option(LITERT_LM_ENABLE_FST_CONSTRAINTS
+    "Enable FST constraint provider"
+    ON)
+option(LITERT_LM_ENABLE_TOOL_USE_PARSER
+    "Enable tool-use expression parsers"
+    ON)
+option(LITERT_LM_ENABLE_GEMMA_PROCESSORS
+    "Enable Gemma family model data processors"
+    ON)
+option(LITERT_LM_ENABLE_QWEN_PROCESSOR
+    "Enable Qwen family model data processor"
+    ON)
+option(LITERT_LM_ENABLE_FASTVLM_PROCESSOR
+    "Enable FastVLM model data processor"
+    ON)
+option(LITERT_LM_ENABLE_LFM2_PROCESSOR
+    "Enable LFM2 model data processor"
+    ON)
+option(LITERT_LM_ENABLE_MINICPM_PROCESSOR
+    "Enable MiniCPM family model data processors"
+    ON)
+
 # --- Build
 option(LITERT_BUILD_CONFIG_DISABLE_GPU_VAL
     "LiteRT definition to disable GPU in build config"
@@ -173,12 +223,12 @@ option(LITERT_BUILD_CONFIG_DISABLE_NPU_VAL
     "LiteRT definition to disable NPU in build config"
     TRUE)
 
-option(LITERTLM_BUILD_FETCH_CONTENT 
-    "Enable downloading and building FetchContent dependencies" 
+option(LITERTLM_BUILD_FETCH_CONTENT
+    "Enable downloading and building FetchContent dependencies"
     ON)
-option(LITERTLM_BUILD_EXTERNAL_PROJECTS 
+option(LITERTLM_BUILD_EXTERNAL_PROJECTS
     "Enable building ExternalProject dependencies"
-    ON)  
+    ON)
 option(LITERTLM_BUILD_TARGETS
     "Enable building the primary LiteRT-LM targets and executables"
     ON)
@@ -206,7 +256,7 @@ if(DEFINED LITERTLM_PREBUILD_PHASE)
 string(REPLACE " " ";" LITERTLM_PREBUILD_TARGETS "${LITERTLM_PREBUILD_TARGETS}")
     block()
         set(LITERTLM_EXTERNAL_PROJECT_BIN_DIR ${LITERTLM_PREBUILD_EXTERNAL_PROJECT_DIR})
-        message(STATUS "[LiteRTLM] Prebuild Phase: Provisioning targeted tools: ${LITERTLM_PREBUILD_TARGETS}")        
+        message(STATUS "[LiteRTLM] Prebuild Phase: Provisioning targeted tools: ${LITERTLM_PREBUILD_TARGETS}")
         foreach(_target ${LITERTLM_PREBUILD_TARGETS})
             load_package(${_target})
         endforeach()
@@ -261,9 +311,21 @@ if("${LITERTLM_ORCHESTRATION_PHASE}" STREQUAL "litert_lm")
 
     add_compile_definitions(
         absl_nullable=
-        absl_nonnull=
-        ENABLE_HUGGINGFACE_TOKENIZER
-        ENABLE_SENTENCEPIECE_TOKENIZER)
+        absl_nonnull=)
+    if(LITERT_LM_ENABLE_HUGGINGFACE_TOKENIZER)
+        add_compile_definitions(ENABLE_HUGGINGFACE_TOKENIZER)
+    endif()
+    if(LITERT_LM_ENABLE_SENTENCEPIECE_TOKENIZER)
+        add_compile_definitions(ENABLE_SENTENCEPIECE_TOKENIZER)
+    endif()
+    if(NOT LITERT_LM_ENABLE_CONSTRAINED_DECODING)
+        add_compile_definitions(
+            LITERT_LM_CONSTRAINED_DECODING_DISABLED
+            LITERT_LM_FST_CONSTRAINTS_DISABLED)
+    endif()
+    if(NOT LITERT_LM_ENABLE_FST_CONSTRAINTS)
+        add_compile_definitions(LITERT_LM_FST_CONSTRAINTS_DISABLED)
+    endif()
 
     add_subdirectory("${LITERTLM_PROJECT_ROOT}/c" "${LITERTLM_GENERATED_SRC_DIR}/c")
     add_subdirectory("${LITERTLM_PROJECT_ROOT}/js" "${LITERTLM_GENERATED_SRC_DIR}/js")

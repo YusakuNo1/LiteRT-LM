@@ -14,21 +14,27 @@
  * limitations under the License.
  */
 
-import {LiteRtLm, loadLiteRtLm, unloadLiteRtLm, type Wasm} from '@litert-lm/core';
+import {type EmbeddingEngineSettings, fillWasmEmbeddingEngineSettingsFromEmbeddingEngineSettings, LiteRtLm, loadLiteRtLm, unloadLiteRtLm, type Wasm} from '@litert-lm/core';
 // Placeholder for internal dependency on trusted resource url
+
+import {Cleanup} from './cleanup.js';
+import {createStreamingModelAssets} from './stream_utils.js';
 
 describe('EmbeddingEngineSettings', () => {
   let liteRtLm: LiteRtLm;
+  let cleanup: Cleanup;
   let modelAssets: Wasm.ModelAssets;
 
   beforeAll(async () => {
     unloadLiteRtLm();
-    liteRtLm = await loadLiteRtLm(trustedResourceUrl`/wasm`);
-    modelAssets = liteRtLm.liteRtLmWasm.ModelAssets.create('/path/to/model');
+    liteRtLm = await loadLiteRtLm('/wasm');
+    cleanup = new Cleanup();
+    ({modelAssets} = await createStreamingModelAssets(
+         new Blob([]), liteRtLm.liteRtLmWasm, cleanup));
   });
 
   afterAll(() => {
-    modelAssets.delete();
+    cleanup.run();
   });
 
   it('creates EmbeddingEngineSettings', () => {
@@ -37,5 +43,38 @@ describe('EmbeddingEngineSettings', () => {
             modelAssets, liteRtLm.liteRtLmWasm.Backend.CPU);
     expect(settings).toBeDefined();
     settings.delete();
+  });
+
+  describe('input length bounds', () => {
+    function fill(settings: Partial<EmbeddingEngineSettings>):
+        Wasm.EmbeddingEngineSettings {
+      const wasmSettings =
+          liteRtLm.liteRtLmWasm.EmbeddingEngineSettings.createDefault(
+              modelAssets, liteRtLm.liteRtLmWasm.Backend.CPU);
+      fillWasmEmbeddingEngineSettingsFromEmbeddingEngineSettings(
+          wasmSettings, {...settings, model: '/path/to/model'});
+      return wasmSettings;
+    }
+
+    it('prepares a single signature when neither bound is set', () => {
+      const wasmSettings = fill({});
+      expect(wasmSettings.getMaxInputLength()).toBe(1024);
+      expect(wasmSettings.getMinInputLength()).toBe(1024);
+      wasmSettings.delete();
+    });
+
+    it('makes minInputLength follow an explicit maxInputLength', () => {
+      const wasmSettings = fill({maxInputLength: 256});
+      expect(wasmSettings.getMaxInputLength()).toBe(256);
+      expect(wasmSettings.getMinInputLength()).toBe(256);
+      wasmSettings.delete();
+    });
+
+    it('keeps an explicit minInputLength', () => {
+      const wasmSettings = fill({minInputLength: 128, maxInputLength: 512});
+      expect(wasmSettings.getMaxInputLength()).toBe(512);
+      expect(wasmSettings.getMinInputLength()).toBe(128);
+      wasmSettings.delete();
+    });
   });
 });

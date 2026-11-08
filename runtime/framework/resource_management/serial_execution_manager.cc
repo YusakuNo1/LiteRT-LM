@@ -58,6 +58,7 @@
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
+#include "runtime/executor/vision/vision_executor.h"
 #include "runtime/executor/vision/vision_executor_settings.h"
 #include "runtime/framework/resource_management/execution_manager.h"
 #include "runtime/framework/resource_management/resource_manager.h"
@@ -109,13 +110,15 @@ SerialExecutionManager::Create(
     audio_executor_settings,
     ::litert::Environment* absl_nullable litert_env,
     std::unique_ptr<AudioExecutor> absl_nullable audio_executor,
-    std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger) {
+    std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger,
+    std::unique_ptr<VisionExecutor> absl_nullable vision_executor) {
   ABSL_ASSIGN_OR_RETURN(
       auto resource_manager,
       ResourceManager::Create(model_resources, std::move(llm_executor),
                               std::move(vision_executor_settings),
                               std::move(audio_executor_settings), litert_env,
-                              std::move(audio_executor)));
+                              std::move(audio_executor),
+                              std::move(vision_executor)));
   return absl::WrapUnique(new SerialExecutionManager(
       tokenizer, std::move(resource_manager), litert_env,
       std::move(runtime_debugger)));
@@ -960,7 +963,7 @@ absl::Status SerialExecutionManager::AddDecodeTask(
         std::move(decoded_ids_buffer), callback, cancelled.get(),
         max_output_tokens, thinking_token_budget, thinking_end_token_ids,
         thinking_start_token_ids,
-        session_info->session_config.GetEnableSpeculativeDecoding());
+        session_info->session_config.GetSpeculativeDecodingConfig());
 
     if (!responses.ok() && absl::IsCancelled(responses.status())) {
       responses = Responses(TaskState::kCancelled);
@@ -1163,6 +1166,23 @@ absl::Status SerialExecutionManager::SetCurrentStep(
         "Target step is greater than the current step: ", current_step));
   }
   return llm_executor->SetCurrentStep(target_step);
+}
+
+absl::StatusOr<std::unique_ptr<ProcessedContext>>
+SerialExecutionManager::SaveContext(const SessionInfo& session_info) {
+  ABSL_ASSIGN_OR_RETURN(auto llm_executor,
+                        resource_manager_->AcquireExecutorWithContextHandler(
+                            session_info.context_handler));
+  return llm_executor->SaveContext();
+}
+
+absl::Status SerialExecutionManager::RestoreContext(
+    const SessionInfo& session_info,
+    std::unique_ptr<ProcessedContext> processed_context) {
+  ABSL_ASSIGN_OR_RETURN(auto llm_executor,
+                        resource_manager_->AcquireExecutorWithContextHandler(
+                            session_info.context_handler));
+  return llm_executor->RestoreContext(std::move(processed_context));
 }
 
 absl::StatusOr<AudioExecutorProperties>

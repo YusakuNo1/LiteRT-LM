@@ -41,6 +41,7 @@ cc_library(
         "@com_google_absl//absl/time",
         "@litert//litert/cc:litert_environment",
         "//runtime/components:model_resources",
+        "//runtime/proto:llm_metadata_cc_proto",
         "//support/tokenizer",
     ],
 )
@@ -50,6 +51,7 @@ cc_library(
     srcs = ["embedding_engine_settings.cc"],
     hdrs = ["embedding_engine_settings.h"],
     deps = [
+        "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
@@ -91,6 +93,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "//runtime/executor:executor_backend_registry",
         "//runtime/executor:executor_settings_base",
     ],
 )
@@ -98,9 +101,14 @@ cc_library(
 # The selected engine implementations based on the build flags.
 cc_library(
     name = "engine_impl_selected",
-    deps = select({
-        "//conditions:default": ["//runtime/core:engine_advanced_impl"],
-    }),
+    deps = ["//runtime/core:engine_advanced_impl"],
+    alwayslink = 1,
+)
+
+# The selected CPU-only engine implementations based on the build flags.
+cc_library(
+    name = "engine_impl_cpu_only_selected",
+    deps = ["//runtime/core:engine_advanced_impl_cpu_only"],
     alwayslink = 1,
 )
 
@@ -129,6 +137,7 @@ cc_library(
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
@@ -171,6 +180,8 @@ cc_library(
         ":engine_settings",
         ":io_types",
         "@com_google_absl//absl/base:log_severity",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
@@ -198,9 +209,12 @@ cc_library(
         "//runtime/conversation/model_data_processor:gemma4_data_processor_config",
         "//runtime/executor:executor_settings_base",
         "//runtime/executor:llm_executor_settings",
+        "//runtime/executor:mtp_gating_policy",
+        "//runtime/executor:speculative_decoding_mode",
         "//runtime/proto:sampler_params_cc_proto",
         "//runtime/util:litert_status_util",
         "//runtime/util:scoped_file",
+        "//runtime/util/memory_profiling:accelerator_memory_monitor",
         "//support/tokenizer",
         "@com_googlesource_code_re2//:re2",
         "@stb//:stb_image",
@@ -209,6 +223,8 @@ cc_library(
     ] + select({
         "@platforms//os:linux": [
         ],
+        "//conditions:default": [],
+    }) + select({
         "//conditions:default": [],
     }),
 )
@@ -219,8 +235,26 @@ cc_library(
     hdrs = ["shared_flags.h"],
     deps = [
         "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:marshalling",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "//runtime/executor:speculative_decoding_mode",
     ],
     alwayslink = 1,
+)
+
+cc_test(
+    name = "shared_flags_test",
+    srcs = ["shared_flags_test.cc"],
+    deps = [
+        ":shared_flags",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+        "//runtime/executor:speculative_decoding_mode",
+        "//runtime/util:test_utils",
+    ],
 )
 
 cc_binary(
@@ -273,7 +307,9 @@ cc_binary(
         "//runtime/executor:executor_settings_base",
         "//runtime/executor:llm_executor_settings",
         "//runtime/util:litert_status_util",
-    ],
+    ] + select({
+        "//conditions:default": [],
+    }),
 )
 
 cc_binary(
@@ -333,6 +369,53 @@ cc_binary(
     }),
 )
 
+cc_library(
+    name = "embedding_litert_lm_lib",
+    srcs = ["embedding_litert_lm_lib.cc"],
+    hdrs = ["embedding_litert_lm_lib.h"],
+    deps = [
+        ":embedding_engine",
+        ":embedding_engine_settings",
+        ":io_types",
+        "@com_google_absl//absl/base:log_severity",
+        "@com_google_absl//absl/base:no_destructor",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/log:globals",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@nlohmann_json//:json",
+        "//runtime/components:model_resources",
+        "//runtime/core:embedding_engine_impl",
+        "//runtime/executor:embedding_executor_base",
+        "//runtime/executor:executor_settings_base",
+        "//runtime/executor:litert_compiled_model_executor_utils",
+        "//runtime/proto:embedding_metadata_cc_proto",
+        "//runtime/util:litert_status_util",
+        "//runtime/util:litert_util",
+        "//runtime/util:memory_mapped_file",
+        "//runtime/util:scoped_file",
+        "//runtime/util/memory_profiling:accelerator_memory_monitor",
+        "//support/preprocessor:audio_preprocessor_miniaudio",  # buildcleaner: keep
+        "//support/preprocessor:image_preprocessor_impl",  # buildcleaner: keep
+        "@litert//tflite/profiling:memory_usage_monitor",
+    ],
+)
+
+cc_test(
+    name = "embedding_litert_lm_lib_test",
+    srcs = ["embedding_litert_lm_lib_test.cc"],
+    deps = [
+        ":embedding_litert_lm_lib",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+    ],
+)
+
 cc_binary(
     name = "embedding_litert_lm_main",
     srcs = ["embedding_litert_lm_main.cc"],
@@ -341,36 +424,20 @@ cc_binary(
         "//conditions:default": [],
     }),
     deps = [
-        ":embedding_engine",
-        ":embedding_engine_settings",
-        ":io_types",
+        ":embedding_litert_lm_lib",
         ":shared_flags",
-        "@com_google_absl//absl/base:log_severity",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
-        "@com_google_absl//absl/log:absl_log",
-        "@com_google_absl//absl/log:globals",
         "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:str_format",
-        "@com_google_absl//absl/time",
-        "@com_google_absl//absl/types:span",
-        "@nlohmann_json//:json",
-        "//runtime/components:model_resources",
-        "//runtime/core:embedding_engine_impl",
+        "@com_google_absl//absl/status:status_macros",
         "//runtime/executor:default_static_gpu_accelerator",
-        "//runtime/executor:embedding_executor_base",
         "//runtime/executor:executor_settings_base",
-        "//runtime/executor:litert_compiled_model_executor_utils",
-        "//runtime/util:litert_status_util",
-        "//runtime/util:litert_util",
-        "//runtime/util:memory_mapped_file",
-        "//runtime/util:scoped_file",
-        "//support/preprocessor:audio_preprocessor_miniaudio",  # buildcleaner: keep
-        "//support/preprocessor:image_preprocessor_impl",  # buildcleaner: keep
-        "@litert//tflite/profiling:memory_info",
     ],
+)
+
+cc_library(
+    name = "engine_defaults",
+    hdrs = ["engine_defaults.h"],
 )
 
 cc_library(
@@ -378,9 +445,9 @@ cc_library(
     srcs = ["engine_settings.cc"],
     hdrs = ["engine_settings.h"],
     deps = [
+        ":engine_defaults",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/container:flat_hash_set",
-        "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
@@ -392,9 +459,10 @@ cc_library(
         "//runtime/components/constrained_decoding:suppress_tokens_config",
         "//runtime/core:version",
         "//runtime/executor:audio_executor_settings",
+        "//runtime/executor:executor_backend_registry",
         "//runtime/executor:executor_settings_base",
-        "//runtime/executor:llm_executor_io_types",
         "//runtime/executor:llm_executor_settings",
+        "//runtime/executor:speculative_decoding_mode",
         "//runtime/executor:vision_executor_settings",
         "//runtime/proto:engine_cc_proto",
         "//runtime/proto:llm_metadata_cc_proto",
@@ -403,6 +471,7 @@ cc_library(
         "//runtime/proto:token_cc_proto",
         "//runtime/util:file_util",
         "//runtime/util:litert_lm_loader",
+        "//runtime/util:litert_lm_streaming_loader",
         "//runtime/util:litert_status_util",
         "//runtime/util:model_type_utils",
         "//runtime/util:scoped_file",
@@ -427,11 +496,15 @@ cc_test(
         "//runtime/components/constrained_decoding:suppress_tokens_config",
         "//runtime/executor:executor_settings_base",
         "//runtime/executor:llm_executor_io_types",
+        "//runtime/executor:llm_executor_settings",
+        "//runtime/executor:speculative_decoding_mode",
         "//runtime/proto:engine_cc_proto",
         "//runtime/proto:llm_metadata_cc_proto",
         "//runtime/proto:llm_model_type_cc_proto",
         "//runtime/proto:sampler_params_cc_proto",
         "//runtime/proto:token_cc_proto",
+        "//runtime/util:file_data_stream",
+        "//runtime/util:litert_lm_streaming_loader",
         "//runtime/util:test_utils",
         "//support/tokenizer",
     ],

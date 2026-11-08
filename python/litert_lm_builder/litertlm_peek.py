@@ -21,9 +21,13 @@ from google.protobuf import text_format
 
 from litert_lm_builder import litertlm_core
 from litert_lm_builder import litertlm_header_schema_py_generated as schema
+from runtime.proto import any2any_metadata_pb2
 from runtime.proto import embedding_metadata_pb2
 from runtime.proto import executor_metadata_pb2
 from runtime.proto import llm_metadata_pb2
+from runtime.proto import speech2text_metadata_pb2
+from runtime.proto import text2image_metadata_pb2
+from runtime.proto import text2speech_metadata_pb2
 
 # --- ANSI Escape Code Definitions ---
 ANSI_BOLD = "\033[1m"
@@ -169,6 +173,43 @@ def _get_tflite_weight_filename(
   return f"{file_name}.weight"
 
 
+def _dump_proto_section(
+    file_stream: IO[bytes],
+    section_object: schema.SectionObject,
+    dump_files_dir: str | None,
+    output_stream: IO[str],
+    proto_cls: Any,
+    on_parsed: Any = None,
+) -> Optional[str]:
+  """Dumps a protobuf metadata section content."""
+  file_stream.seek(section_object.BeginOffset())
+  proto_data = file_stream.read(
+      section_object.EndOffset() - section_object.BeginOffset()
+  )
+  proto_msg = proto_cls()
+  proto_msg.ParseFromString(proto_data)
+  proto_name = proto_cls.__name__
+  output_stream.write(f"{' ' * INDENT_SPACES}<<<<<<<< start of {proto_name}\n")
+  debug_str = text_format.MessageToString(proto_msg)
+  for line in debug_str.splitlines():
+    output_stream.write(f"{' ' * (INDENT_SPACES * 2)}{line}\n")
+  output_stream.write(f"{' ' * INDENT_SPACES}>>>>>>>> end of {proto_name}\n")
+
+  if on_parsed is not None:
+    on_parsed(proto_msg)
+
+  if dump_files_dir:
+    file_name = f"{proto_name}Proto.pbtext"
+    file_path = os.path.join(dump_files_dir, file_name)
+    with litertlm_core.open_file(file_path, "w") as f_out:
+      f_out.write(debug_str)
+    output_stream.write(
+        f"{' ' * INDENT_SPACES}{file_name} dumped to: {file_path}\n"
+    )
+    return file_name
+  return None
+
+
 def _dump_llm_metadata_proto(
     file_stream: IO[bytes],
     section_object: schema.SectionObject,
@@ -177,19 +218,10 @@ def _dump_llm_metadata_proto(
     jinja_prompt_template_path: Optional[str] = None,
 ) -> Optional[str]:
   """Dumps LlmMetadataProto section content."""
-  file_stream.seek(section_object.BeginOffset())
-  proto_data = file_stream.read(
-      section_object.EndOffset() - section_object.BeginOffset()
-  )
-  llm_metadata = llm_metadata_pb2.LlmMetadata()
-  llm_metadata.ParseFromString(proto_data)
-  output_stream.write(f"{' ' * INDENT_SPACES}<<<<<<<< start of LlmMetadata\n")
-  debug_str = text_format.MessageToString(llm_metadata)
-  for line in debug_str.splitlines():
-    output_stream.write(f"{' ' * (INDENT_SPACES * 2)}{line}\n")
-  output_stream.write(f"{' ' * INDENT_SPACES}>>>>>>>> end of LlmMetadata\n")
 
-  if jinja_prompt_template_path:
+  def _extract_jinja(llm_metadata: llm_metadata_pb2.LlmMetadata) -> None:
+    if not jinja_prompt_template_path:
+      return
     if (
         not llm_metadata.HasField("jinja_prompt_template")
         or not llm_metadata.jinja_prompt_template
@@ -203,16 +235,14 @@ def _dump_llm_metadata_proto(
     with litertlm_core.open_file(jinja_prompt_template_path, "w") as f_jinja:
       f_jinja.write(llm_metadata.jinja_prompt_template)
 
-  if dump_files_dir:
-    file_name = "LlmMetadataProto.pbtext"
-    file_path = os.path.join(dump_files_dir, file_name)
-    with litertlm_core.open_file(file_path, "w") as f_out:
-      f_out.write(debug_str)
-    output_stream.write(
-        f"{' ' * INDENT_SPACES}{file_name} dumped to: {file_path}\n"
-    )
-    return file_name
-  return None
+  return _dump_proto_section(
+      file_stream,
+      section_object,
+      dump_files_dir,
+      output_stream,
+      llm_metadata_pb2.LlmMetadata,
+      on_parsed=_extract_jinja,
+  )
 
 
 def _dump_executor_metadata_proto(
@@ -222,32 +252,13 @@ def _dump_executor_metadata_proto(
     output_stream: IO[str],
 ) -> Optional[str]:
   """Dumps ExecutorMetadataProto section content."""
-  file_stream.seek(section_object.BeginOffset())
-  proto_data = file_stream.read(
-      section_object.EndOffset() - section_object.BeginOffset()
+  return _dump_proto_section(
+      file_stream,
+      section_object,
+      dump_files_dir,
+      output_stream,
+      executor_metadata_pb2.ExecutorMetadata,
   )
-  executor_metadata = executor_metadata_pb2.ExecutorMetadata()
-  executor_metadata.ParseFromString(proto_data)
-  output_stream.write(
-      f"{' ' * INDENT_SPACES}<<<<<<<< start of ExecutorMetadata\n"
-  )
-  debug_str = text_format.MessageToString(executor_metadata)
-  for line in debug_str.splitlines():
-    output_stream.write(f"{' ' * (INDENT_SPACES * 2)}{line}\n")
-  output_stream.write(
-      f"{' ' * INDENT_SPACES}>>>>>>>> end of ExecutorMetadata\n"
-  )
-
-  if dump_files_dir:
-    file_name = "ExecutorMetadataProto.pbtext"
-    file_path = os.path.join(dump_files_dir, file_name)
-    with litertlm_core.open_file(file_path, "w") as f_out:
-      f_out.write(debug_str)
-    output_stream.write(
-        f"{' ' * INDENT_SPACES}{file_name} dumped to: {file_path}\n"
-    )
-    return file_name
-  return None
 
 
 def _dump_embedding_metadata_proto(
@@ -257,32 +268,77 @@ def _dump_embedding_metadata_proto(
     output_stream: IO[str],
 ) -> Optional[str]:
   """Dumps EmbeddingMetadataProto section content."""
-  file_stream.seek(section_object.BeginOffset())
-  proto_data = file_stream.read(
-      section_object.EndOffset() - section_object.BeginOffset()
-  )
-  embedding_metadata = embedding_metadata_pb2.EmbeddingMetadata()
-  embedding_metadata.ParseFromString(proto_data)
-  output_stream.write(
-      f"{' ' * INDENT_SPACES}<<<<<<<< start of EmbeddingMetadata\n"
-  )
-  debug_str = text_format.MessageToString(embedding_metadata)
-  for line in debug_str.splitlines():
-    output_stream.write(f"{' ' * (INDENT_SPACES * 2)}{line}\n")
-  output_stream.write(
-      f"{' ' * INDENT_SPACES}>>>>>>>> end of EmbeddingMetadata\n"
+  return _dump_proto_section(
+      file_stream,
+      section_object,
+      dump_files_dir,
+      output_stream,
+      embedding_metadata_pb2.EmbeddingMetadata,
   )
 
-  if dump_files_dir:
-    file_name = "EmbeddingMetadataProto.pbtext"
-    file_path = os.path.join(dump_files_dir, file_name)
-    with litertlm_core.open_file(file_path, "w") as f_out:
-      f_out.write(debug_str)
-    output_stream.write(
-        f"{' ' * INDENT_SPACES}{file_name} dumped to: {file_path}\n"
-    )
-    return file_name
-  return None
+
+def _dump_speech2text_metadata_proto(
+    file_stream: IO[bytes],
+    section_object: schema.SectionObject,
+    dump_files_dir: str | None,
+    output_stream: IO[str],
+) -> Optional[str]:
+  """Dumps Speech2TextMetadataProto section content."""
+  return _dump_proto_section(
+      file_stream,
+      section_object,
+      dump_files_dir,
+      output_stream,
+      speech2text_metadata_pb2.Speech2TextMetadata,
+  )
+
+
+def _dump_text2speech_metadata_proto(
+    file_stream: IO[bytes],
+    section_object: schema.SectionObject,
+    dump_files_dir: str | None,
+    output_stream: IO[str],
+) -> Optional[str]:
+  """Dumps Text2SpeechMetadataProto section content."""
+  return _dump_proto_section(
+      file_stream,
+      section_object,
+      dump_files_dir,
+      output_stream,
+      text2speech_metadata_pb2.Text2SpeechMetadata,
+  )
+
+
+def _dump_text2image_metadata_proto(
+    file_stream: IO[bytes],
+    section_object: schema.SectionObject,
+    dump_files_dir: str | None,
+    output_stream: IO[str],
+) -> Optional[str]:
+  """Dumps Text2ImageMetadataProto section content."""
+  return _dump_proto_section(
+      file_stream,
+      section_object,
+      dump_files_dir,
+      output_stream,
+      text2image_metadata_pb2.Text2ImageMetadata,
+  )
+
+
+def _dump_any2any_metadata_proto(
+    file_stream: IO[bytes],
+    section_object: schema.SectionObject,
+    dump_files_dir: str | None,
+    output_stream: IO[str],
+) -> Optional[str]:
+  """Dumps Any2AnyMetadataProto section content."""
+  return _dump_proto_section(
+      file_stream,
+      section_object,
+      dump_files_dir,
+      output_stream,
+      any2any_metadata_pb2.Any2AnyMetadata,
+  )
 
 
 def _dump_section_content(
@@ -646,6 +702,26 @@ def peek_litertlm_file(
         elif data_type == schema.AnySectionDataType.EmbeddingMetadataProto:
           section_info["section_type"] = "EmbeddingMetadata"
           dumped_file_name = _dump_embedding_metadata_proto(
+              file_stream, section_object, dump_files_dir, output_stream
+          )
+        elif data_type == schema.AnySectionDataType.Speech2TextMetadataProto:
+          section_info["section_type"] = "Speech2TextMetadata"
+          dumped_file_name = _dump_speech2text_metadata_proto(
+              file_stream, section_object, dump_files_dir, output_stream
+          )
+        elif data_type == schema.AnySectionDataType.Text2SpeechMetadataProto:
+          section_info["section_type"] = "Text2SpeechMetadata"
+          dumped_file_name = _dump_text2speech_metadata_proto(
+              file_stream, section_object, dump_files_dir, output_stream
+          )
+        elif data_type == schema.AnySectionDataType.Text2ImageMetadataProto:
+          section_info["section_type"] = "Text2ImageMetadata"
+          dumped_file_name = _dump_text2image_metadata_proto(
+              file_stream, section_object, dump_files_dir, output_stream
+          )
+        elif data_type == schema.AnySectionDataType.Any2AnyMetadataProto:
+          section_info["section_type"] = "Any2AnyMetadata"
+          dumped_file_name = _dump_any2any_metadata_proto(
               file_stream, section_object, dump_files_dir, output_stream
           )
         elif data_type == schema.AnySectionDataType.TFLiteModel:

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/match.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
@@ -29,6 +30,7 @@
 #include "litert/cc/litert_model.h"  // from @litert
 #include "litert/cc/litert_ranked_tensor_type.h"  // from @litert
 #include "runtime/components/model_resources.h"
+#include "runtime/proto/embedding_metadata.pb.h"
 #include "runtime/util/status_macros.h"
 
 namespace litert::lm {
@@ -148,27 +150,30 @@ absl::StatusOr<std::vector<SignatureInfo>> GetVisionModelSignatures(
 }  // namespace
 
 absl::StatusOr<std::vector<SignatureInfo>> GetAvailableSignatures(
-    const litert::Model& model, ModelType model_type) {
+    const litert::Model& model,
+    proto::EmbeddingMetadata::TfLiteModelType model_type) {
   switch (model_type) {
-    case ModelType::kTfLiteTextEncoder:
+    case proto::EmbeddingMetadata::TF_LITE_TEXT_ENCODER:
       return GetTextEncoderSignatures(model);
-    case ModelType::kTfLiteVisionEncoder:
-    case ModelType::kTfLiteVisionAdapter:
+    case proto::EmbeddingMetadata::TF_LITE_VISION_ENCODER:
+    case proto::EmbeddingMetadata::TF_LITE_VISION_ADAPTER:
       return GetVisionModelSignatures(model);
     default:
-      return absl::InvalidArgumentError(
-          absl::StrCat("Unsupported model type for signature inspection: ",
-                       ModelTypeToString(model_type)));
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Unsupported model type for signature inspection: ",
+          proto::EmbeddingMetadata::TfLiteModelType_Name(model_type)));
   }
 }
 
 absl::StatusOr<std::vector<SignatureInfo>> GetAvailableSignatures(
-    ModelResources& resources, ModelType model_type) {
+    ModelResources& resources,
+    proto::EmbeddingMetadata::TfLiteModelType model_type) {
   LITERT_ASSIGN_OR_RETURN(const litert::Model* model,
                           resources.GetTFLiteModel(model_type));
   if (model == nullptr) {
-    return absl::NotFoundError(absl::StrCat("Model not found in resources: ",
-                                            ModelTypeToString(model_type)));
+    return absl::NotFoundError(absl::StrCat(
+        "Model not found in resources: ",
+        proto::EmbeddingMetadata::TfLiteModelType_Name(model_type)));
   }
   return GetAvailableSignatures(*model, model_type);
 }
@@ -206,6 +211,15 @@ absl::StatusOr<SelectedTextSignaturesInfo> SelectSignaturesByCapacity(
               return a.length < b.length;
             });
 
+  // Early exit if no signature is long enough.
+  if (target_capacity.has_value() &&
+      *target_capacity > sorted_signatures.back().length) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Requested target capacity (", *target_capacity,
+                     ") exceeds maximum available signature length (",
+                     sorted_signatures.back().length, ")."));
+  }
+
   SelectedTextSignaturesInfo result;
   for (const auto& sig : sorted_signatures) {
     if (min_capacity.has_value() && sig.length < *min_capacity) {
@@ -218,21 +232,10 @@ absl::StatusOr<SelectedTextSignaturesInfo> SelectSignaturesByCapacity(
     }
   }
 
-  if (!result.signature_lengths.empty()) {
-    result.max_signature_length = result.signature_lengths.back();
-  }
-
   if (result.signature_names.empty()) {
     return absl::NotFoundError("No signatures could be selected.");
   }
-
-  if (target_capacity.has_value() &&
-      *target_capacity > result.max_signature_length) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("Requested target capacity (", *target_capacity,
-                     ") exceeds maximum available signature length (",
-                     result.max_signature_length, ")."));
-  }
+  result.max_signature_length = result.signature_lengths.back();
 
   return result;
 }
@@ -260,56 +263,88 @@ absl::StatusOr<SelectedTextSignaturesInfo> SelectTextEncoderSignatures(
     std::optional<int> min_input_length) {
   LITERT_ASSIGN_OR_RETURN(
       auto signatures,
-      GetAvailableSignatures(resources, ModelType::kTfLiteTextEncoder));
+      GetAvailableSignatures(resources,
+                             proto::EmbeddingMetadata::TF_LITE_TEXT_ENCODER));
   return SelectTextEncoderSignatures(signatures, max_input_length,
                                      min_input_length);
 }
 
-absl::StatusOr<SelectedTextSignaturesInfo> SelectVisionEncoderSignatures(
-    const std::vector<SignatureInfo>& signatures, int vision_tokens_per_image) {
+namespace {
+
+absl::Status ValidateVisionTokensPerImage(
+    int vision_tokens_per_image,
+    std::optional<int> min_vision_tokens_per_image) {
   if (vision_tokens_per_image <= 0) {
     return absl::InvalidArgumentError(
         absl::StrCat("vision_tokens_per_image must be positive, got: ",
                      vision_tokens_per_image));
   }
+  if (min_vision_tokens_per_image.has_value() &&
+      *min_vision_tokens_per_image < 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("min_vision_tokens_per_image must be non-negative, got: ",
+                     *min_vision_tokens_per_image));
+  }
+  if (min_vision_tokens_per_image.has_value() &&
+      *min_vision_tokens_per_image > vision_tokens_per_image) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "min_vision_tokens_per_image (", *min_vision_tokens_per_image,
+        ") must not exceed vision_tokens_per_image (", vision_tokens_per_image,
+        ")."));
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace
+
+absl::StatusOr<SelectedTextSignaturesInfo> SelectVisionEncoderSignatures(
+    const std::vector<SignatureInfo>& signatures, int vision_tokens_per_image,
+    std::optional<int> min_vision_tokens_per_image) {
+  ABSL_RETURN_IF_ERROR(ValidateVisionTokensPerImage(
+      vision_tokens_per_image, min_vision_tokens_per_image));
   if (signatures.empty()) {
     return absl::NotFoundError("No vision encoder signatures found in model.");
   }
-  return SelectSignaturesByCapacity(signatures, vision_tokens_per_image);
+  return SelectSignaturesByCapacity(signatures, vision_tokens_per_image,
+                                    min_vision_tokens_per_image);
 }
 
 absl::StatusOr<SelectedTextSignaturesInfo> SelectVisionEncoderSignatures(
-    ModelResources& resources, int vision_tokens_per_image) {
+    ModelResources& resources, int vision_tokens_per_image,
+    std::optional<int> min_vision_tokens_per_image) {
   LITERT_ASSIGN_OR_RETURN(
       auto signatures,
-      GetAvailableSignatures(resources, ModelType::kTfLiteVisionEncoder));
-  return SelectVisionEncoderSignatures(signatures, vision_tokens_per_image);
+      GetAvailableSignatures(resources,
+                             proto::EmbeddingMetadata::TF_LITE_VISION_ENCODER));
+  return SelectVisionEncoderSignatures(signatures, vision_tokens_per_image,
+                                       min_vision_tokens_per_image);
 }
 
 absl::StatusOr<std::optional<SelectedTextSignaturesInfo>>
 SelectVisionAdapterSignatures(const std::vector<SignatureInfo>& signatures,
-                              int vision_tokens_per_image) {
+                              int vision_tokens_per_image,
+                              std::optional<int> min_vision_tokens_per_image) {
   if (signatures.empty()) {
     return std::nullopt;
   }
-  if (vision_tokens_per_image <= 0) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("vision_tokens_per_image must be positive, got: ",
-                     vision_tokens_per_image));
-  }
-  return SelectSignaturesByCapacity(signatures, vision_tokens_per_image);
+  ABSL_RETURN_IF_ERROR(ValidateVisionTokensPerImage(
+      vision_tokens_per_image, min_vision_tokens_per_image));
+  return SelectSignaturesByCapacity(signatures, vision_tokens_per_image,
+                                    min_vision_tokens_per_image);
 }
 
 absl::StatusOr<std::optional<SelectedTextSignaturesInfo>>
 SelectVisionAdapterSignatures(ModelResources& resources,
-                              int vision_tokens_per_image) {
-  auto adapter_signatures =
-      GetAvailableSignatures(resources, ModelType::kTfLiteVisionAdapter);
+                              int vision_tokens_per_image,
+                              std::optional<int> min_vision_tokens_per_image) {
+  auto adapter_signatures = GetAvailableSignatures(
+      resources, proto::EmbeddingMetadata::TF_LITE_VISION_ADAPTER);
   if (!adapter_signatures.ok() || adapter_signatures->empty()) {
     return std::nullopt;
   }
   return SelectVisionAdapterSignatures(*adapter_signatures,
-                                       vision_tokens_per_image);
+                                       vision_tokens_per_image,
+                                       min_vision_tokens_per_image);
 }
 
 int GetSignatureInputLength(const SignatureInfo& signature) {

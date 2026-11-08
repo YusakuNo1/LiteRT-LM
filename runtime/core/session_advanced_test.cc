@@ -264,9 +264,10 @@ CreateAudioExecutorSettings(const std::string& model_path,
   auto model_file_ptr = std::make_shared<ScopedFile>(std::move(model_file));
   ABSL_ASSIGN_OR_RETURN(auto model_assets, ModelAssets::Create(model_file_ptr));
   // Create the audio executor settings.
-  ABSL_ASSIGN_OR_RETURN(auto audio_executor_settings,
-                        AudioExecutorSettings::CreateDefault(
-                            model_assets, max_sequence_length, backend));
+  ABSL_ASSIGN_OR_RETURN(
+      auto audio_executor_settings,
+      AudioExecutorSettings::CreateDefault(model_assets, max_sequence_length,
+                                           backend, backend));
   return std::make_unique<AudioExecutorSettings>(
       std::move(audio_executor_settings));
 }
@@ -1256,6 +1257,56 @@ TEST_F(SessionAdvancedTest, SaveAndRewindCheckpoint) {
               StatusIs(absl::StatusCode::kNotFound));
 }
 
+TEST_F(SessionAdvancedTest, SaveAndRestoreContext) {
+  ASSERT_OK_AND_ASSIGN(auto session, CreateTestSession());
+
+  std::vector<InputData> inputs;
+  inputs.emplace_back(InputText("Hello World!"));
+
+  EXPECT_OK(session->RunPrefill(inputs));
+
+  EXPECT_OK(session->SaveCheckpoint("regular-checkpoint"));
+  EXPECT_OK(session->SaveContext("context-1"));
+
+  auto decode_config = DecodeConfig::CreateDefault();
+  decode_config.SetMaxOutputTokens(2);
+  ASSERT_OK_AND_ASSIGN(auto responses1, session->RunDecode(decode_config));
+  EXPECT_EQ(responses1.GetTexts().size(), 1);
+  EXPECT_EQ(responses1.GetTexts()[0], "How'");
+  EXPECT_THAT(responses1.GetTokenIds()[0], testing::ElementsAre(224, 24));
+  ASSERT_OK_AND_ASSIGN(auto text_from_ids1,
+                       tokenizer_->TokenIdsToText(responses1.GetTokenIds()[0]));
+  EXPECT_EQ(text_from_ids1, responses1.GetTexts()[0]);
+
+  EXPECT_OK(session->SaveContext("context-2"));
+
+  // Restoring a regular checkpoint (without saved context) should fail.
+  EXPECT_THAT(session->RestoreContext("regular-checkpoint"),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+
+  EXPECT_OK(session->RestoreContext("context-1"));
+
+  decode_config.SetMaxOutputTokens(2);
+  ASSERT_OK_AND_ASSIGN(auto responses3, session->RunDecode(decode_config));
+  EXPECT_EQ(responses3.GetTexts().size(), 1);
+  EXPECT_EQ(responses3.GetTexts()[0], "How'");
+  EXPECT_THAT(responses3.GetTokenIds()[0], testing::ElementsAre(224, 24));
+  ASSERT_OK_AND_ASSIGN(auto text_from_ids3,
+                       tokenizer_->TokenIdsToText(responses3.GetTokenIds()[0]));
+  EXPECT_EQ(text_from_ids3, responses3.GetTexts()[0]);
+
+  // Saved contexts are single-use and consumed upon restore.
+  EXPECT_THAT(session->RestoreContext("context-1"),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  // Checkpoints created after the target step should be pruned.
+  EXPECT_THAT(session->RestoreContext("context-2"),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  EXPECT_THAT(session->RestoreContext("non-existent"),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
 TEST_F(SessionAdvancedTest, GetCurrentStep) {
   ASSERT_OK_AND_ASSIGN(auto session, CreateTestSession());
 
@@ -2116,6 +2167,7 @@ TEST_F(SessionAdvancedTest,
   ASSERT_OK_AND_ASSIGN(
       auto session, SessionAdvanced::Create(execution_manager, tokenizer_.get(),
                                             session_config, benchmark_info));
+  EXPECT_TRUE(session->GetSessionConfig().GetApplyPromptTemplateInSession());
 
   std::vector<InputData> inputs;
   inputs.emplace_back(InputText("Hello World!"));
@@ -2141,9 +2193,8 @@ TEST_F(SessionAdvancedTest,
 
   auto executor = CreateFakeLlmExecutor(
       // Expected tokens: "Hello World!" (No templates)
-      // Expected tokens: "Hello World!" (No templates)
       /*prefill_tokens=*/{{90, 547, 58, 735, 210, 466, 2294}},
-      /*decode_tokens=*/{{224}});
+      /*decode_tokens=*/{{224}, {2294}});
 
   proto::BenchmarkParams benchmark_params;
   benchmark_params.set_num_prefill_tokens(7);
@@ -2160,12 +2211,15 @@ TEST_F(SessionAdvancedTest,
   ASSERT_OK_AND_ASSIGN(
       auto session, SessionAdvanced::Create(execution_manager, tokenizer_.get(),
                                             session_config, benchmark_info));
+  EXPECT_FALSE(session->GetSessionConfig().GetApplyPromptTemplateInSession());
 
   std::vector<InputData> inputs;
   inputs.emplace_back(InputText("Hello World!"));
   EXPECT_OK(session->RunPrefill(inputs));
+  EXPECT_OK(session->RunDecode());
   ASSERT_OK_AND_ASSIGN(auto actual_benchmark_info, session->GetBenchmarkInfo());
   EXPECT_EQ(actual_benchmark_info.GetTotalPrefillTurns(), 1);
+  EXPECT_EQ(actual_benchmark_info.GetTotalDecodeTurns(), 1);
 }
 
 TEST_F(SessionAdvancedTest,

@@ -36,6 +36,7 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "litert/c/options/litert_gpu_options.h"  // from @litert
 #include "litert/cc/litert_common.h"  // from @litert
 #include "litert/cc/litert_element_type.h"  // from @litert
 #include "litert/cc/litert_layout.h"  // from @litert
@@ -51,6 +52,7 @@
 #endif  // !defined(LITERT_DISABLE_NPU)
 #include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
+#include "litert/cc/litert_expected.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_model.h"  // from @litert
 #include "litert/cc/litert_options.h"  // from @litert
@@ -62,6 +64,7 @@
 #include "runtime/executor/litert_compiled_model_executor_utils.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/vision/vision_executor_settings.h"
+#include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/status_macros.h"  // NOLINT
 
@@ -93,7 +96,14 @@ constexpr absl::string_view kPositionsXy = "positions_xy";
 // Set the default GPU options for the model.
 absl::Status SetGpuOptions(const VisionExecutorSettings& executor_settings,
                            litert::GpuOptions& gpu_options) {
-  return ::litert::lm::SetCommonGpuOptions(executor_settings, gpu_options);
+  ABSL_RETURN_IF_ERROR(
+      ::litert::lm::SetCommonGpuOptions(executor_settings, gpu_options));
+  // The vision encoder is compiled for the GPU only, so it is always fully
+  // delegated to a single delegate. This lets TFLite skip preparing the CPU
+  // kernels before delegation, which otherwise allocates a CPU arena for every
+  // STABLEHLO_COMPOSITE decomposition subgraph that is never released.
+  gpu_options.SetHintFullyDelegatedToSingleDelegate(true);
+  return absl::OkStatus();
 }
 
 // Set the default CPU options for the model.
@@ -198,7 +208,41 @@ absl::StatusOr<int> GetVitSignatureIndex(
                    max_available_length, "."));
 }
 
+// WebGPU and Metal buffers cannot be reused across calls (see b/457483190).
+bool AreBuffersReusable(const std::vector<TensorBuffer>& buffers) {
+  return absl::c_none_of(buffers, [](const TensorBuffer& buffer) {
+    return buffer.IsWebGpuMemory() || buffer.IsMetalMemory();
+  });
+}
+
 }  // namespace
+
+Expected<std::vector<TensorBuffer>&> VisionLiteRtCompiledModelExecutor::
+    SignatureBufferCache::GetOrCreateInputBuffers(CompiledModel& compiled_model,
+                                                  int signature_index) {
+  auto it = input_buffers_.find(signature_index);
+  if (it != input_buffers_.end() && AreBuffersReusable(it->second)) {
+    return it->second;
+  }
+  LITERT_ASSIGN_OR_RETURN(auto buffers,
+                          compiled_model.CreateInputBuffers(signature_index));
+  for (auto& buffer : buffers) {
+    LITERT_RETURN_IF_ERROR(buffer.Clear());
+  }
+  return input_buffers_[signature_index] = std::move(buffers);
+}
+
+Expected<std::vector<TensorBuffer>&> VisionLiteRtCompiledModelExecutor::
+    SignatureBufferCache::GetOrCreateOutputBuffers(
+        CompiledModel& compiled_model, int signature_index) {
+  auto it = output_buffers_.find(signature_index);
+  if (it != output_buffers_.end() && AreBuffersReusable(it->second)) {
+    return it->second;
+  }
+  LITERT_ASSIGN_OR_RETURN(auto buffers,
+                          compiled_model.CreateOutputBuffers(signature_index));
+  return output_buffers_[signature_index] = std::move(buffers);
+}
 
 absl::StatusOr<
     std::unique_ptr<VisionLiteRtCompiledModelExecutor::VisionEncoder>>
@@ -281,7 +325,7 @@ absl::Status VisionLiteRtCompiledModelExecutor::VisionEncoder::Initialize(
           absl::StrCat("Unsupported encoder backend: ", backend_));
   }
   ABSL_RETURN_IF_ERROR(SetExternalWeightOptions(
-      resources, ModelType::kTfLiteVisionEncoder, options));
+      resources, proto::LlmMetadata::TF_LITE_VISION_ENCODER, options));
 
   if (!vision_executor_settings_.GetEncoderSelectedSignatures().empty()) {
     std::vector<absl::string_view> selected_signatures;
@@ -297,16 +341,17 @@ absl::Status VisionLiteRtCompiledModelExecutor::VisionEncoder::Initialize(
   }
 
 #ifdef __EMSCRIPTEN__
-  extern void SetCurrentlyCompilingModel(ModelType model_type)
+  extern void SetCurrentlyCompilingModel(absl::string_view model_type_str)
       __attribute__((weak));
   if (SetCurrentlyCompilingModel) {
-    SetCurrentlyCompilingModel(ModelType::kTfLiteVisionEncoder);
+    SetCurrentlyCompilingModel(TfLiteModelTypeToWireString(
+        proto::LlmMetadata::TF_LITE_VISION_ENCODER));
   }
 #endif
   auto compiled_model_or = CompiledModel::Create(env_, model_.Get(), options);
 #ifdef __EMSCRIPTEN__
   if (SetCurrentlyCompilingModel) {
-    SetCurrentlyCompilingModel(ModelType::kUnknown);
+    SetCurrentlyCompilingModel("");
   }
 #endif
   LITERT_ASSIGN_OR_RETURN(compiled_model_, std::move(compiled_model_or));
@@ -316,10 +361,8 @@ absl::Status VisionLiteRtCompiledModelExecutor::VisionEncoder::Initialize(
     // but multi-signature(ViT) encoders create buffers for each signature
     // in map-based encode at that time, so signature 0 buffers should not
     // be created in advance.
-    LITERT_ASSIGN_OR_RETURN(input_buffers_,
-                            compiled_model_.CreateInputBuffers(0));
-    LITERT_ASSIGN_OR_RETURN(output_buffers_,
-                            compiled_model_.CreateOutputBuffers(0));
+    LITERT_RETURN_IF_ERROR(GetOrCreateInputBuffers(0));
+    LITERT_RETURN_IF_ERROR(GetOrCreateOutputBuffers(0));
   }
   return absl::OkStatus();
 }
@@ -371,6 +414,10 @@ absl::Status VisionLiteRtCompiledModelExecutor::VisionAdapter::Initialize(
           cache_files.cache_key,
           /*logging_prefix=*/VisionExecutorSettings::kAdapterName,
           /*cache_compiled_shaders_only=*/false, gpu_options));
+      // "default" (unset) currently resolves to disabled.
+      LrtSetGpuOptionsUseIrModel(
+          gpu_options.Get(),
+          vision_executor_settings_.UseIrModel().value_or(false));
 
       break;
     }
@@ -386,7 +433,6 @@ absl::Status VisionLiteRtCompiledModelExecutor::VisionAdapter::Initialize(
           options.GetOptions<google_tensor::GoogleTensorOptions>());
       google_tensor_options.SetPerformanceMode(
           google_tensor::GoogleTensorOptions::PerformanceMode::kBurst);
-
       options.SetHardwareAccelerators(litert::HwAccelerators::kNpu |
                                       litert::HwAccelerators::kCpu);
       break;
@@ -397,7 +443,7 @@ absl::Status VisionLiteRtCompiledModelExecutor::VisionAdapter::Initialize(
           absl::StrCat("Unsupported adapter backend: ", backend_));
   }
   ABSL_RETURN_IF_ERROR(SetExternalWeightOptions(
-      resources, ModelType::kTfLiteVisionAdapter, options));
+      resources, proto::LlmMetadata::TF_LITE_VISION_ADAPTER, options));
 
   if (!vision_executor_settings_.GetAdapterSelectedSignatures().empty()) {
     std::vector<absl::string_view> adapter_selected_signatures;
@@ -413,16 +459,17 @@ absl::Status VisionLiteRtCompiledModelExecutor::VisionAdapter::Initialize(
   }
 
 #ifdef __EMSCRIPTEN__
-  extern void SetCurrentlyCompilingModel(ModelType model_type)
+  extern void SetCurrentlyCompilingModel(absl::string_view model_type_str)
       __attribute__((weak));
   if (SetCurrentlyCompilingModel) {
-    SetCurrentlyCompilingModel(ModelType::kTfLiteVisionAdapter);
+    SetCurrentlyCompilingModel(TfLiteModelTypeToWireString(
+        proto::LlmMetadata::TF_LITE_VISION_ADAPTER));
   }
 #endif
   auto compiled_model_or = CompiledModel::Create(env_, model_.Get(), options);
 #ifdef __EMSCRIPTEN__
   if (SetCurrentlyCompilingModel) {
-    SetCurrentlyCompilingModel(ModelType::kUnknown);
+    SetCurrentlyCompilingModel("");
   }
 #endif
   LITERT_ASSIGN_OR_RETURN(compiled_model_, std::move(compiled_model_or));
@@ -434,8 +481,7 @@ absl::Status VisionLiteRtCompiledModelExecutor::VisionAdapter::Initialize(
   if (model_.GetNumSignatures() == 1) {
     auto signature = model_.GetSignature(0);
     if (signature.HasValue() && !signature->InputNames().empty()) {
-      LITERT_ASSIGN_OR_RETURN(input_buffers_,
-                              compiled_model_.CreateInputBuffers(0));
+      LITERT_RETURN_IF_ERROR(GetOrCreateInputBuffers(0));
     }
   }
 
@@ -448,13 +494,13 @@ litert::lm::VisionLiteRtCompiledModelExecutor::Create(
     ModelResources& resources) {
   ABSL_ASSIGN_OR_RETURN(
       auto vision_encoder_model,
-      resources.GetTFLiteModel(ModelType::kTfLiteVisionEncoder));
+      resources.GetTFLiteModel(proto::LlmMetadata::TF_LITE_VISION_ENCODER));
   if (!vision_encoder_model) {
     return absl::InternalError("Failed to build LiteRt encoder model.");
   }
   // Vision adapter is optional.
   auto vision_adapter_model =
-      resources.GetTFLiteModel(ModelType::kTfLiteVisionAdapter);
+      resources.GetTFLiteModel(proto::LlmMetadata::TF_LITE_VISION_ADAPTER);
   if (!vision_adapter_model.ok() &&
       vision_adapter_model.status().code() != absl::StatusCode::kNotFound) {
     return vision_adapter_model.status();
@@ -526,11 +572,13 @@ litert::lm::VisionLiteRtCompiledModelExecutor::Create(
 absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
     const litert::TensorBuffer& input_image_tensor) {
   ScopedLatency scoped_total_latency(latency_stats_);
+  LITERT_ASSIGN_OR_RETURN(auto& encoder_input_buffers,
+                          vision_encoder_->GetOrCreateInputBuffers(0));
+
   LITERT_ASSIGN_OR_RETURN(auto input_image_data,
                           ReferTensorBufferAsSpan<float>(input_image_tensor));
   LITERT_RETURN_IF_ERROR(
-      vision_encoder_->GetMutableInputBuffers()[0].Write<float>(
-          input_image_data));
+      encoder_input_buffers[0].Write<float>(input_image_data));
 
   if (vision_adapter_ == nullptr) {
     LITERT_ASSIGN_OR_RETURN(
@@ -539,7 +587,7 @@ absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
     {
       ScopedLatency scoped(latency_stats_, kVisionEncoderInferenceLatency);
       LITERT_RETURN_IF_ERROR(vision_encoder_->GetCompiledModel().Run(
-          /*input_buffers=*/vision_encoder_->GetInputBuffers(),
+          /*input_buffers=*/encoder_input_buffers,
           /*output_buffers=*/encoder_outputs));
     }
     AccumulateStat(latency_stats_, kVisionNumImagesMetric, int64_t{1});
@@ -557,21 +605,13 @@ absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
                      output_tensor_buffers.size()));
   }
 
-  auto& encoder_outputs = vision_encoder_->GetMutableOutputBuffers();
-  if (encoder_outputs[0].IsWebGpuMemory() ||
-      encoder_outputs[0].IsMetalMemory()) {
-    // For WebGPU and Metal memory, we need to create a new output buffer to
-    // hold the data, otherwise we will get failed to lock TensorBuffer error on
-    // the second call to `Encode`. See b/457483190
-    LITERT_ASSIGN_OR_RETURN(
-        encoder_outputs,
-        vision_encoder_->GetCompiledModel().CreateOutputBuffers(0));
-  }
+  LITERT_ASSIGN_OR_RETURN(auto& encoder_outputs,
+                          vision_encoder_->GetOrCreateOutputBuffers(0));
 
   {
     ScopedLatency scoped(latency_stats_, kVisionEncoderInferenceLatency);
     LITERT_RETURN_IF_ERROR(vision_encoder_->GetCompiledModel().Run(
-        /*input_buffers=*/vision_encoder_->GetInputBuffers(),
+        /*input_buffers=*/encoder_input_buffers,
         /*output_buffers=*/encoder_outputs));
   }
 
@@ -629,9 +669,8 @@ absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
   }
 
   LITERT_ASSIGN_OR_RETURN(
-      auto encoder_input_buffers,
-      vision_encoder_->GetCompiledModel().CreateInputBuffers(
-          encoder_signature_index));
+      auto& encoder_input_buffers,
+      vision_encoder_->GetOrCreateInputBuffers(encoder_signature_index));
 
   LITERT_ASSIGN_OR_RETURN(
       auto encoder_signature,
@@ -646,25 +685,17 @@ absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
                  << " name: " << adapter_signature.Key();
   }
 
-  std::vector<TensorBuffer> adapter_output_tensor_buffers;
-  if (vision_adapter_ != nullptr) {
-    LITERT_ASSIGN_OR_RETURN(
-        adapter_output_tensor_buffers,
-        vision_adapter_->GetCompiledModel().CreateOutputBuffers(
-            *adapter_signature_index));
-    if (adapter_output_tensor_buffers.size() != 1) {
-      return absl::InternalError(
-          absl::StrCat("The Vision Adapter model must have exactly one output "
-                       "buffer but got ",
-                       adapter_output_tensor_buffers.size()));
-    }
-  }
-
   for (const auto& [key, value] : input_maps) {
     LITERT_ASSIGN_OR_RETURN(auto tensor_type, value.TensorType());
-    LITERT_ASSIGN_OR_RETURN(auto input_index,
-                            vision_encoder_->GetCompiledModel().FindInputIndex(
-                                encoder_signature_index, key));
+    size_t input_index = 0;
+    auto input_index_or = vision_encoder_->GetCompiledModel().FindInputIndex(
+        encoder_signature_index, key);
+    if (input_index_or.HasValue()) {
+      input_index = *input_index_or;
+    } else if (vision_encoder_->GetModel().GetNumSignatures() > 1) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("FindInputIndex failed for signature: ", key));
+    }
     encoder_input_buffers[input_index].Clear();
     if (tensor_type.ElementType() == ElementType::Float32) {
       LITERT_ASSIGN_OR_RETURN(auto input_data,
@@ -705,9 +736,8 @@ absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
   }
 
   LITERT_ASSIGN_OR_RETURN(
-      auto encoder_output_buffers,
-      vision_encoder_->GetCompiledModel().CreateOutputBuffers(
-          encoder_signature_index));
+      auto& encoder_output_buffers,
+      vision_encoder_->GetOrCreateOutputBuffers(encoder_signature_index));
 
   {
     ScopedLatency scoped(latency_stats_, kVisionEncoderInferenceLatency);
@@ -784,9 +814,17 @@ absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
 
   if (vision_adapter_ != nullptr) {
     LITERT_ASSIGN_OR_RETURN(
-        auto adapter_input_buffers,
-        vision_adapter_->GetCompiledModel().CreateInputBuffers(
-            *adapter_signature_index));
+        auto& adapter_input_buffers,
+        vision_adapter_->GetOrCreateInputBuffers(*adapter_signature_index));
+    LITERT_ASSIGN_OR_RETURN(
+        auto& adapter_output_tensor_buffers,
+        vision_adapter_->GetOrCreateOutputBuffers(*adapter_signature_index));
+    if (adapter_output_tensor_buffers.size() != 1) {
+      return absl::InternalError(
+          absl::StrCat("The Vision Adapter model must have exactly one output "
+                       "buffer but got ",
+                       adapter_output_tensor_buffers.size()));
+    }
     // Feed the adapter's `features` input from the encoder output. Any extra
     // adapter inputs are matched by name against the other encoder outputs.
     LITERT_ASSIGN_OR_RETURN(

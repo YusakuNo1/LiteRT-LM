@@ -63,6 +63,7 @@
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/litert_compiled_model_executor_utils.h"
 #include "runtime/executor/llm_executor_io_types.h"
+#include "runtime/proto/embedding_metadata.pb.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/status_macros.h"
 
@@ -176,7 +177,7 @@ EmbeddingLiteRtCompiledModelExecutor::CompileTextEncoder(
     ModelResources& resources) {
   ABSL_ASSIGN_OR_RETURN(
       auto text_encoder_model,
-      resources.GetTFLiteModel(ModelType::kTfLiteTextEncoder));
+      resources.GetTFLiteModel(proto::EmbeddingMetadata::TF_LITE_TEXT_ENCODER));
   RET_CHECK_NE(text_encoder_model, nullptr) << "TEXT_ENCODER model is null.";
 
   litert::Options options;
@@ -206,6 +207,12 @@ EmbeddingLiteRtCompiledModelExecutor::CompileTextEncoder(
                                EmbeddingExecutorSettings::kEncoderName));
       LITERT_RETURN_IF_ERROR(
           SetCommonGpuOptions(executor_settings, gpu_options));
+      // The text encoder is compiled for the GPU only, so it is always fully
+      // delegated to a single delegate. This lets TFLite skip preparing the
+      // CPU kernels before delegation, which otherwise allocates a CPU arena
+      // for every STABLEHLO_COMPOSITE decomposition subgraph that is never
+      // released.
+      gpu_options.SetHintFullyDelegatedToSingleDelegate(true);
       ABSL_RETURN_IF_ERROR(SetGpuCacheOptions(
           cache_files.weight_cache_file, cache_files.program_cache_file,
           cache_files.cache_key,
@@ -237,7 +244,7 @@ EmbeddingLiteRtCompiledModelExecutor::CompileTextEncoder(
                        GetBackendString(executor_settings.GetBackend())));
   }
   ABSL_RETURN_IF_ERROR(SetExternalWeightOptions(
-      resources, ModelType::kTfLiteTextEncoder, options));
+      resources, proto::EmbeddingMetadata::TF_LITE_TEXT_ENCODER, options));
 
   if (!executor_settings.GetSelectedSignatures().empty()) {
     std::vector<absl::string_view> selected_signatures;
@@ -252,17 +259,18 @@ EmbeddingLiteRtCompiledModelExecutor::CompileTextEncoder(
   }
 
 #ifdef __EMSCRIPTEN__
-  extern void SetCurrentlyCompilingModel(ModelType model_type)
+  extern void SetCurrentlyCompilingModel(absl::string_view model_type_str)
       __attribute__((weak));
   if (SetCurrentlyCompilingModel) {
-    SetCurrentlyCompilingModel(ModelType::kTfLiteTextEncoder);
+    SetCurrentlyCompilingModel(TfLiteModelTypeToWireString(
+        proto::EmbeddingMetadata::TF_LITE_TEXT_ENCODER));
   }
 #endif
   auto compiled_model_status_or =
       CompiledModelWrapper::Create(env, text_encoder_model->Get(), options);
 #ifdef __EMSCRIPTEN__
   if (SetCurrentlyCompilingModel) {
-    SetCurrentlyCompilingModel(ModelType::kUnknown);
+    SetCurrentlyCompilingModel("");
   }
 #endif
   LITERT_ASSIGN_OR_RETURN(auto compiled_model,
@@ -301,17 +309,6 @@ EmbeddingLiteRtCompiledModelExecutor::CompileTextEncoder(
     LITERT_ASSIGN_OR_RETURN(
         auto output_buffers,
         compiled_model_ptr->CreateOutputBuffers(signature_index));
-
-    // Run a warmup inference to prime the NPU driver and execution pipelines.
-    if (executor_settings.GetBackend() == Backend::NPU) {
-      auto warmup_status = compiled_model_ptr->Run(
-          signature_index, input_buffers, output_buffers);
-      if (!warmup_status) {
-        ABSL_LOG(WARNING) << "Warmup inference failed for signature index "
-                          << signature_index << ": "
-                          << warmup_status.Error().Message();
-      }
-    }
 
     input_buffers_cache[signature_index] = std::move(input_buffers);
     output_buffers_cache[signature_index] = std::move(output_buffers);

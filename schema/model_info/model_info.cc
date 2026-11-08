@@ -20,6 +20,7 @@
 #include <fstream>
 #include <ios>
 #include <istream>
+#include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -36,8 +37,10 @@
 #include "absl/strings/str_format.h"  // from @com_google_absl
 #include "absl/strings/str_split.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "flatbuffers/base.h"  // from @flatbuffers
 #include "flatbuffers/flexbuffers.h"  // from @flatbuffers
 #include "flatbuffers/verifier.h"  // from @flatbuffers
+#include "runtime/engine/engine_defaults.h"
 #include "runtime/proto/embedding_metadata.pb.h"
 #include "runtime/proto/embedding_model_type.pb.h"
 #include "runtime/proto/llm_metadata.pb.h"
@@ -45,6 +48,8 @@
 #include "runtime/util/status_macros.h"
 #include "schema/core/litertlm_header_schema_generated.h"
 #include "schema/core/litertlm_read.h"
+#include "support/util/memory_mapped_file.h"
+#include "support/util/scoped_file.h"
 #include "tflite/schema/schema_generated.h"  // from @litert
 
 namespace litert::lm::schema::model_info {
@@ -65,6 +70,17 @@ constexpr size_t kMaxNpuSectionSize = 10 * 1024 * 1024;
 // addressable by the FlatBuffers specification (due to 32-bit signed offsets)
 // and protects against unbounded memory allocations.
 constexpr size_t kMaxVisionSectionSize = 2ULL * 1024 * 1024 * 1024;
+
+// Maximum number of leading bytes of the main TFLite section read to inspect
+// its graph. A FlatBuffer, and therefore the graph, never exceeds
+// FLATBUFFERS_MAX_BUFFER_SIZE; larger models store their weights after the
+// FlatBuffer. The FlatBuffers verifier requires a smaller buffer than that.
+constexpr size_t kMaxTfliteGraphSize = FLATBUFFERS_MAX_BUFFER_SIZE - 1;
+
+// Minimum file offset alignment for a section to be memory-mapped instead of
+// copied, as FlatBuffers require aligned buffers. Conforming LiteRT-LM files
+// align sections to 16 KB.
+constexpr uint64_t kMinMappedSectionAlignment = 16;
 
 // Formats a float for the CLI report. Uses general format '%g' to preserve
 // precision without trailing zeros, but appends '.0' if the formatted string
@@ -349,6 +365,7 @@ enum class SectionKind {
   kVideo,
   kSpeculativeDrafter,
   kNpuAux,
+  kAuxiliary,
   kOther,
 };
 
@@ -361,18 +378,20 @@ SectionKind ClassifyModelType(absl::string_view model_type) {
       model_type == "tf_lite_embedder") {
     return SectionKind::kTextEncoder;
   }
-  if (model_type == "tf_lite_vision_adapter" ||
-      model_type == "tf_lite_vision_encoder") {
+  if (model_type == "tf_lite_vision_encoder") {
     return SectionKind::kVision;
   }
-  if (model_type == "tf_lite_audio_adapter" ||
-      model_type == "tf_lite_audio_encoder_hw" ||
-      model_type == "tf_lite_audio_frontend") {
+  if (model_type == "tf_lite_audio_encoder_hw") {
     return SectionKind::kAudio;
   }
-  if (model_type == "tf_lite_video_adapter" ||
-      model_type == "tf_lite_video_encoder") {
+  if (model_type == "tf_lite_video_encoder") {
     return SectionKind::kVideo;
+  }
+  if (model_type == "tf_lite_vision_adapter" ||
+      model_type == "tf_lite_audio_adapter" ||
+      model_type == "tf_lite_audio_frontend" ||
+      model_type == "tf_lite_video_adapter") {
+    return SectionKind::kAuxiliary;
   }
   if (model_type == "tf_lite_mtp_drafter") {
     return SectionKind::kSpeculativeDrafter;
@@ -400,6 +419,7 @@ struct DiscoveredSections {
   StreamSection npu_aux;
   std::vector<StreamSection> vision_sections;
   bool has_speculative_decoding = false;
+  bool has_artisan_text_decoder = false;
 
   ModalityMetadata text;
   ModalityMetadata vision;
@@ -548,38 +568,107 @@ absl::StatusOr<std::vector<int>> ExtractVisionSignatureLengths(
   return extracted_lengths;
 }
 
-// Reads a section from the container stream into memory with size and bounds
-// validation.
-absl::StatusOr<std::string> ReadStreamSection(
-    std::istream& stream, std::streamoff total_stream_size,
-    const StreamSection& section, size_t max_size,
-    absl::string_view section_name) {
-  if (section.end <= section.begin) {
-    return absl::InternalError(
-        absl::StrFormat("Invalid %s section offsets.", section_name));
+// Bytes of a container section, either memory-mapped from the container file
+// or copied into memory (via InMemoryFile).
+class SectionBytes {
+ public:
+  SectionBytes(std::unique_ptr<litert::support::MemoryMappedFile> file,
+               size_t offset, size_t size)
+      : file_(std::move(file)), offset_(offset), size_(size) {}
+
+  absl::string_view data() const {
+    if (file_ == nullptr) return "";
+    return absl::string_view(static_cast<const char*>(file_->data()) + offset_,
+                             size_);
   }
-  if (total_stream_size >= 0 &&
-      static_cast<uint64_t>(total_stream_size) < section.end) {
-    return absl::InternalError(
-        absl::StrFormat("%s section exceeds stream bounds.", section_name));
+
+ private:
+  std::unique_ptr<litert::support::MemoryMappedFile> file_;
+  size_t offset_ = 0;
+  size_t size_ = 0;
+};
+
+// Reads sections of a LiteRT-LM container with size and bounds validation. If
+// the container file is available via ScopedFile, sections are memory-mapped so
+// that only the pages that are accessed are read from disk, instead of copying
+// whole sub-models such as vision encoders or the main prefill/decode graph.
+class SectionReader {
+ public:
+  SectionReader(std::istream& stream, std::streamoff total_stream_size,
+                const litert::support::ScopedFile* scoped_file)
+      : stream_(stream),
+        total_stream_size_(total_stream_size),
+        scoped_file_(scoped_file) {}
+
+  absl::StatusOr<SectionBytes> Read(const StreamSection& section,
+                                    size_t max_size,
+                                    absl::string_view section_name) {
+    if (section.end <= section.begin) {
+      return absl::InternalError(
+          absl::StrFormat("Invalid %s section offsets.", section_name));
+    }
+    if (total_stream_size_ >= 0 &&
+        static_cast<uint64_t>(total_stream_size_) < section.end) {
+      return absl::InternalError(
+          absl::StrFormat("%s section exceeds stream bounds.", section_name));
+    }
+    if (section.size() > max_size) {
+      return absl::InternalError(absl::StrFormat(
+          "%s section size exceeds maximum allowed limit.", section_name));
+    }
+    if (auto mapping = Map(section)) return std::move(*mapping);
+    return Copy(section, section_name);
   }
-  size_t size = section.size();
-  if (size > max_size) {
-    return absl::InternalError(absl::StrFormat(
-        "%s section size exceeds maximum allowed limit.", section_name));
+
+ private:
+  // Returns std::nullopt if the section cannot be memory-mapped.
+  std::optional<SectionBytes> Map(const StreamSection& section) const {
+    if (scoped_file_ == nullptr || !scoped_file_->IsValid()) {
+      return std::nullopt;
+    }
+    // A mapped section is only as aligned in memory as it is in the file.
+    // FlatBuffers require 16-byte alignment.
+    if (section.begin % kMinMappedSectionAlignment != 0) return std::nullopt;
+    const size_t alignment =
+        litert::support::MemoryMappedFile::GetOffsetAlignment();
+    const uint64_t alignment_gap = section.begin % alignment;
+    const uint64_t aligned_begin = section.begin - alignment_gap;
+    const uint64_t aligned_size = section.end - aligned_begin;
+    auto mapping_or = litert::support::MemoryMappedFile::Create(
+        scoped_file_->file(), aligned_begin, aligned_size, /*key=*/"",
+        litert::support::MemoryMappedFile::Access::kRead);
+    if (!mapping_or.ok()) return std::nullopt;
+    return SectionBytes(std::move(*mapping_or), alignment_gap, section.size());
   }
-  stream.seekg(section.begin);
-  std::string buffer(size, '\0');
-  stream.read(&buffer[0], size);
-  if (!stream && stream.gcount() == 0) {
-    return absl::InternalError(absl::StrFormat(
-        "Failed to read %s section from stream.", section_name));
+
+  // Copies the section from the stream into an InMemoryFile.
+  absl::StatusOr<SectionBytes> Copy(const StreamSection& section,
+                                    absl::string_view section_name) {
+    size_t size = section.size();
+    stream_.seekg(section.begin);
+    std::string buffer(size, '\0');
+    stream_.read(&buffer[0], size);
+    if (!stream_ && stream_.gcount() == 0) {
+      return absl::InternalError(absl::StrFormat(
+          "Failed to read %s section from stream.", section_name));
+    }
+    if (static_cast<size_t>(stream_.gcount()) < size) {
+      buffer.resize(stream_.gcount());
+    }
+    size_t actual_size = buffer.size();
+    auto in_memory_file_or =
+        litert::support::InMemoryFile::Create(std::move(buffer));
+    if (!in_memory_file_or.ok()) {
+      return in_memory_file_or.status();
+    }
+    return SectionBytes(std::move(*in_memory_file_or), /*offset=*/0,
+                        actual_size);
   }
-  if (static_cast<size_t>(stream.gcount()) < size) {
-    buffer.resize(stream.gcount());
-  }
-  return buffer;
-}
+
+  std::istream& stream_;
+  const std::streamoff total_stream_size_;
+  const litert::support::ScopedFile* scoped_file_;
+};
 
 // Scans container system metadata and section entries to discover sections.
 absl::StatusOr<DiscoveredSections> DiscoverSections(
@@ -670,8 +759,10 @@ absl::StatusOr<DiscoveredSections> DiscoverSections(
     // modality.
     auto record_modality = [&](ModalityMetadata& mod) {
       mod.present = true;
-      mod.backend_constraint = backend_constraint;
-      if (!section_soc_name.empty()) {
+      if (mod.backend_constraint.empty()) {
+        mod.backend_constraint = backend_constraint;
+      }
+      if (mod.soc_name.empty() && !section_soc_name.empty()) {
         mod.soc_name = section_soc_name;
       }
     };
@@ -682,6 +773,9 @@ absl::StatusOr<DiscoveredSections> DiscoverSections(
         record_modality(sections.text);
         sections.main_tflite = sec;
         found_main_tflite = true;
+        if (model_type == "tf_lite_artisan_text_decoder") {
+          sections.has_artisan_text_decoder = true;
+        }
         break;
       case SectionKind::kTextEncoder:
         record_modality(sections.text);
@@ -703,6 +797,8 @@ absl::StatusOr<DiscoveredSections> DiscoverSections(
       case SectionKind::kNpuAux:
         sections.npu_aux = sec;
         break;
+      case SectionKind::kAuxiliary:
+        break;
       case SectionKind::kOther:
         is_adapter = false;
         break;
@@ -722,8 +818,7 @@ absl::StatusOr<DiscoveredSections> DiscoverSections(
 // and SoC chipset details across all active modalities for LLM or Embedding
 // models.
 absl::Status ConfigureSupportedBackendsAndNpu(
-    std::istream& stream, std::streamoff total_stream_size,
-    const DiscoveredSections& sections,
+    SectionReader& reader, const DiscoveredSections& sections,
     const StreamSection& primary_compute_sec,
     SupportedModalities& input_modalities, SupportedBackends& text_backends,
     SupportedBackends& vision_backends, SupportedBackends& audio_backends,
@@ -770,10 +865,9 @@ absl::Status ConfigureSupportedBackendsAndNpu(
 
   auto inspect_section_for_npu = [&](const StreamSection& sec) {
     if (!sec.is_valid()) return;
-    auto buffer_or = ReadStreamSection(stream, total_stream_size, sec,
-                                       kMaxNpuSectionSize, "NPU");
-    if (!buffer_or.ok()) return;
-    NpuInfo info = DetectNpuInfoFromTfliteBuffer(*buffer_or);
+    auto bytes_or = reader.Read(sec, kMaxNpuSectionSize, "NPU");
+    if (!bytes_or.ok()) return;
+    NpuInfo info = DetectNpuInfoFromTfliteBuffer(bytes_or->data());
     if (npu_brand == NpuBrand::kUnknown) {
       npu_brand = info.brand;
     }
@@ -818,9 +912,9 @@ absl::Status ConfigureSupportedBackendsAndNpu(
 
 // Configures supported modalities and hardware backends for Large Language
 // Models.
-absl::Status ConfigureModalitiesAndBackends(
-    std::istream& stream, std::streamoff total_stream_size,
-    const DiscoveredSections& sections, LlmInferenceCapability& llm_cap) {
+absl::Status ConfigureModalitiesAndBackends(SectionReader& reader,
+                                            const DiscoveredSections& sections,
+                                            LlmInferenceCapability& llm_cap) {
   llm_cap.input_modalities.text = sections.text.present;
   llm_cap.input_modalities.vision = sections.vision.present;
   llm_cap.input_modalities.audio = sections.audio.present;
@@ -829,10 +923,9 @@ absl::Status ConfigureModalitiesAndBackends(
   llm_cap.supports_speculative_decoding = sections.has_speculative_decoding;
 
   return ConfigureSupportedBackendsAndNpu(
-      stream, total_stream_size, sections, sections.main_tflite,
-      llm_cap.input_modalities, llm_cap.text_supported_backends,
-      llm_cap.vision_supported_backends, llm_cap.audio_supported_backends,
-      llm_cap.video_supported_backends);
+      reader, sections, sections.main_tflite, llm_cap.input_modalities,
+      llm_cap.text_supported_backends, llm_cap.vision_supported_backends,
+      llm_cap.audio_supported_backends, llm_cap.video_supported_backends);
 }
 
 // Calculates max vision token budget for LLM models.
@@ -868,22 +961,30 @@ int CalculateMaxVisionTokenBudget(const proto::LlmModelType& model_type) {
 // Calculates max vision token budget for Embedding models.
 int CalculateMaxVisionTokenBudget(
     const proto::EmbeddingModelType& model_type) {
+  if (model_type.has_embedding_gemma_v2()) {
+    const auto& gemma_v2 = model_type.embedding_gemma_v2();
+    if (gemma_v2.max_num_patches() > 0) {
+      int pool = gemma_v2.pooling_kernel_size() > 0
+                     ? gemma_v2.pooling_kernel_size()
+                     : 3;
+      return gemma_v2.max_num_patches() / (pool * pool);
+    }
+  }
   return -1;
 }
 
 // Overwrite from serialized binary LlmMetadata protobuf if present.
-absl::Status LoadLlmMetadataProtoIfPresent(
-    std::istream& stream, std::streamoff total_stream_size,
-    const StreamSection& proto_section, LlmInferenceCapability& llm_cap) {
+absl::Status LoadLlmMetadataProtoIfPresent(SectionReader& reader,
+                                           const StreamSection& proto_section,
+                                           LlmInferenceCapability& llm_cap) {
   if (!proto_section.is_valid()) return absl::OkStatus();
 
   ABSL_ASSIGN_OR_RETURN(
-      std::string buffer,
-      ReadStreamSection(stream, total_stream_size, proto_section,
-                        kMaxProtoMetadataSize, "LLM metadata"));
+      SectionBytes bytes,
+      reader.Read(proto_section, kMaxProtoMetadataSize, "LLM metadata"));
 
   proto::LlmMetadata proto_metadata;
-  if (!proto_metadata.ParseFromString(buffer)) {
+  if (!proto_metadata.ParseFromString(bytes.data())) {
     return absl::OkStatus();
   }
 
@@ -907,16 +1008,16 @@ absl::Status LoadLlmMetadataProtoIfPresent(
     }
   }
 
+  // Default context size. is_dynamic_context comes only from the TFLite graph,
+  // see LoadContextInfoFromTfliteIfPresent().
   llm_cap.max_context_tokens = proto_metadata.max_num_tokens();
-  llm_cap.is_dynamic_context = IsMagicNumber(llm_cap.max_context_tokens);
 
   return absl::OkStatus();
 }
 
 // Extracts vision signature token lengths if vision is supported.
 absl::Status LoadVisionSignaturesIfPresent(
-    std::istream& stream, std::streamoff total_stream_size,
-    const std::vector<StreamSection>& vision_sections,
+    SectionReader& reader, const std::vector<StreamSection>& vision_sections,
     LlmInferenceCapability& llm_cap) {
   if (!llm_cap.input_modalities.vision) {
     llm_cap.vision_signature_selection = std::nullopt;
@@ -926,12 +1027,11 @@ absl::Status LoadVisionSignaturesIfPresent(
   std::vector<int> all_lengths;
   for (const auto& vision_sec : vision_sections) {
     ABSL_ASSIGN_OR_RETURN(
-        std::string buffer,
-        ReadStreamSection(stream, total_stream_size, vision_sec,
-                          kMaxVisionSectionSize, "Vision model"));
+        SectionBytes bytes,
+        reader.Read(vision_sec, kMaxVisionSectionSize, "Vision model"));
 
     ABSL_ASSIGN_OR_RETURN(auto lengths,
-                          ExtractVisionSignatureLengths(buffer));
+                          ExtractVisionSignatureLengths(bytes.data()));
     all_lengths.insert(all_lengths.end(), lengths.begin(), lengths.end());
   }
 
@@ -947,20 +1047,53 @@ absl::Status LoadVisionSignaturesIfPresent(
   return absl::OkStatus();
 }
 
-// Inspects a TFLite model buffer to extract context token limit from prefill
-// signature input mask tensor.
-std::optional<int64_t> ExtractContextTokensFromTfliteBuffer(
-    absl::string_view buffer) {
+// Context information inspected from the main TFLite graph.
+struct TfliteContextInfo {
+  // Whether the KV-cache size is chosen at initialization time: the prefill
+  // mask has a magic-number context length, or the KV cache has dynamic (-1)
+  // dimensions.
+  bool is_dynamic = false;
+  // Fixed context size of a static graph, or 0 if dynamic or unknown.
+  int64_t context_tokens = 0;
+};
+
+// KV-cache input names, as in GetKVCacheRootNames() and the NPU executor.
+bool IsKvCacheInput(absl::string_view name) {
+  return absl::StartsWith(name, "kv_cache_k") ||
+         absl::StartsWith(name, "kv_cache_v") ||
+         absl::StartsWith(name, "kv_cache_c") ||
+         absl::StartsWith(name, "k_cache_") ||
+         absl::StartsWith(name, "v_cache_");
+}
+
+// Returns true if `tensor` has a dynamic (-1) dimension. Dynamic dimensions are
+// only recorded in `shape_signature`; `shape` holds a placeholder (1) for them.
+bool HasDynamicDim(const tflite::Tensor& tensor) {
+  if (tensor.shape_signature() == nullptr) return false;
+  for (int32_t dim : *tensor.shape_signature()) {
+    if (dim < 0) return true;
+  }
+  return false;
+}
+
+// Inspects the KV-cache and mask inputs of a TFLite graph's prefill signatures.
+// The context size is the largest KV-cache dimension, not the mask's last
+// dimension, which on NPU graphs also counts the prefill tokens (e.g. 4096 +
+// 128). Decode signatures are skipped: on NPU graphs their mask is the KV-cache
+// size plus one, which can be a prime number.
+TfliteContextInfo ExtractContextInfoFromTfliteBuffer(absl::string_view buffer) {
+  TfliteContextInfo info;
   flatbuffers::Verifier verifier(
       reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size());
-  if (!tflite::VerifyModelBuffer(verifier)) return std::nullopt;
+  if (!tflite::VerifyModelBuffer(verifier)) return info;
 
   const tflite::Model* model = tflite::GetModel(buffer.data());
   if (model == nullptr || model->signature_defs() == nullptr ||
       model->subgraphs() == nullptr) {
-    return std::nullopt;
+    return info;
   }
 
+  int64_t max_kv_cache_dim = 0;
   for (const auto* sig : *model->signature_defs()) {
     if (sig == nullptr || sig->signature_key() == nullptr ||
         sig->inputs() == nullptr) {
@@ -969,66 +1102,83 @@ std::optional<int64_t> ExtractContextTokensFromTfliteBuffer(
     if (!absl::StartsWith(sig->signature_key()->string_view(), "prefill")) {
       continue;
     }
+    if (sig->subgraph_index() >= model->subgraphs()->size()) continue;
+    const auto* subgraph = model->subgraphs()->Get(sig->subgraph_index());
+    if (subgraph == nullptr || subgraph->tensors() == nullptr) continue;
+
     for (const auto* input : *sig->inputs()) {
       if (input == nullptr || input->name() == nullptr) continue;
-      if (!absl::StrContains(input->name()->string_view(), "mask")) continue;
+      const absl::string_view name = input->name()->string_view();
+      const bool is_kv_cache = IsKvCacheInput(name);
+      if (!is_kv_cache && !absl::StrContains(name, "mask")) continue;
+      if (input->tensor_index() >= subgraph->tensors()->size()) continue;
+      const auto* tensor = subgraph->tensors()->Get(input->tensor_index());
+      if (tensor == nullptr || tensor->shape() == nullptr ||
+          tensor->shape()->empty()) {
+        continue;
+      }
 
-      uint32_t tensor_idx = input->tensor_index();
-      uint32_t subgraph_idx = sig->subgraph_index();
-      if (subgraph_idx >= model->subgraphs()->size()) continue;
-
-      const auto* subgraph = model->subgraphs()->Get(subgraph_idx);
-      if (subgraph == nullptr || subgraph->tensors() == nullptr) continue;
-      if (tensor_idx >= subgraph->tensors()->size()) continue;
-
-      const auto* tensor = subgraph->tensors()->Get(tensor_idx);
-      if (tensor == nullptr || tensor->shape() == nullptr) continue;
-
-      int rank = tensor->shape()->size();
-      if (rank > 0) {
-        return tensor->shape()->Get(rank - 1);
+      const auto& shape = *tensor->shape();
+      if (is_kv_cache) {
+        info.is_dynamic |= HasDynamicDim(*tensor);
+        for (int32_t dim : shape) {
+          max_kv_cache_dim = std::max<int64_t>(max_kv_cache_dim, dim);
+        }
+      } else {
+        info.is_dynamic |= IsMagicNumber(shape.Get(shape.size() - 1));
       }
     }
   }
-  return std::nullopt;
+
+  // A dynamic graph's sizes are placeholders.
+  if (!info.is_dynamic) info.context_tokens = max_kv_cache_dim;
+  return info;
 }
 
-// Inspects main TFLite model graph for context size if not already populated
-// from LlmMetadata protobuf (e.g. for legacy or raw TFLite models).
-absl::Status InferContextTokensFallbackIfMissing(
-    std::istream& stream, std::streamoff total_stream_size,
-    const StreamSection& main_tflite_sec, LlmInferenceCapability& llm_cap) {
-  if (llm_cap.max_context_tokens != 0 || !main_tflite_sec.is_valid()) {
+// Sets is_dynamic_context from the main TFLite graph. If LlmMetadata does not
+// set max_num_tokens, also sets max_context_tokens to the size the engine
+// initializes the model with: its default, capped by a static graph's KV-cache
+// size. Leaves it 0 if the graph is static and has no KV-cache inputs.
+absl::Status LoadContextInfoFromTfliteIfPresent(
+    SectionReader& reader, const StreamSection& main_tflite_sec,
+    LlmInferenceCapability& llm_cap) {
+  if (!main_tflite_sec.is_valid()) {
     return absl::OkStatus();
   }
-  auto buffer_or = ReadStreamSection(stream, total_stream_size, main_tflite_sec,
-                                     kMaxVisionSectionSize, "Main TFLite");
-  if (!buffer_or.ok()) {
+  // Read only the leading kMaxTfliteGraphSize bytes, which hold the graph.
+  StreamSection graph_sec = main_tflite_sec;
+  graph_sec.end =
+      std::min<uint64_t>(graph_sec.end, graph_sec.begin + kMaxTfliteGraphSize);
+  auto bytes_or = reader.Read(graph_sec, kMaxTfliteGraphSize, "Main TFLite");
+  if (!bytes_or.ok()) {
     return absl::OkStatus();
   }
 
-  auto context_tokens = ExtractContextTokensFromTfliteBuffer(*buffer_or);
-  if (context_tokens.has_value()) {
-    llm_cap.max_context_tokens = *context_tokens;
-    llm_cap.is_dynamic_context = IsMagicNumber(*context_tokens);
+  const TfliteContextInfo info =
+      ExtractContextInfoFromTfliteBuffer(bytes_or->data());
+  llm_cap.is_dynamic_context = info.is_dynamic;
+  if (llm_cap.max_context_tokens == 0) {
+    if (info.is_dynamic) {
+      llm_cap.max_context_tokens = kDefaultMaxNumTokens;
+    } else if (info.context_tokens > 0) {
+      llm_cap.max_context_tokens =
+          std::min<int64_t>(kDefaultMaxNumTokens, info.context_tokens);
+    }
   }
-
   return absl::OkStatus();
 }
 
 // Parses embedding metadata protobuf if present.
 absl::Status LoadEmbeddingMetadataProtoIfPresent(
-    std::istream& stream, std::streamoff total_stream_size,
-    const StreamSection& proto_section,
+    SectionReader& reader, const StreamSection& proto_section,
     EmbeddingInferenceCapability& embed_cap) {
   if (proto_section.is_valid()) {
-    ABSL_ASSIGN_OR_RETURN(
-        std::string buffer,
-        ReadStreamSection(stream, total_stream_size, proto_section,
-                          kMaxProtoMetadataSize, "Embedding metadata"));
+    ABSL_ASSIGN_OR_RETURN(SectionBytes bytes,
+                          reader.Read(proto_section, kMaxProtoMetadataSize,
+                                      "Embedding metadata"));
 
     proto::EmbeddingMetadata proto_metadata;
-    if (proto_metadata.ParseFromString(buffer)) {
+    if (proto_metadata.ParseFromString(bytes.data())) {
       if (proto_metadata.has_embedding_model_type()) {
         int budget = CalculateMaxVisionTokenBudget(
             proto_metadata.embedding_model_type());
@@ -1205,33 +1355,30 @@ absl::Status ExtractEmbeddingInfoFromTfliteBuffer(
 
 // Loads embedding model TFLite and extracts dimensions and signatures.
 absl::Status LoadEmbeddingModelTfliteIfPresent(
-    std::istream& stream, std::streamoff total_stream_size,
-    const StreamSection& encoder_section,
+    SectionReader& reader, const StreamSection& encoder_section,
     EmbeddingInferenceCapability& embed_cap) {
   if (!encoder_section.is_valid()) return absl::OkStatus();
 
-  ABSL_ASSIGN_OR_RETURN(
-      std::string buffer,
-      ReadStreamSection(stream, total_stream_size, encoder_section,
-                        kMaxVisionSectionSize, "Embedding encoder model"));
+  ABSL_ASSIGN_OR_RETURN(SectionBytes bytes,
+                        reader.Read(encoder_section, kMaxVisionSectionSize,
+                                    "Embedding encoder model"));
 
-  return ExtractEmbeddingInfoFromTfliteBuffer(buffer, embed_cap);
+  return ExtractEmbeddingInfoFromTfliteBuffer(bytes.data(), embed_cap);
 }
 
 // Configures supported modalities and hardware backends for embedding models.
 absl::Status ConfigureEmbeddingModalitiesAndBackends(
-    std::istream& stream, std::streamoff total_stream_size,
-    const DiscoveredSections& sections,
+    SectionReader& reader, const DiscoveredSections& sections,
     EmbeddingInferenceCapability& embed_cap) {
   embed_cap.input_modalities.text = sections.text.present;
   if (sections.vision.present) {
     embed_cap.input_modalities.vision = true;
     std::vector<int> vision_lengths;
     for (const auto& vision_sec : sections.vision_sections) {
-      auto buffer_or = ReadStreamSection(stream, total_stream_size, vision_sec,
-                                         kMaxVisionSectionSize, "Vision model");
-      if (buffer_or.ok()) {
-        auto lengths_or = ExtractVisionSignatureLengths(*buffer_or);
+      auto bytes_or =
+          reader.Read(vision_sec, kMaxVisionSectionSize, "Vision model");
+      if (bytes_or.ok()) {
+        auto lengths_or = ExtractVisionSignatureLengths(bytes_or->data());
         if (lengths_or.ok() && !lengths_or->empty()) {
           for (int len : *lengths_or) {
             vision_lengths.push_back(len);
@@ -1259,10 +1406,9 @@ absl::Status ConfigureEmbeddingModalitiesAndBackends(
                                 : sections.main_tflite;
 
   return ConfigureSupportedBackendsAndNpu(
-      stream, total_stream_size, sections, primary_sec,
-      embed_cap.input_modalities, embed_cap.text_supported_backends,
-      embed_cap.vision_supported_backends, embed_cap.audio_supported_backends,
-      embed_cap.video_supported_backends);
+      reader, sections, primary_sec, embed_cap.input_modalities,
+      embed_cap.text_supported_backends, embed_cap.vision_supported_backends,
+      embed_cap.audio_supported_backends, embed_cap.video_supported_backends);
 }
 
 // Helper to format modality backends consistently across both LLM and
@@ -1287,9 +1433,11 @@ void PrintModalityBackends(std::ostream& os,
   }
 }
 
-}  // namespace
-
-absl::StatusOr<ModelInfo> GetModelInfo(std::istream& litertlm_stream) {
+// Implements GetModelInfo(). If set, `scoped_file` provides the file backing
+// `litertlm_stream`, so that sections can be memory-mapped from it.
+absl::StatusOr<ModelInfo> GetModelInfoImpl(
+    std::istream& litertlm_stream,
+    const litert::support::ScopedFile* scoped_file) {
   litertlm_stream.seekg(0, std::ios::end);
   const std::streamoff total_stream_size = litertlm_stream.tellg();
   litertlm_stream.seekg(0, std::ios::beg);
@@ -1301,6 +1449,7 @@ absl::StatusOr<ModelInfo> GetModelInfo(std::istream& litertlm_stream) {
   ABSL_ASSIGN_OR_RETURN(DiscoveredSections sections,
                         DiscoverSections(*header.metadata));
 
+  SectionReader reader(litertlm_stream, total_stream_size, scoped_file);
   ModelInfo info;
 
   // 1. If EmbeddingMetadata proto is present OR if this is a dedicated
@@ -1314,17 +1463,16 @@ absl::StatusOr<ModelInfo> GetModelInfo(std::istream& litertlm_stream) {
   if (is_embedding_model) {
     EmbeddingInferenceCapability embed_cap;
     ABSL_RETURN_IF_ERROR(LoadEmbeddingMetadataProtoIfPresent(
-        litertlm_stream, total_stream_size, sections.embedding_metadata_proto,
-        embed_cap));
+        reader, sections.embedding_metadata_proto, embed_cap));
 
     const auto& encoder_sec = sections.embedding_encoder_tflite.is_valid()
                                   ? sections.embedding_encoder_tflite
                                   : sections.main_tflite;
-    ABSL_RETURN_IF_ERROR(LoadEmbeddingModelTfliteIfPresent(
-        litertlm_stream, total_stream_size, encoder_sec, embed_cap));
+    ABSL_RETURN_IF_ERROR(
+        LoadEmbeddingModelTfliteIfPresent(reader, encoder_sec, embed_cap));
 
-    ABSL_RETURN_IF_ERROR(ConfigureEmbeddingModalitiesAndBackends(
-        litertlm_stream, total_stream_size, sections, embed_cap));
+    ABSL_RETURN_IF_ERROR(
+        ConfigureEmbeddingModalitiesAndBackends(reader, sections, embed_cap));
 
     info.embedding_capability = std::move(embed_cap);
   }
@@ -1332,18 +1480,27 @@ absl::StatusOr<ModelInfo> GetModelInfo(std::istream& litertlm_stream) {
   // 2. If LlmMetadata proto is present OR if this is not an embedding model:
   if (sections.llm_metadata_proto.is_valid() || !is_embedding_model) {
     LlmInferenceCapability llm_cap;
-    ABSL_RETURN_IF_ERROR(ConfigureModalitiesAndBackends(
-        litertlm_stream, total_stream_size, sections, llm_cap));
+    ABSL_RETURN_IF_ERROR(
+        ConfigureModalitiesAndBackends(reader, sections, llm_cap));
 
     ABSL_RETURN_IF_ERROR(LoadLlmMetadataProtoIfPresent(
-        litertlm_stream, total_stream_size, sections.llm_metadata_proto,
-        llm_cap));
+        reader, sections.llm_metadata_proto, llm_cap));
 
     ABSL_RETURN_IF_ERROR(LoadVisionSignaturesIfPresent(
-        litertlm_stream, total_stream_size, sections.vision_sections, llm_cap));
+        reader, sections.vision_sections, llm_cap));
 
-    ABSL_RETURN_IF_ERROR(InferContextTokensFallbackIfMissing(
-        litertlm_stream, total_stream_size, sections.main_tflite, llm_cap));
+    // Must run after LoadLlmMetadataProtoIfPresent(), whose max_num_tokens
+    // takes precedence.
+    ABSL_RETURN_IF_ERROR(LoadContextInfoFromTfliteIfPresent(
+        reader, sections.main_tflite, llm_cap));
+
+    // Artisan GPU text decoders size their KV cache from the max_num_tokens
+    // requested at runtime, so their context size is always configurable and
+    // the metadata max_num_tokens is only the default.
+    if (sections.has_artisan_text_decoder &&
+        llm_cap.text_supported_backends.gpu) {
+      llm_cap.is_dynamic_context = true;
+    }
 
     info.llm_capability = std::move(llm_cap);
   }
@@ -1351,14 +1508,24 @@ absl::StatusOr<ModelInfo> GetModelInfo(std::istream& litertlm_stream) {
   return info;
 }
 
+}  // namespace
+
+absl::StatusOr<ModelInfo> GetModelInfo(std::istream& litertlm_stream) {
+  return GetModelInfoImpl(litertlm_stream, /*scoped_file=*/nullptr);
+}
+
 // Extracts model metadata and capabilities from the given LiteRT-LM file path.
 absl::StatusOr<ModelInfo> GetModelInfo(absl::string_view litertlm_path) {
+  auto scoped_file_or = litert::support::ScopedFile::Open(litertlm_path);
+  if (!scoped_file_or.ok()) {
+    return scoped_file_or.status();
+  }
   std::ifstream input_file_stream(std::string(litertlm_path), std::ios::binary);
   if (!input_file_stream.is_open()) {
     return absl::InternalError(
         absl::StrFormat("Could not open file: %s", litertlm_path));
   }
-  return GetModelInfo(input_file_stream);
+  return GetModelInfoImpl(input_file_stream, &*scoped_file_or);
 }
 
 // Formats the supported input/output modalities into a space-separated string
@@ -1468,7 +1635,7 @@ std::ostream& operator<<(std::ostream& os,
      << "  Max Vision Token Budget: "
      << llm_cap.max_vision_token_budget << "\n"
      << "  Min Runtime Version:    "
-     << (llm_cap.min_runtime_version.empty() ? "-1"
+     << (llm_cap.min_runtime_version.empty() ? "NOT SET"
                                              : llm_cap.min_runtime_version)
      << "\n";
 
@@ -1514,7 +1681,7 @@ std::ostream& operator<<(std::ostream& os,
      << "\n";
 
   if (embed_cap.supported_signature_lengths.has_value()) {
-    os << "  Supported Signature Lengths: [";
+    os << "  Text Signature Selection: [";
     const auto& lengths = *embed_cap.supported_signature_lengths;
     for (size_t i = 0; i < lengths.size(); ++i) {
       os << lengths[i];
@@ -1522,11 +1689,23 @@ std::ostream& operator<<(std::ostream& os,
     }
     os << "]\n";
   } else {
-    os << "  Supported Signature Lengths: -1\n";
+    os << "  Text Signature Selection: -1\n";
+  }
+
+  if (embed_cap.vision_signature_selection.has_value()) {
+    os << "  Vision Signature Selection: [";
+    const auto& lengths = *embed_cap.vision_signature_selection;
+    for (size_t i = 0; i < lengths.size(); ++i) {
+      os << lengths[i];
+      if (i + 1 < lengths.size()) os << ", ";
+    }
+    os << "]\n";
+  } else {
+    os << "  Vision Signature Selection: -1\n";
   }
 
   os << "  Min Runtime Version:    "
-     << (embed_cap.min_runtime_version.empty() ? "-1"
+     << (embed_cap.min_runtime_version.empty() ? "NOT SET"
                                                : embed_cap.min_runtime_version)
      << "\n"
      << "  Input Modalities:       " << embed_cap.input_modalities << "\n";

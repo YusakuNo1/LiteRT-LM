@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include "absl/algorithm/container.h"  // from @com_google_absl
+
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
@@ -134,9 +136,10 @@ absl::StatusOr<std::string> CreateLarkGrammarForFcToolCalls(
     }
     std::string tool_name = tool["name"].get<std::string>();
     tool_names.push_back(tool_name);
+    // See `SanitizeLarkRuleName` for why `-object` uses a hyphen separator.
     const ToolFormatConfig fc_config = {
         .pair_separator = ":",
-        .rule_suffix = "_object",
+        .rule_suffix = "-object",
         .start_wrap = "{",
         .end_wrap = "}",
         .generate_value_rule = GenerateFcValueRule,
@@ -144,14 +147,23 @@ absl::StatusOr<std::string> CreateLarkGrammarForFcToolCalls(
     AppendToolRules(tool, tool_name, fc_config, tool_blocks);
   }
 
-  std::string tool_union =
-      absl::StrFormat(R"(TOOL_UNION: /%s/)", absl::StrJoin(tool_names, "|"));
-
   std::vector<std::string> tool_call_cases;
-  tool_call_cases.reserve(tool_names.size());
-  for (const auto& tool_name : tool_names) {
-    tool_call_cases.push_back(
-        absl::StrFormat(R"("call:" "%s" %s_object)", tool_name, tool_name));
+  if (options.forced_function_name.has_value()) {
+    const std::string& forced_name = *options.forced_function_name;
+    if (!absl::c_linear_search(tool_names, forced_name)) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Forced function '%s' not found in provided tools.", forced_name));
+    }
+    tool_call_cases.push_back(absl::StrFormat(
+        R"("call:" "%s" %s-object)", forced_name,
+        SanitizeLarkRuleName(forced_name)));
+  } else {
+    tool_call_cases.reserve(tool_names.size());
+    for (const auto& tool_name : tool_names) {
+      tool_call_cases.push_back(absl::StrFormat(
+          R"("call:" "%s" %s-object)", tool_name,
+          SanitizeLarkRuleName(tool_name)));
+    }
   }
 
   std::string json_grammar = GetFcGrammar(options);
@@ -164,15 +176,29 @@ absl::StatusOr<std::string> CreateLarkGrammarForFcToolCalls(
       return text_only_block;
     }
     case LlgConstraintMode::kFunctionCallsOnly: {
-      if (tool_names.empty()) {
+      if (tool_call_cases.empty()) {
         return absl::InvalidArgumentError(
             "No tools provided for FunctionCallsOnly mode.");
       }
-      start_rule = absl::StrCat("start: ", function_block, "\n");
+      if (options.forced_function_name.has_value()) {
+        // The forced function must be called. FST doesn't support forcing a
+        // function, so there is no FST behavior to match here.
+        start_rule = absl::StrCat("start: ", function_block, "\n");
+      } else {
+        // Like FST's FUNCTION_CALL_ONLY mode, the model may also end its turn
+        // without a call, e.g. once it has the tool responses it needs.
+        start_rule = absl::StrFormat(
+            R"(
+start: function_block_opt
+function_block_opt: function_block |
+function_block: %s
+)",
+            function_block);
+      }
       break;
     }
     case LlgConstraintMode::kTextAndOrFunctionCalls: {
-      if (tool_names.empty()) {
+      if (tool_call_cases.empty()) {
         return text_only_block;
       }
       start_rule = absl::StrFormat(
@@ -185,10 +211,24 @@ function_block: %s
           function_block);
       break;
     }
+    case LlgConstraintMode::kFunctionCallsRequired: {
+      if (tool_call_cases.empty()) {
+        return absl::InvalidArgumentError(
+            "No tools provided for FunctionCallsRequired mode.");
+      }
+      start_rule = absl::StrFormat(
+          R"(
+start: TEXT_CONTENT? function_block
+TEXT_CONTENT: /(.|\n)+/
+function_block: %s
+)",
+          function_block);
+      break;
+    }
   }
 
-  return absl::StrCat(tool_union, "\n", absl::StrJoin(tool_blocks, "\n"), "\n",
-                      json_grammar, "\n", start_rule);
+  return absl::StrCat(absl::StrJoin(tool_blocks, "\n"), "\n", json_grammar,
+                      "\n", start_rule);
 }
 
 }  // namespace litert::lm

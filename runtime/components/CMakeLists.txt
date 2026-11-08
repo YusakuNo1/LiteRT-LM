@@ -20,20 +20,23 @@ add_subdirectory(preprocessor)
 add_subdirectory(tool_use)
 
 # ==============================================================================
-# Model Resources Interface
+# Model Resources
 # ==============================================================================
-add_litertlm_library(runtime_components_model_resources INTERFACE)
+add_litertlm_library(runtime_components_model_resources STATIC
+  model_resources.cc
+)
 add_library(LiteRTLM::Runtime::Components::ModelResourcesInterface
   ALIAS runtime_components_model_resources)
 
 target_include_directories(runtime_components_model_resources
-  INTERFACE
+  PUBLIC
     ${LITERTLM_GENERATED_SRC_DIR}
+    ${CMAKE_BINARY_DIR}
     ${LITERTLM_INCLUDE_PATHS}
 )
 
 target_link_libraries(runtime_components_model_resources
-  INTERFACE
+  PUBLIC
     LiteRTLM::Runtime::Components::TokenizerInterface
     LITERTLM_DEPS
 )
@@ -170,7 +173,9 @@ target_include_directories(runtime_components_model_resources_streaming
 target_link_libraries(runtime_components_model_resources_streaming
   PUBLIC
     LiteRTLM::Runtime::Components::ModelResourcesInterface
+    LiteRTLM::Runtime::Util::DataStream
     LiteRTLM::Runtime::Util::LitertLmLoader
+    LiteRTLM::Runtime::Util::ScopedFile
     LiteRTLM::Runtime::Components::TokenizerInterface
     LiteRTLM::Schema::Core
 
@@ -206,9 +211,15 @@ target_link_libraries(runtime_components_model_resources_task
 # ==============================================================================
 # Prompt Template
 # ==============================================================================
-add_litertlm_library(runtime_components_prompt_template STATIC
-  prompt_template.cc
-)
+if(LITERT_LM_ENABLE_MINIJINJA_TEMPLATE)
+  add_litertlm_library(runtime_components_prompt_template STATIC
+    prompt_template.cc
+  )
+else()
+  add_litertlm_library(runtime_components_prompt_template STATIC
+    prompt_template_noop.cc
+  )
+endif()
 add_library(LiteRTLM::Runtime::Components::PromptTemplate
   ALIAS runtime_components_prompt_template)
 
@@ -219,6 +230,23 @@ target_include_directories(runtime_components_prompt_template
 )
 
 target_link_libraries(runtime_components_prompt_template
+  PUBLIC
+    LITERTLM_DEPS
+)
+
+add_litertlm_library(runtime_components_prompt_template_noop STATIC
+  prompt_template_noop.cc
+)
+add_library(LiteRTLM::Runtime::Components::PromptTemplateNoop
+  ALIAS runtime_components_prompt_template_noop)
+
+target_include_directories(runtime_components_prompt_template_noop
+  PRIVATE
+    ${LITERTLM_INCLUDE_PATHS}
+    ${THIRD_PARTY_DIR}/json/include
+)
+
+target_link_libraries(runtime_components_prompt_template_noop
   PUBLIC
     LITERTLM_DEPS
 )

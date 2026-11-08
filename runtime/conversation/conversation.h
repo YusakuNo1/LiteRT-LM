@@ -102,7 +102,8 @@ class ConversationConfig {
     return return_error_on_parse_failure_;
   }
 
-  // Returns whether to return an error status when max num tokens reached.
+  // Returns whether a reply that is cut off at the max number of tokens fails
+  // with an error. See `Builder::SetReturnErrorOnMaxTokensReached()`.
   bool return_error_on_max_tokens_reached() const {
     return return_error_on_max_tokens_reached_;
   }
@@ -219,7 +220,19 @@ class ConversationConfig {
       return *this;
     }
 
-    // Sets whether to return an error status when max num tokens reached.
+    // Sets what happens when the model's reply is cut off because the
+    // conversation reaches the max number of tokens (the size of the context
+    // window):
+    // - false (default): the reply generated so far is returned as a
+    //   successful response.
+    // - true: the message fails with a RESOURCE_EXHAUSTED error and is removed
+    //   from the history.
+    //
+    // This setting only applies to the reply. If the input of a message does
+    // not fit in the space left in the context window (e.g. because an earlier
+    // reply filled it), the message always fails with RESOURCE_EXHAUSTED and
+    // is removed from the history, regardless of this setting, because no
+    // reply was generated that could be returned.
     Builder& SetReturnErrorOnMaxTokensReached(
         bool return_error_on_max_tokens_reached) {
       return_error_on_max_tokens_reached_ = return_error_on_max_tokens_reached;
@@ -520,9 +533,7 @@ class Conversation {
 
   // Sends a message to the LLM and returns the complete message.
   // Args:
-  // - `message`: The message to be sent to the LLM. If `message` is an array,
-  //    each element will be treated as a separate message and be prefilled
-  //    before generating the response.
+  // - `message`: The message (a JSON object) to be sent to the LLM.
   // - `optional_args`: The optional arguments for sending the message. See the
   //    definition of `OptionalArgs` for more details.
   // Returns :
@@ -533,9 +544,7 @@ class Conversation {
   // Sends a message to the LLM and process the asynchronous message results via
   // the user_callback.
   // Args:
-  // - `message`: The message to be sent to the LLM. If `message` is an array,
-  //    each element will be treated as a separate message and be prefilled
-  //    before generating the response.
+  // - `message`: The message (a JSON object) to be sent to the LLM.
   // - `user_callback`: The callback to receive the message events. The
   //    user_callback will be invoked in the following conditions:
   //    - On every new message chunk.
@@ -554,6 +563,14 @@ class Conversation {
       const Message& message,
       absl::AnyInvocable<void(absl::StatusOr<Message>)> user_callback,
       OptionalArgs optional_args = OptionalArgs());
+
+  // Triggers execution of, and waits for, all pending tasks in the session.
+  //
+  // This is required when the engine runs with single-threaded execution
+  // enabled: work queued by the asynchronous APIs above only makes progress
+  // while a caller drives it. With multi-threaded execution this simply blocks
+  // until the pending work completes.
+  absl::Status WaitUntilDone() { return session_->WaitUntilDone(); }
 
   // Scores the target text after the prefill process is done. This function
   // will run the decode process (with the existing context history) by feeding
@@ -617,6 +634,17 @@ class Conversation {
   // Returns the number of tokens in the conversation KV Cache (prefill +
   // decode).
   absl::StatusOr<int> GetTokenCount() const;
+
+  // Returns the number of tokens the given message would consume if added
+  // to the conversation, including template tokens and media (vision/audio)
+  // soft tokens. This does not mutate the conversation or the KV cache.
+  //
+  // Args:
+  // - `message`: The message (a JSON object) to count tokens for.
+  // - `optional_args`: Optional arguments for template rendering.
+  absl::StatusOr<int> CountTokens(
+      const Message& message,
+      const OptionalArgs& optional_args = OptionalArgs()) const;
 
   // Returns the benchmark info for the conversation. Under the hood, this
   // method triggers the benchmark info collection from the Session. Returns:
@@ -742,11 +770,17 @@ class Conversation {
   // - `optional_args`: The optional arguments for template rendering.
   // - `include_preface`: Include the preface in the returned text when
   //   `old_messages` is empty.
+  // - `add_generation_prompt_to_old`: Whether to set `add_generation_prompt`
+  //   when rendering `old_messages` into `old_string` (which is subtracted from
+  //   `new_string`). Set to true when rewinding to a checkpoint taken after
+  //   prefilling the user turn, because the KV cache at that checkpoint already
+  //   contains the generation prompt (e.g. `<|turn>model\n`) and subtracting it
+  //   from `new_string` avoids duplicating the assistant turn header.
   absl::StatusOr<std::string> GetPrefillTextForMessages(
       absl::Span<const Message> old_messages,
       absl::Span<const Message> new_messages,
       const OptionalArgs& optional_args = OptionalArgs(),
-      bool include_preface = true);
+      bool include_preface = true, bool add_generation_prompt_to_old = false);
 
   // Returns the input data vector for the given messages.
   //
@@ -759,16 +793,20 @@ class Conversation {
   // - `optional_args`: The optional arguments for template rendering.
   // - `include_preface`: Include the preface in the returned input data vector
   //   when `old_messages` is empty.
+  // - `add_generation_prompt_to_old`: Whether to set `add_generation_prompt`
+  //   when rendering `old_messages` into the prefix subtracted from
+  //   `new_string`.
   absl::StatusOr<std::vector<InputData>> GetInputDataVectorForMessages(
       absl::Span<const Message> old_messages,
       absl::Span<const Message> new_messages,
       const OptionalArgs& optional_args = OptionalArgs(),
-      bool include_preface = true);
+      bool include_preface = true, bool add_generation_prompt_to_old = false);
 
   // Rewinds the session to the checkpoint after the most recent channel content
   // and return the input data vector for all messages from that point onward.
   absl::StatusOr<std::vector<InputData>> RewindAndGetInputDataVector(
-      const OptionalArgs& optional_args = OptionalArgs());
+      const OptionalArgs& optional_args = OptionalArgs())
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(history_mutex_);
 
   // Applies the prompt template to the given input. This function will strip
   // heavy blobs from the input before applying the template.
@@ -806,10 +844,12 @@ class Conversation {
 
   // The index of the message you have to rewind to in order to remove channel
   // content from the KV cache. nullopt means no rewind is needed.
-  std::optional<int> checkpoint_message_index_ = std::nullopt;
+  std::optional<int> checkpoint_message_index_ ABSL_GUARDED_BY(history_mutex_) =
+      std::nullopt;
 
-  // Whether there is channel content present since the last user message.
-  bool channel_content_since_last_user_message_ = false;
+  // Whether the saved channel content checkpoint was taken after prefilling the
+  // user turn (including the generation prompt).
+  bool checkpoint_after_user_prefill_ ABSL_GUARDED_BY(history_mutex_) = false;
 };
 }  // namespace litert::lm
 

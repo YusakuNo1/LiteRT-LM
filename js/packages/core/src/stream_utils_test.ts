@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-import {modelToStream, setupStreamWeightsCallback} from './stream_utils.js';
-import {LiteRtLmWasm} from './wasm_binding_types.js';
+import {Cleanup} from './cleanup.js';
+import {createStreamingModelAssets, modelToStream} from './stream_utils.js';
+import {LiteRtLmWasm, ModelAssets, ReadableStreamDataStream} from './wasm_binding_types.js';
 
 describe('stream_utils', () => {
   it('converts a Blob to a ReadableStream', async () => {
@@ -38,51 +39,39 @@ describe('stream_utils', () => {
     expect(stream).toBe(existingStream);
   });
 
-  it('throws an error if WebGPU device is not initialized', () => {
-    const fakeWasm = {
-      preinitializedWebGPUDevice: undefined,
+  it('creates streaming ModelAssets and manages cleanup', async () => {
+    const blob = new Blob([new Uint8Array([1, 2, 3])]);
+    const cleanup = new Cleanup();
+    const mockDataStream =
+        jasmine.createSpyObj<ReadableStreamDataStream>('DataStream', ['delete']);
+    const mockModelAssets =
+        jasmine.createSpyObj<ModelAssets>('ModelAssets', ['delete']);
+    const mockWasm = {
+      HEAPU8: new Uint8Array(64),
+      ReadableStreamDataStream: {
+        create: jasmine.createSpy('create').and.returnValue(mockDataStream),
+      },
+      ModelAssets: {
+        createStreaming: jasmine.createSpy('createStreaming')
+                             .and.returnValue(mockModelAssets),
+      },
     } as unknown as LiteRtLmWasm;
 
-    expect(() => setupStreamWeightsCallback(fakeWasm))
-        .toThrowError('WebGPU device not initialized');
-  });
+    const {modelAssets, cleanupModelAssets} =
+        await createStreamingModelAssets(blob, mockWasm, cleanup);
+    expect(modelAssets).toBe(mockModelAssets);
+    expect(mockWasm.ModelAssets.createStreaming)
+        .toHaveBeenCalledWith(mockDataStream);
 
-  it('throws an error if wasm._malloc returns 0', async () => {
-    let callback: Function | undefined;
-    const fakeFree = jasmine.createSpy('freeSpy');
-    const fakeDevice = {
-      queue: {
-        writeBuffer: () => {},
-      },
-    };
-    const fakeWasm = {
-      preinitializedWebGPUDevice: fakeDevice,
-      registerStreamWeightsCallback: (cb: Function) => {
-        callback = cb;
-      },
-      _malloc: () => 0,
-      _free: fakeFree,
-    } as unknown as LiteRtLmWasm;
+    // Calling cleanupModelAssets deletes only the ModelAssets wrapper, leaving
+    // the underlying DataStream alive until cleanup.run() is called.
+    cleanupModelAssets();
+    expect(mockModelAssets.delete).toHaveBeenCalledTimes(1);
+    expect(mockDataStream.delete).not.toHaveBeenCalled();
 
-    setupStreamWeightsCallback(fakeWasm);
-    expect(callback).toBeDefined();
-
-    const invokeCallback = callback as (
-        tflIds: Int32Array,
-        wgpuBufferIds: Uint32Array,
-        offsets: Float64Array,
-        lengths: Float64Array,
-    ) => Promise<void>;
-
-    await expectAsync(
-        invokeCallback(
-            new Int32Array([1]),
-            new Uint32Array([1]),
-            new Float64Array([0]),
-            new Float64Array([100]),
-        ),
-    ).toBeRejectedWithError(
-        'Failed to allocate Wasm memory for streaming weights');
-    expect(fakeFree).not.toHaveBeenCalled();
+    cleanup.run();
+    expect(mockModelAssets.delete).toHaveBeenCalledTimes(1);
+    expect(mockDataStream.delete).toHaveBeenCalledTimes(1);
   });
 });
+

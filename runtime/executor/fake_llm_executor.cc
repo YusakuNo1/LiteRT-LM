@@ -29,6 +29,7 @@
 #include "absl/time/clock.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "runtime/components/constrained_decoding/constrained_decoder.h"
@@ -186,6 +187,8 @@ absl::StatusOr<std::vector<std::vector<int>>> FakeLlmExecutor::Decode() {
 
 absl::StatusOr<std::vector<std::vector<int>>> FakeLlmExecutor::Decode(
     const ExecutorDecodeParams& decode_params) {
+  last_decode_speculative_decoding_config_ =
+      decode_params.GetSpeculativeDecodingConfig();
   TryDecodeDelay();
   ABSL_RETURN_IF_ERROR(decode_status_);
   if (last_op_ == LastOp::kNone) {
@@ -333,6 +336,16 @@ DiffusionLlmFakeLlmExecutor::Decode(const ExecutorDecodeParams& decode_params) {
   // If not cancelled, proceed to call the base class implementation to generate
   // tokens.
   return FakeLlmExecutor::Decode(decode_params);
+}
+
+::litert::Environment* FakeLlmExecutor::GetEnvironment() const {
+  if (!env_) {
+    auto env_or = ::litert::Environment::Create({});
+    if (env_or.HasValue()) {
+      env_ = std::move(*env_or);
+    }
+  }
+  return env_ ? &*env_ : nullptr;
 }
 
 }  // namespace litert::lm

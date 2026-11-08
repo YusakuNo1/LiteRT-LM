@@ -60,6 +60,7 @@
 #include "runtime/executor/vision/vision_executor.h"
 #include "runtime/proto/embedding_metadata.pb.h"
 #include "runtime/proto/embedding_model_type.pb.h"
+#include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/token.pb.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/file_data_stream.h"
@@ -119,10 +120,22 @@ class FakeModelResources : public ModelResources {
         vision_adapter_model_(vision_adapter_model) {}
   ~FakeModelResources() override = default;
 
+  using ModelResources::GetTFLiteModel;
+  using ModelResources::GetTFLiteModelBackendConstraint;
+  using ModelResources::GetTFLiteModelBuffer;
+  using ModelResources::GetTFLiteModelPreferActivationType;
+  using ModelResources::GetTFLiteModelSectionFileRegion;
+  using ModelResources::GetWeightsSectionOffset;
+
   absl::StatusOr<const litert::Model*> GetTFLiteModel(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    return GetTFLiteModel(TfLiteModelTypeToWireString(model_type));
+  }
+
+  absl::StatusOr<const litert::Model*> GetTFLiteModel(
+      absl::string_view model_type) override {
     ++get_tflite_model_call_counts_[model_type];
-    if (model_type == ModelType::kTfLiteVisionEncoder) {
+    if (model_type == "tf_lite_vision_encoder") {
       if (vision_model_ != nullptr) {
         return vision_model_;
       }
@@ -130,13 +143,13 @@ class FakeModelResources : public ModelResources {
         return nullptr;
       }
     }
-    if (model_type == ModelType::kTfLiteVisionAdapter) {
+    if (model_type == "tf_lite_vision_adapter") {
       if (vision_adapter_model_ != nullptr) {
         return vision_adapter_model_;
       }
     }
-    if ((model_type == ModelType::kTfLiteAudioEncoderHw ||
-         model_type == ModelType::kTfLiteAudioFrontend) &&
+    if ((model_type == "tf_lite_audio_encoder_hw" ||
+         model_type == "tf_lite_audio_frontend") &&
         has_audio_) {
       return nullptr;
     }
@@ -144,13 +157,20 @@ class FakeModelResources : public ModelResources {
   }
 
   // Returns how many times GetTFLiteModel() was called for `model_type`.
-  int GetTFLiteModelCallCount(ModelType model_type) const {
-    const auto it = get_tflite_model_call_counts_.find(model_type);
+  int GetTFLiteModelCallCount(
+      proto::LlmMetadata::TfLiteModelType model_type) const {
+    const auto it = get_tflite_model_call_counts_.find(
+        TfLiteModelTypeToWireString(model_type));
     return it == get_tflite_model_call_counts_.end() ? 0 : it->second;
   }
 
   absl::StatusOr<absl::string_view> GetTFLiteModelBuffer(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    return delegate_->GetTFLiteModelBuffer(model_type);
+  }
+
+  absl::StatusOr<absl::string_view> GetTFLiteModelBuffer(
+      absl::string_view model_type) override {
     return delegate_->GetTFLiteModelBuffer(model_type);
   }
 
@@ -159,17 +179,32 @@ class FakeModelResources : public ModelResources {
   }
 
   absl::StatusOr<std::pair<size_t, size_t>> GetWeightsSectionOffset(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    return delegate_->GetWeightsSectionOffset(model_type);
+  }
+
+  absl::StatusOr<std::pair<size_t, size_t>> GetWeightsSectionOffset(
+      absl::string_view model_type) override {
     return delegate_->GetWeightsSectionOffset(model_type);
   }
 
   std::optional<std::string> GetTFLiteModelBackendConstraint(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    return delegate_->GetTFLiteModelBackendConstraint(model_type);
+  }
+
+  std::optional<std::string> GetTFLiteModelBackendConstraint(
+      absl::string_view model_type) override {
     return delegate_->GetTFLiteModelBackendConstraint(model_type);
   }
 
   std::optional<std::string> GetTFLiteModelPreferActivationType(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    return delegate_->GetTFLiteModelPreferActivationType(model_type);
+  }
+
+  std::optional<std::string> GetTFLiteModelPreferActivationType(
+      absl::string_view model_type) override {
     return delegate_->GetTFLiteModelPreferActivationType(model_type);
   }
 
@@ -195,7 +230,12 @@ class FakeModelResources : public ModelResources {
   }
 
   absl::StatusOr<FileRegion> GetTFLiteModelSectionFileRegion(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    return delegate_->GetTFLiteModelSectionFileRegion(model_type);
+  }
+
+  absl::StatusOr<FileRegion> GetTFLiteModelSectionFileRegion(
+      absl::string_view model_type) override {
     return delegate_->GetTFLiteModelSectionFileRegion(model_type);
   }
 
@@ -204,7 +244,7 @@ class FakeModelResources : public ModelResources {
   bool has_vision_;
   bool has_audio_;
   std::optional<const proto::EmbeddingMetadata*> metadata_;
-  absl::flat_hash_map<ModelType, int> get_tflite_model_call_counts_;
+  absl::flat_hash_map<std::string, int> get_tflite_model_call_counts_;
   const litert::Model* vision_model_ = nullptr;
   const litert::Model* vision_adapter_model_ = nullptr;
 };
@@ -391,29 +431,8 @@ TEST(EmbeddingEngineImplTest,
   }
 }
 
-TEST(EmbeddingEngineImplTest,
-     CreateStreamingWeightsWithMinInputLengthAutoSelectsSignatures) {
-  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
-                                   std::string(kTestEmbeddingModelPath))
-                                      .string();
-  ASSERT_OK_AND_ASSIGN(auto file_stream, FileDataStream::Create(model_path));
-  ASSERT_OK_AND_ASSIGN(auto model_assets,
-                       ModelAssets::Create(std::move(file_stream)));
-  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
-                                          model_assets, Backend::CPU));
-  settings.SetMinInputLength(128);
-
-  ASSERT_OK_AND_ASSIGN(auto engine, EmbeddingEngineImpl::CreateStreamingWeights(
-                                        std::move(settings)));
-  ASSERT_NE(engine, nullptr);
-  const auto& text_sig_info = engine->GetSelectedTextSignaturesInfo();
-  ASSERT_TRUE(text_sig_info.has_value());
-  EXPECT_FALSE(text_sig_info->signature_names.empty());
-  for (int length : text_sig_info->signature_lengths) {
-    EXPECT_GE(length, 128);
-  }
-}
-
+// Regression test: min_input_length must reach text encoder signature
+// auto-selection on the streaming path, which used to drop it entirely.
 TEST(EmbeddingEngineImplTest,
      CreateStreamingWeightsWithMetadataMinInputLengthAutoSelectsSignatures) {
   const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
@@ -438,6 +457,78 @@ TEST(EmbeddingEngineImplTest,
   for (int length : text_sig_info->signature_lengths) {
     EXPECT_GE(length, 128);
   }
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateStreamingWeightsWithSettingsMinInputLengthAutoSelectsSignatures) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto file_stream, FileDataStream::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(std::move(file_stream)));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+  settings.SetMinInputLength(128);
+
+  ASSERT_OK_AND_ASSIGN(auto engine, EmbeddingEngineImpl::CreateStreamingWeights(
+                                        std::move(settings)));
+  ASSERT_NE(engine, nullptr);
+  const auto& text_sig_info = engine->GetSelectedTextSignaturesInfo();
+  ASSERT_TRUE(text_sig_info.has_value());
+  EXPECT_FALSE(text_sig_info->signature_names.empty());
+  for (int length : text_sig_info->signature_lengths) {
+    EXPECT_GE(length, 128);
+  }
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateStreamingWeightsWithInvalidMinInputLengthReturnsError) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto file_stream, FileDataStream::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(std::move(file_stream)));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+  settings.SetMinInputLength(-1);
+
+  EXPECT_THAT(EmbeddingEngineImpl::CreateStreamingWeights(std::move(settings)),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateStreamingWeightsWithMinGreaterThanMaxReturnsError) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto file_stream, FileDataStream::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(std::move(file_stream)));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+  settings.SetMinInputLength(512);
+  settings.SetMaxInputLength(128);
+
+  EXPECT_THAT(EmbeddingEngineImpl::CreateStreamingWeights(std::move(settings)),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateStreamingWeightsWithInvalidMaxInputLengthReturnsError) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto file_stream, FileDataStream::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(std::move(file_stream)));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+  settings.SetMaxInputLength(-1);
+
+  EXPECT_THAT(EmbeddingEngineImpl::CreateStreamingWeights(std::move(settings)),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST(EmbeddingEngineImplTest,
@@ -1142,12 +1233,12 @@ TEST(EmbeddingEngineImplTest, MultimodalEncodersAreReadDuringCreateByDefault) {
       EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
                                   std::move(tokenizer), std::move(settings)));
 
-  EXPECT_GT(
-      resources_ptr->GetTFLiteModelCallCount(ModelType::kTfLiteVisionEncoder),
-      0);
-  EXPECT_GT(
-      resources_ptr->GetTFLiteModelCallCount(ModelType::kTfLiteAudioEncoderHw),
-      0);
+  EXPECT_GT(resources_ptr->GetTFLiteModelCallCount(
+                proto::LlmMetadata::TF_LITE_VISION_ENCODER),
+            0);
+  EXPECT_GT(resources_ptr->GetTFLiteModelCallCount(
+                proto::LlmMetadata::TF_LITE_AUDIO_ENCODER_HW),
+            0);
 }
 
 TEST(EmbeddingEngineImplTest,
@@ -1176,12 +1267,12 @@ TEST(EmbeddingEngineImplTest,
                                   std::move(tokenizer), std::move(settings)));
 
   // Neither encoder is read while the engine is created.
-  EXPECT_EQ(
-      resources_ptr->GetTFLiteModelCallCount(ModelType::kTfLiteVisionEncoder),
-      0);
-  EXPECT_EQ(
-      resources_ptr->GetTFLiteModelCallCount(ModelType::kTfLiteAudioEncoderHw),
-      0);
+  EXPECT_EQ(resources_ptr->GetTFLiteModelCallCount(
+                proto::LlmMetadata::TF_LITE_VISION_ENCODER),
+            0);
+  EXPECT_EQ(resources_ptr->GetTFLiteModelCallCount(
+                proto::LlmMetadata::TF_LITE_AUDIO_ENCODER_HW),
+            0);
 
   EmbeddingOptions options;
   options.normalize = false;
@@ -1194,12 +1285,12 @@ TEST(EmbeddingEngineImplTest,
   EXPECT_THAT(engine->ComputeEmbedding(image_contents, options),
               StatusIs(absl::StatusCode::kInternal,
                        HasSubstr("Vision executor is not available")));
-  EXPECT_GT(
-      resources_ptr->GetTFLiteModelCallCount(ModelType::kTfLiteVisionEncoder),
-      0);
-  EXPECT_EQ(
-      resources_ptr->GetTFLiteModelCallCount(ModelType::kTfLiteAudioEncoderHw),
-      0);
+  EXPECT_GT(resources_ptr->GetTFLiteModelCallCount(
+                proto::LlmMetadata::TF_LITE_VISION_ENCODER),
+            0);
+  EXPECT_EQ(resources_ptr->GetTFLiteModelCallCount(
+                proto::LlmMetadata::TF_LITE_AUDIO_ENCODER_HW),
+            0);
 
   // Likewise, the first audio input triggers the load of the audio encoder.
   std::vector<InputData> audio_contents;
@@ -1207,9 +1298,9 @@ TEST(EmbeddingEngineImplTest,
   EXPECT_THAT(engine->ComputeEmbedding(audio_contents, options),
               StatusIs(absl::StatusCode::kInternal,
                        HasSubstr("Audio executor is not available")));
-  EXPECT_GT(
-      resources_ptr->GetTFLiteModelCallCount(ModelType::kTfLiteAudioEncoderHw),
-      0);
+  EXPECT_GT(resources_ptr->GetTFLiteModelCallCount(
+                proto::LlmMetadata::TF_LITE_AUDIO_ENCODER_HW),
+            0);
 }
 
 TEST(EmbeddingEngineImplTest,
@@ -1250,9 +1341,9 @@ TEST(EmbeddingEngineImplTest,
 
   // Right after Create(), the vision encoder is not compiled and signature info
   // is std::nullopt.
-  EXPECT_EQ(
-      resources_ptr->GetTFLiteModelCallCount(ModelType::kTfLiteVisionEncoder),
-      0);
+  EXPECT_EQ(resources_ptr->GetTFLiteModelCallCount(
+                proto::LlmMetadata::TF_LITE_VISION_ENCODER),
+            0);
   EXPECT_FALSE(engine->GetSelectedVisionSignatureInfo().has_value());
 
   EmbeddingOptions options;
@@ -1266,16 +1357,16 @@ TEST(EmbeddingEngineImplTest,
 
   EXPECT_TRUE(engine->GetSelectedVisionSignatureInfo().has_value());
   EXPECT_EQ(engine->GetSelectedVisionSignatureInfo()->max_num_patches, 70);
-  const int call_count_after_first =
-      resources_ptr->GetTFLiteModelCallCount(ModelType::kTfLiteVisionEncoder);
+  const int call_count_after_first = resources_ptr->GetTFLiteModelCallCount(
+      proto::LlmMetadata::TF_LITE_VISION_ENCODER);
   EXPECT_GT(call_count_after_first, 0);
 
   // Subsequent image inputs reuse the compiled vision executor without
   // reloading.
   (void)engine->ComputeEmbedding(image_contents, options);
-  EXPECT_EQ(
-      resources_ptr->GetTFLiteModelCallCount(ModelType::kTfLiteVisionEncoder),
-      call_count_after_first);
+  EXPECT_EQ(resources_ptr->GetTFLiteModelCallCount(
+                proto::LlmMetadata::TF_LITE_VISION_ENCODER),
+            call_count_after_first);
 }
 
 class FakeEmbeddingExecutor : public EmbeddingExecutorBase {
@@ -2141,6 +2232,302 @@ TEST(EmbeddingEngineImplTest,
             InputOverflowStrategy::kTruncate);
 }
 
+TEST(EmbeddingEngineImplTest,
+     CreateWithEmbeddingMetadataExtractsSpecialTokens) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+  EXPECT_CALL(*tokenizer, TextToTokenIds("<eos>"))
+      .WillRepeatedly(Return(std::vector<int>{1}));
+  EXPECT_CALL(*tokenizer, TextToTokenIds("<image|>"))
+      .WillRepeatedly(Return(std::vector<int>{102}));
+  EXPECT_CALL(*tokenizer, TextToTokenIds("<|audio>"))
+      .WillRepeatedly(Return(std::vector<int>{201}));
+
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+
+  proto::EmbeddingMetadata metadata;
+  metadata.mutable_bos_token()->mutable_token_ids()->add_ids(2);
+  metadata.mutable_eos_token()->set_token_str("<eos>");
+  auto* gemma_v2 =
+      metadata.mutable_embedding_model_type()->mutable_embedding_gemma_v2();
+  gemma_v2->mutable_start_of_image_token()->mutable_token_ids()->add_ids(101);
+  gemma_v2->mutable_end_of_image_token()->set_token_str("<image|>");
+  gemma_v2->mutable_start_of_audio_token()->set_token_str("<|audio>");
+  gemma_v2->mutable_end_of_audio_token()->mutable_token_ids()->add_ids(202);
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+
+  auto* engine_impl = dynamic_cast<EmbeddingEngineImpl*>(engine.get());
+  ASSERT_NE(engine_impl, nullptr);
+  EXPECT_THAT(engine_impl->GetSpecialTokens().bos_token_ids, ElementsAre(2));
+  EXPECT_THAT(engine_impl->GetSpecialTokens().eos_token_ids, ElementsAre(1));
+  EXPECT_THAT(engine_impl->GetSpecialTokens().start_of_image_token_ids,
+              ElementsAre(101));
+  EXPECT_THAT(engine_impl->GetSpecialTokens().end_of_image_token_ids,
+              ElementsAre(102));
+  EXPECT_THAT(engine_impl->GetSpecialTokens().start_of_audio_token_ids,
+              ElementsAre(201));
+  EXPECT_THAT(engine_impl->GetSpecialTokens().end_of_audio_token_ids,
+              ElementsAre(202));
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateWithNullTokenizerDoesNotExtractSpecialTokens) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+
+  proto::EmbeddingMetadata metadata;
+  metadata.mutable_bos_token()->mutable_token_ids()->add_ids(2);
+  metadata.mutable_eos_token()->set_token_str("<eos>");
+  auto* gemma_v2 =
+      metadata.mutable_embedding_model_type()->mutable_embedding_gemma_v2();
+  gemma_v2->mutable_start_of_image_token()->mutable_token_ids()->add_ids(101);
+  gemma_v2->mutable_end_of_image_token()->set_token_str("<image|>");
+  gemma_v2->mutable_start_of_audio_token()->set_token_str("<|audio>");
+  gemma_v2->mutable_end_of_audio_token()->mutable_token_ids()->add_ids(202);
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(auto engine, EmbeddingEngineImpl::Create(
+                                        std::move(resources), std::move(env),
+                                        std::move(settings)));
+
+  auto* engine_impl = dynamic_cast<EmbeddingEngineImpl*>(engine.get());
+  ASSERT_NE(engine_impl, nullptr);
+  EXPECT_TRUE(engine_impl->GetSpecialTokens().bos_token_ids.empty());
+  EXPECT_TRUE(engine_impl->GetSpecialTokens().eos_token_ids.empty());
+  EXPECT_TRUE(engine_impl->GetSpecialTokens().start_of_image_token_ids.empty());
+  EXPECT_TRUE(engine_impl->GetSpecialTokens().end_of_image_token_ids.empty());
+  EXPECT_TRUE(engine_impl->GetSpecialTokens().start_of_audio_token_ids.empty());
+  EXPECT_TRUE(engine_impl->GetSpecialTokens().end_of_audio_token_ids.empty());
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateWithEmbeddingMetadataExtractsImagePreprocessParameter) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+
+  proto::EmbeddingMetadata metadata;
+  auto* gemma_v2 =
+      metadata.mutable_embedding_model_type()->mutable_embedding_gemma_v2();
+  gemma_v2->set_patch_width(16);
+  gemma_v2->set_patch_height(16);
+  gemma_v2->set_max_num_patches(2520);
+  gemma_v2->set_pooling_kernel_size(3);
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+
+  auto* engine_impl = dynamic_cast<EmbeddingEngineImpl*>(engine.get());
+  ASSERT_NE(engine_impl, nullptr);
+  EXPECT_NE(engine_impl->GetImagePreprocessor(), nullptr);
+  ASSERT_TRUE(engine_impl->GetImagePreprocessParameter().has_value());
+  const auto& param = *engine_impl->GetImagePreprocessParameter();
+  ASSERT_TRUE(param.GetPatchifyConfig().has_value());
+  EXPECT_EQ(param.GetPatchifyConfig()->patch_width, 16);
+  EXPECT_EQ(param.GetPatchifyConfig()->patch_height, 16);
+  EXPECT_EQ(param.GetPatchifyConfig()->max_num_patches, 2520);
+  EXPECT_EQ(param.GetPatchifyConfig()->pooling_kernel_size, 3);
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateWithEmbeddingMetadataExtractsAudioPreprocessor) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+
+  proto::EmbeddingMetadata metadata;
+  auto* miniaudio = metadata.mutable_audio_preprocessor()->mutable_miniaudio();
+  miniaudio->set_sample_rate_hz(16000);
+  miniaudio->set_num_channels(1);
+  miniaudio->set_frame_length(320);
+  miniaudio->set_hop_length(160);
+  miniaudio->set_fft_length(512);
+  miniaudio->set_input_scale(1.0);
+  miniaudio->set_pre_emphasis_factor(0.0);
+  miniaudio->set_num_mel_bins(128);
+  miniaudio->set_mel_low_hz(0.0);
+  miniaudio->set_mel_high_hz(8000.0);
+  miniaudio->set_mel_floor(1e-3);
+  miniaudio->set_normalize_mel(false);
+  miniaudio->set_add_floor_to_mel_before_log(true);
+  miniaudio->set_semicausal_padding(true);
+  miniaudio->set_non_zero_hanning(false);
+  miniaudio->set_periodic_hanning(true);
+  miniaudio->set_fft_padding_type(
+      proto::MiniAudioPreprocessorConfig::FFT_PADDING_TYPE_CENTER);
+  miniaudio->set_skip_mel_spectrogram_extraction(false);
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+
+  auto* engine_impl = dynamic_cast<EmbeddingEngineImpl*>(engine.get());
+  ASSERT_NE(engine_impl, nullptr);
+  EXPECT_NE(engine_impl->GetAudioPreprocessor(), nullptr);
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateWithEmbeddingGemmaV2WithoutAudioConfigUsesDefaultGemma4Config) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+
+  proto::EmbeddingMetadata metadata;
+  // Set model type to embedding_gemma_v2 without audio_preprocessor config.
+  metadata.mutable_embedding_model_type()->mutable_embedding_gemma_v2();
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+
+  auto* engine_impl = dynamic_cast<EmbeddingEngineImpl*>(engine.get());
+  ASSERT_NE(engine_impl, nullptr);
+  EXPECT_NE(engine_impl->GetAudioPreprocessor(), nullptr);
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateWithoutAudioParametersDoesNotInitializeAudioPreprocessor) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+
+  proto::EmbeddingMetadata metadata;
+  // Metadata has generic_model and no audio_preprocessor.
+  metadata.mutable_embedding_model_type()->mutable_generic_model();
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+
+  auto* engine_impl = dynamic_cast<EmbeddingEngineImpl*>(engine.get());
+  ASSERT_NE(engine_impl, nullptr);
+  EXPECT_EQ(engine_impl->GetAudioPreprocessor(), nullptr);
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateWithoutVisionParametersDoesNotInitializeImagePreprocessor) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+
+  proto::EmbeddingMetadata metadata;
+  // Metadata has no vision parameters.
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+
+  auto* engine_impl = dynamic_cast<EmbeddingEngineImpl*>(engine.get());
+  ASSERT_NE(engine_impl, nullptr);
+  EXPECT_EQ(engine_impl->GetImagePreprocessor(), nullptr);
+  EXPECT_EQ(engine_impl->GetImagePreprocessParameter(), std::nullopt);
+}
+
+TEST(EmbeddingEngineImplTest,
+     Profiling_BenchmarkInfo_AutoRecordsExecutorStats) {
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+  EXPECT_CALL(*tokenizer, TextToTokenIds("hello"))
+      .WillRepeatedly(Return(std::vector<int>{1, 2}));
+  ASSERT_OK_AND_ASSIGN(auto image_tensor,
+                       CreateDummyTensorBuffer(env->env, {1, 224, 224, 3}));
+  ASSERT_OK_AND_ASSIGN(auto audio_tensor,
+                       CreateDummyTensorBuffer(env->env, {1, 1, 100, 80}));
+
+  EmbeddingEngineImpl engine(
+      std::move(env), std::move(tokenizer),
+      std::make_unique<FakeEmbeddingExecutor>(),
+      std::make_unique<FakeVisionExecutor>(),
+      std::make_unique<FakeAudioExecutor>(),
+      /*benchmark_info=*/BenchmarkInfo((proto::BenchmarkParams())),
+      /*special_tokens=*/{});
+
+  std::vector<InputData> contents;
+  contents.push_back(InputText(std::string("hello")));
+  contents.push_back(InputImage(std::move(image_tensor)));
+  contents.push_back(InputAudio(std::move(audio_tensor)));
+
+  EmbeddingOptions options;
+  options.insert_special_tokens = false;
+  ASSERT_OK(engine.ComputeEmbedding(contents, options).status());
+
+  auto benchmark_info = engine.GetBenchmarkInfo();
+  ASSERT_TRUE(benchmark_info.has_value());
+  ASSERT_TRUE(benchmark_info->GetExecutorStats().has_value());
+  const auto& stats = *benchmark_info->GetExecutorStats();
+  EXPECT_EQ(stats.module_name, "Embedding");
+  EXPECT_EQ(stats.GetTotalLatency(), absl::Milliseconds(10));
+  ASSERT_EQ(stats.substats.size(), 2);
+  EXPECT_EQ(stats.substats[0].module_name, "Vision");
+  EXPECT_EQ(stats.substats[0].GetTotalLatency(), absl::Milliseconds(5));
+  EXPECT_EQ(stats.substats[1].module_name, "Audio");
+  EXPECT_EQ(stats.substats[1].GetTotalLatency(), absl::Milliseconds(3));
+}
+
 TEST(EmbeddingEngineImplTest, CreateWithMaxInputLengthAutoSelectsSignatures) {
   const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
                                    std::string(kTestEmbeddingModelPath))
@@ -2581,6 +2968,185 @@ TEST(EmbeddingEngineImplTest,
   EXPECT_EQ(recorded_info->GetTotalPrefillTurns(), 1);
   ASSERT_OK_AND_ASSIGN(auto turn, recorded_info->GetPrefillTurn(0));
   EXPECT_EQ(turn.num_tokens, 9);
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateWithMetadataMaxNumPatchesWithVisionBackendSucceedsIfNoVisionModel) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU,
+                                          Backend::CPU, std::nullopt));
+  // Vision metadata on a model without a vision encoder must not prevent the
+  // engine from being created for text-only use.
+  proto::EmbeddingMetadata metadata;
+  auto* gemma_v2 =
+      metadata.mutable_embedding_model_type()->mutable_embedding_gemma_v2();
+  gemma_v2->set_max_num_patches(630);
+  gemma_v2->set_pooling_kernel_size(3);
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+  EXPECT_NE(engine, nullptr);
+  EXPECT_EQ(engine->GetSelectedVisionSignatureInfo(), std::nullopt);
+
+  // Image input is still rejected with a clear error rather than a crash.
+  // ComputeEmbedding() wraps the precondition failure as INTERNAL.
+  std::vector<InputData> image_contents;
+  image_contents.push_back(InputImage("dummy"));
+  EXPECT_THAT(engine->ComputeEmbedding(image_contents, EmbeddingOptions()),
+              StatusIs(absl::StatusCode::kInternal,
+                       HasSubstr("Vision executor is not available")));
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateWithVisionTokensPerImageSucceedsIfNoVisionModel) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU,
+                                          Backend::CPU, std::nullopt));
+  settings.SetVisionTokensPerImage(70);
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+  EXPECT_NE(engine, nullptr);
+  EXPECT_EQ(engine->GetSelectedVisionSignatureInfo(), std::nullopt);
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateStreamingWeightsWithVisionTokensPerImageSucceedsIfNoVisionModel) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto file_stream, FileDataStream::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(std::move(file_stream)));
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU,
+                                          Backend::CPU, std::nullopt));
+  settings.SetVisionTokensPerImage(70);
+
+  ASSERT_OK_AND_ASSIGN(auto engine, EmbeddingEngineImpl::CreateStreamingWeights(
+                                        std::move(settings)));
+  EXPECT_NE(engine, nullptr);
+  EXPECT_EQ(engine->GetSelectedVisionSignatureInfo(), std::nullopt);
+}
+
+TEST(
+    EmbeddingEngineImplTest,
+    CreateWithMetadataMaxNumPatchesWithoutVisionBackendIgnoresVisionSignatures) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+  proto::EmbeddingMetadata metadata;
+  auto* gemma_v2 =
+      metadata.mutable_embedding_model_type()->mutable_embedding_gemma_v2();
+  gemma_v2->set_max_num_patches(630);
+  gemma_v2->set_pooling_kernel_size(3);
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+  EXPECT_NE(engine, nullptr);
+  EXPECT_EQ(engine->GetSelectedVisionSignatureInfo(), std::nullopt);
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateWithZeroMetadataMaxNumPatchesDoesNotSetVisionTokens) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto resources, CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU));
+  proto::EmbeddingMetadata metadata;
+  auto* gemma_v2 =
+      metadata.mutable_embedding_model_type()->mutable_embedding_gemma_v2();
+  gemma_v2->set_max_num_patches(0);
+  gemma_v2->set_pooling_kernel_size(3);
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+  EXPECT_NE(engine, nullptr);
+  EXPECT_EQ(engine->GetSelectedVisionSignatureInfo(), std::nullopt);
+}
+
+TEST(EmbeddingEngineImplTest,
+     CreateWithMetadataMaxNumPatchesDefaultsPoolingKernelSize) {
+  const std::string& model_path = (std::filesystem::path(::testing::SrcDir()) /
+                                   std::string(kTestEmbeddingModelPath))
+                                      .string();
+  ASSERT_OK_AND_ASSIGN(auto model_assets, ModelAssets::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(auto real_resources,
+                       CreateTestModelResources(model_path));
+  ASSERT_OK_AND_ASSIGN(auto env, CreateTestEnvironment());
+  auto tokenizer = std::make_unique<MockTokenizer>();
+
+  auto vision_buffer =
+      BuildDummyVisionModelBuffer({"vision_280"}, {280}, /*feature_dim=*/64);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto vision_model,
+      ::litert::Model::CreateFromBuffer(
+          env->env, ::litert::BufferRef<uint8_t>(vision_buffer.data(),
+                                                 vision_buffer.size())));
+
+  auto resources = std::make_unique<FakeModelResources>(
+      std::move(real_resources), /*has_vision=*/false, /*has_audio=*/false,
+      /*metadata=*/std::nullopt, /*vision_model=*/&vision_model);
+
+  ASSERT_OK_AND_ASSIGN(auto settings, EmbeddingEngineSettings::CreateDefault(
+                                          model_assets, Backend::CPU,
+                                          Backend::CPU, std::nullopt));
+  proto::EmbeddingMetadata metadata;
+  auto* gemma_v2 =
+      metadata.mutable_embedding_model_type()->mutable_embedding_gemma_v2();
+  gemma_v2->set_max_num_patches(2520);
+  settings.GetMutableEmbeddingMetadata() = metadata;
+
+  ASSERT_OK_AND_ASSIGN(
+      auto engine,
+      EmbeddingEngineImpl::Create(std::move(resources), std::move(env),
+                                  std::move(tokenizer), std::move(settings)));
+  ASSERT_TRUE(engine->GetSelectedVisionSignatureInfo().has_value());
+  EXPECT_EQ(engine->GetSelectedVisionSignatureInfo()->max_signature_length,
+            280);
+  EXPECT_THAT(engine->GetSelectedVisionSignatureInfo()->signature_lengths,
+              ElementsAre(280));
+  EXPECT_EQ(engine->GetSelectedVisionSignatureInfo()->max_num_patches, 2520);
 }
 
 TEST(EmbeddingEngineImplTest,

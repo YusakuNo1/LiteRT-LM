@@ -65,6 +65,7 @@ target_link_libraries(runtime_executor_audio_litert_compiled_model_executor
     LiteRTLM::Runtime::Executor::LlmExecutorIoTypes
     LiteRTLM::Runtime::Components::ModelResourcesInterface
     LiteRTLM::Runtime::Executor::LitertCompiledModelExecutorUtils
+    LiteRTLM::Runtime::Util::LoraUtil
 
     LITERTLM_DEPS
 )
@@ -88,6 +89,31 @@ target_include_directories(runtime_executor_executor_settings_base
 target_link_libraries(runtime_executor_executor_settings_base
   PUBLIC
     LiteRTLM::Runtime::Util
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
+# Executor Backend Registry
+# ==============================================================================
+add_litertlm_library(runtime_executor_executor_backend_registry STATIC
+  executor_backend_registry.cc
+)
+add_library(LiteRTLM::Runtime::Executor::ExecutorBackendRegistry
+ALIAS runtime_executor_executor_backend_registry)
+
+target_include_directories(runtime_executor_executor_backend_registry
+  PUBLIC
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERT_INCLUDE_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_executor_executor_backend_registry
+  PUBLIC
+    LiteRTLM::Runtime::Components::ModelResourcesInterface
+    LiteRTLM::Runtime::Executor::ExecutorSettingsBase
+    LiteRTLM::Runtime::Executor::LlmExecutorInterface
+    LiteRTLM::Support::Tokenizer
     LITERTLM_DEPS
 )
 
@@ -210,6 +236,7 @@ target_include_directories(runtime_executor_llm_executor_base
 
 target_link_libraries(runtime_executor_llm_executor_base
   INTERFACE
+    LiteRTLM::Runtime::Executor::ExecutorStats
     LiteRTLM::Runtime::Executor::LlmExecutorIoTypes
     LiteRTLM::Runtime::Executor::LlmExecutorSettings
     LITERTLM_DEPS
@@ -234,6 +261,7 @@ target_include_directories(runtime_executor_llm_executor_io_types
 target_link_libraries(runtime_executor_llm_executor_io_types
   PUBLIC
     LiteRTLM::Runtime::Components::ConstrainedDecoding::Decoder
+    LiteRTLM::Runtime::Executor::SpeculativeDecodingMode
     LiteRTLM::Runtime::Util::LoggingTensorBuffer
     LITERTLM_DEPS
 )
@@ -278,6 +306,8 @@ target_include_directories(runtime_executor_llm_executor_settings
 target_link_libraries(runtime_executor_llm_executor_settings
   PUBLIC
     LiteRTLM::Runtime::Executor::ExecutorSettingsBase
+    LiteRTLM::Runtime::Executor::MtpGatingPolicy
+    LiteRTLM::Runtime::Executor::SpeculativeDecodingMode
     LiteRTLM::Runtime::Util::Logging
     LITERTLM_DEPS
 )
@@ -408,6 +438,7 @@ target_include_directories(runtime_executor_llm_litert_compiled_model_executor
 target_link_libraries(runtime_executor_llm_litert_compiled_model_executor
   PUBLIC
     LiteRTLM::Runtime::Executor::ExecutorSettingsBase
+    LiteRTLM::Runtime::Executor::ExecutorStats
     LiteRTLM::Runtime::Executor::LlmExecutorIoTypes
     LiteRTLM::Runtime::Executor::LlmExecutorSettings
     LiteRTLM::Runtime::Executor::LlmExecutorSettingsUtils
@@ -416,6 +447,8 @@ target_link_libraries(runtime_executor_llm_litert_compiled_model_executor
     LiteRTLM::Runtime::Executor::LlmExecutorProcessedTokens
     LiteRTLM::Runtime::Executor::LlmLitertCompiledModelCacheUtils
     LiteRTLM::Runtime::Executor::LlmLitertMtpDrafter
+    LiteRTLM::Runtime::Executor::MtpGatingPolicy
+    LiteRTLM::Runtime::Executor::SpeculativeDecodingController
     LiteRTLM::Runtime::Executor::MagicNumberConfigsHelper
     LiteRTLM::Runtime::Components::ModelResourcesInterface
     LiteRTLM::Runtime::Components::ModelResourcesLitertLm
@@ -523,6 +556,70 @@ target_link_libraries(runtime_executor_vision_litert_compiled_model_executor
 
 
 # ==============================================================================
+# Speculative Decoding Mode
+# ==============================================================================
+add_litertlm_library(runtime_executor_speculative_decoding_mode INTERFACE)
+add_library(LiteRTLM::Runtime::Executor::SpeculativeDecodingMode
+  ALIAS runtime_executor_speculative_decoding_mode)
+
+target_include_directories(runtime_executor_speculative_decoding_mode
+  INTERFACE
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERT_INCLUDE_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_executor_speculative_decoding_mode
+  INTERFACE
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
+# MTP Gating Policy
+# ==============================================================================
+add_litertlm_library(runtime_executor_mtp_gating_policy STATIC
+  mtp_gating_policy.cc
+)
+add_library(LiteRTLM::Runtime::Executor::MtpGatingPolicy
+  ALIAS runtime_executor_mtp_gating_policy)
+
+target_include_directories(runtime_executor_mtp_gating_policy
+  PUBLIC
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERT_INCLUDE_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_executor_mtp_gating_policy
+  PUBLIC
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
+# Speculative Decoding Controller
+# ==============================================================================
+add_litertlm_library(runtime_executor_speculative_decoding_controller STATIC
+  speculative_decoding_controller.cc
+)
+add_library(LiteRTLM::Runtime::Executor::SpeculativeDecodingController
+  ALIAS runtime_executor_speculative_decoding_controller)
+
+target_include_directories(runtime_executor_speculative_decoding_controller
+  PUBLIC
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERT_INCLUDE_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_executor_speculative_decoding_controller
+  PUBLIC
+    LiteRTLM::Runtime::Executor::MtpGatingPolicy
+    LiteRTLM::Runtime::Executor::SpeculativeDecodingMode
+    LiteRTLM::Runtime::Components::SamplerFactory
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
 # LLM LiteRT MTP Drafter
 # ==============================================================================
 add_litertlm_library(runtime_executor_llm_litert_mtp_drafter STATIC
@@ -613,6 +710,7 @@ target_link_libraries(runtime_executor_libs INTERFACE
   LiteRTLM::Runtime::Executor::LlmExecutorInterface
   LiteRTLM::Runtime::Executor::AudioLitertCompiledModelExecutor
   LiteRTLM::Runtime::Executor::CommonUtils
+  LiteRTLM::Runtime::Executor::ExecutorBackendRegistry
   LiteRTLM::Runtime::Executor::ExecutorSettingsBase
   LiteRTLM::Runtime::Executor::ExecutorStats
   LiteRTLM::Runtime::Executor::FakeLlmExecutor
@@ -625,6 +723,9 @@ target_link_libraries(runtime_executor_libs INTERFACE
   LiteRTLM::Runtime::Executor::LlmLitertCompiledModelCacheUtils
   LiteRTLM::Runtime::Executor::LlmLitertCompiledModelExecutor
   LiteRTLM::Runtime::Executor::LlmLitertMtpDrafter
+  LiteRTLM::Runtime::Executor::MtpGatingPolicy
+  LiteRTLM::Runtime::Executor::SpeculativeDecodingController
+  LiteRTLM::Runtime::Executor::SpeculativeDecodingMode
   LiteRTLM::Runtime::Executor::Npu
   LiteRTLM::Runtime::Executor::LlmNpuCompiledModel
   LiteRTLM::Runtime::Executor::LlmProcessedContextInterface

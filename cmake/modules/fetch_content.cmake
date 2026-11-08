@@ -75,7 +75,7 @@ endif()
 # --- Llguidance ---
 set(LITERTLM_LLGUIDANCE_SRC_DIR ${LITERTLM_THIRD_PARTY_DIR}/llguidance CACHE PATH "Path to llguidance source directory")
 set(LITERTLM_LLGUIDANCE_INCLUDE_DIR "${LITERTLM_THIRD_PARTY_DIR}/llguidance/parser")
-set(LITERTLM_LLGUIDANCE_TAG "v1.3.0" CACHE STRING "Llguidance git tag")
+set(LITERTLM_LLGUIDANCE_TAG "v1.9.1" CACHE STRING "Llguidance git tag")
 FetchContent_Declare(
   llguidance
   GIT_REPOSITORY https://github.com/guidance-ai/llguidance.git
@@ -217,12 +217,16 @@ endif()
 
 # --- STB (Header Only - Populated) ---
 set(LITERTLM_STB_SRC_DIR ${LITERTLM_THIRD_PARTY_DIR}/stb_lib CACHE PATH "Path to libstb headers")
-set(LITERTLM_STB_TAG "master" CACHE STRING "STB git tag")
+# Pinned to the same stb commit as the Bazel WORKSPACE. Upstream removed
+# stb_image_resize2.h from master on 2026-10-19 (moved to a separate
+# repository), so tracking `master` no longer builds.
+set(LITERTLM_STB_TAG "f58f558c120e9b32c217290b80bad1a0729fbb2c" CACHE STRING "STB git tag")
+# No GIT_SHALLOW: the pinned commit is not a branch tip, so a shallow clone
+# cannot check it out ("reference is not a tree"). The repository is small.
 FetchContent_Declare(
   stb_lib
   GIT_REPOSITORY https://github.com/nothings/stb.git
   GIT_TAG ${LITERTLM_STB_TAG}
-  GIT_SHALLOW true
   SOURCE_DIR ${LITERTLM_STB_SRC_DIR}
 )
 FetchContent_Populate(stb_lib)
@@ -245,9 +249,9 @@ file(CONFIGURE
   @ONLY
 )
 
-if(NOT TARGET stb_lib)
-  add_library(stb_lib STATIC ${LITERTLM_STB_IMPL_SRC})
-  target_include_directories(stb_lib PUBLIC ${LITERTLM_STB_SRC_DIR})
+if(NOT TARGET stb_impl)
+  add_litertlm_library(stb_impl STATIC ${LITERTLM_STB_IMPL_SRC})
+  target_include_directories(stb_impl PUBLIC ${LITERTLM_STB_SRC_DIR})
 endif()
 
 # --- ZLIB ---
@@ -306,6 +310,6 @@ add_dependencies(fetch_content_complete
     minizip_lib
     minja_lib
     json_lib
-    stb_lib
+    stb_impl
     zlib_lib
 )

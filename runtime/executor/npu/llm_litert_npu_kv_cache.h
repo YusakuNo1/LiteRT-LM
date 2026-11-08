@@ -27,6 +27,7 @@
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "runtime/components/model_resources.h"
 #include "runtime/executor/npu/llm_litert_npu_compiled_model_executor_utils.h"
+#include "runtime/proto/executor_metadata.pb.h"
 
 namespace litert::lm {
 
@@ -47,9 +48,9 @@ absl::Status ClearKVCacheBuffers(
 absl::Status HWKVCacheUpdate(
     absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>& in_buffers,
     absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>& out_buffers,
+    const NpuGraphLayout* layout,
     const absl::flat_hash_map<absl::string_view, HWQuantParams>& quant_params =
-        {},
-    bool enable_ringbuffer = false);
+        {});
 
 enum class KVCacheUpdateMethod {
   kModel,
@@ -112,20 +113,21 @@ class NpuKVCache {
           decode_output_kv_cache_slice_buffers,
       absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
           verify_output_kv_cache_slice_buffers,
-      absl::flat_hash_map<absl::string_view, HWQuantParams> kv_quant_params =
-          {},
-      bool uses_ringbuffer = false, int64_t kv_cache_init_value = 0);
+      absl::flat_hash_map<absl::string_view, HWQuantParams> kv_quant_params,
+      const NpuGraphLayout* layout, int64_t kv_cache_init_value = 0);
 
   static absl::StatusOr<NpuKVCache> CreateForTest(
       KVCacheUpdateMethod method, const ::litert::CompiledModel* compiled_model,
       InferenceContext cache_update_context,
-      absl::flat_hash_map<absl::string_view, HWQuantParams> kv_quant_params =
-          {},
-      bool uses_ringbuffer = false, int64_t kv_cache_init_value = 0);
+      absl::flat_hash_map<absl::string_view, HWQuantParams> kv_quant_params,
+      const NpuGraphLayout* layout, int64_t kv_cache_init_value = 0);
 
   void SetCompiledModel(const ::litert::CompiledModel* compiled_model) {
     compiled_model_ = compiled_model;
   }
+
+  void SetLayout(const NpuGraphLayout* layout) { layout_ = layout; }
+  const NpuGraphLayout* GetLayout() const { return layout_; }
 
   // --- Stage 1: Prefill ---
   absl::Status SetPrefillPositions(absl::Span<const int32_t> seq_positions);
@@ -148,11 +150,17 @@ class NpuKVCache {
   // - Copies active range [0, active_seq_len) along the sequence dimension.
   // - Supports aliased memory buffers where `src` and `dst` share the exact
   //   same underlying physical memory allocation. In-place expansion is
-  //   guaranteed safe by copying outer slices in reverse order (back-to-front).
+  //   guaranteed safe (copies in reverse order).
+  // - Copies all buffers present in `src_buffers` that start with "kv_cache_k",
+  //   "kv_cache_v", or "kv_cache_c".
   // - Requirement: The caller must ensure `dst` capacity >= `src` capacity.
   // - Padding: Newly exposed strided slots [active_seq_len, dst_capacity) are
   //   cleanly reset to `kv_cache_init_value_` (e.g. quantization zero-point) to
   //   overwrite stale leftover data from adjacent slices.
+  // - The sequence axis of each buffer is taken from
+  //   `NpuGraphLayout::kv_cache_buffers`. Buffers the layout does not
+  //   describe fall back to inferring the axis from the `src`/`dst` shape
+  //   difference (see `CopySingleKVCacheBuffer`).
   absl::Status CopyKVCache(
       const absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
           src_buffers,
@@ -160,23 +168,39 @@ class NpuKVCache {
           dst_buffers,
       int active_seq_len);
 
-  // Updates the internal cache update runner's input and output tensor buffers
-  // to point to the newly active context group's KV cache buffers when
-  // switching from one context length to the next.
+  // Updates the internal cache update context's buffer mappings to point to
+  // the new context group's KV cache and slice buffers.
   absl::Status UpdateKVCacheBuffers(
       const absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
           input_kv_cache_buffers,
       const absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
-          prefill_output_kv_cache_slice_buffers = {},
+          prefill_output_kv_cache_slice_buffers,
       const absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
-          decode_output_kv_cache_slice_buffers = {},
+          decode_output_kv_cache_slice_buffers,
       const absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
-          verify_output_kv_cache_slice_buffers = {});
+          verify_output_kv_cache_slice_buffers);
 
+  // Migrates a single KV cache buffer from `src` to `dst`.
+  //
+  // `sequence_axis` is the axis to migrate along and should come from
+  // `NpuGraphLayout::kv_cache_buffers`. Pass -1 when it is unknown, in which
+  // case it is inferred from the `src`/`dst` shape difference; that inference
+  // only works if the buffer was actually resized, so identically shaped
+  // buffers are then assumed to alias and are skipped.
+  //
+  // With a known axis the behavior is:
+  // - `dst` larger than `src`: copy [0, active_seq_len) and reset the newly
+  //   exposed tail to `kv_cache_init_value`.
+  // - Same extent, same allocation (aliased context groups): no-op.
+  // - Same extent, distinct allocations (e.g. a fixed-capacity layer during a
+  //   dynamic KV cache grow): copy the buffer verbatim, so that content which
+  //   does not live in a [0, active_seq_len) prefix, such as wrapped
+  //   ring-buffer entries, survives the migration.
   static absl::Status CopySingleKVCacheBuffer(const ::litert::TensorBuffer& src,
                                               ::litert::TensorBuffer& dst,
                                               int active_seq_len,
-                                              int64_t kv_cache_init_value = 0);
+                                              int64_t kv_cache_init_value = 0,
+                                              int sequence_axis = -1);
 
   // --- Accessors ---
   KVCacheUpdateMethod GetMethod() const { return method_; }
@@ -188,19 +212,19 @@ class NpuKVCache {
       KVCacheUpdateMethod method, const ::litert::CompiledModel* compiled_model,
       InferenceContext cache_update_context,
       absl::flat_hash_map<absl::string_view, HWQuantParams> kv_quant_params,
-      bool uses_ringbuffer, int64_t kv_cache_init_value = 0)
+      const NpuGraphLayout* layout, int64_t kv_cache_init_value = 0)
       : method_(method),
         compiled_model_(compiled_model),
         cache_update_context_(std::move(cache_update_context)),
         kv_quant_params_(std::move(kv_quant_params)),
-        uses_ringbuffer_(uses_ringbuffer),
+        layout_(layout),
         kv_cache_init_value_(kv_cache_init_value) {}
 
   KVCacheUpdateMethod method_ = KVCacheUpdateMethod::kModel;
   const ::litert::CompiledModel* compiled_model_ = nullptr;
   InferenceContext cache_update_context_;
   absl::flat_hash_map<absl::string_view, HWQuantParams> kv_quant_params_;
-  bool uses_ringbuffer_ = false;
+  const NpuGraphLayout* layout_ = nullptr;
   int64_t kv_cache_init_value_ = 0;
 };
 

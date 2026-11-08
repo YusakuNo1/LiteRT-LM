@@ -32,19 +32,21 @@ let package = Package(
     ),
   ],
   targets: [
-    // The Prebuilt Binary Target for iOS
+    // The Prebuilt Binary Target for iOS (Official Stable Release)
+    // For nightly builds or pinning to specific nightly dates, switch to the 'nightly' branch or see:
+    // https://github.com/google-ai-edge/LiteRT-LM/tree/main/samples/ios_and_mac#1-add-dependency
     .binaryTarget(
       name: "CLiteRTLM",
       url:
-        "https://github.com/google-ai-edge/LiteRT-LM/releases/download/v0.17.1/CLiteRTLM.xcframework.zip",
-      checksum: "c94fc12aa0403cb47208e419cc3bfe258214ea17035f7a63c16de536869f2186"
+        "https://github.com/google-ai-edge/LiteRT-LM/releases/download/v0.19.1/CLiteRTLM.xcframework.zip",
+      checksum: "21cf294b3dfdd9c8166b0f7934ed392d5c69c8bfa57cd1a20e341a7d16874017"
     ),
     // The Prebuilt Binary Target for Mac
     .binaryTarget(
       name: "CLiteRTLM_mac",
       url:
-        "https://github.com/google-ai-edge/LiteRT-LM/releases/download/v0.17.1/CLiteRTLM_mac.xcframework.zip",
-      checksum: "83efd536485c9d58fcd7fb7d4556ddb16ca46bb775b0449d08d9825c6836c1a4"
+        "https://github.com/google-ai-edge/LiteRT-LM/releases/download/v0.19.1/CLiteRTLM_mac.xcframework.zip",
+      checksum: "cedd331e78e94bf98ca8f2f28aeb3d543e20277fcd51570c12deed6d49524fb6"
     ),
     // The Swift Wrapper Target
     .target(
@@ -56,7 +58,6 @@ let package = Package(
       path: "swift",
       exclude: [
         "apple_fm",
-        "device_tests",
         "ModelInfoTests.swift",
         "EngineTests.swift",
         "EmbeddingEngineTests.swift",

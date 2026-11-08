@@ -29,6 +29,7 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/c/litert_common.h"  // from @litert
+#include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_model.h"  // from @litert
 #include "litert/cc/litert_options.h"  // from @litert
@@ -40,7 +41,9 @@
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/executor_stats.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/proto/embedding_metadata.pb.h"
 #include "runtime/proto/executor_metadata.pb.h"
+#include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/scoped_file.h"
 
@@ -106,15 +109,52 @@ absl::Status GetKVCacheRootNames(std::vector<absl::string_view> input_names,
                                  std::string& k_root_name,
                                  std::string& v_root_name);
 
+// Returns true if `name` is the name of a linear attention / convolution
+// recurrent state tensor (e.g. "kv_cache_c_0" for conv state, "kv_cache_r_0"
+// for recurrent state) of a hybrid model such as LFM2 or Qwen3.5. Unlike the
+// standard KV cache, these states are overwritten every step and must always
+// be fed as inputs.
+bool IsLinearAttentionStateName(absl::string_view name);
+
 // Gets a set of prefill signature runners from the interpreter.
 // The signature runners are sorted by the input tokens dimension.
 // signature_name_base is the prefix of the prefill signature names, e.g.
 // "prefill".
 // input_tokens_name is the name of the input tokens signature, e.g. "token_ids"
-// for Gemma2 JAX and "tokens" for Gemma2 PyTorch.
+// for Gemma2 JAX and "tokens" for Gemma2 PyTorch. A nonempty
+// selected_signatures limits the result to active signatures; empty keeps the
+// existing behavior.
 absl::StatusOr<SortedPrefillSignatureMap> GetPrefillRunnerSetFromModel(
     const ::litert::Model& model, absl::string_view signature_name_base,
-    absl::string_view input_positions_name);
+    absl::string_view input_positions_name,
+    absl::Span<const std::string> selected_signatures = {});
+
+// Gets a set of prefill signature runners from an already compiled model.
+//
+// This is equivalent to the `::litert::Model` overload above, but inspects the
+// signatures exposed by the `CompiledModel` instead of the flatbuffer model.
+// Use this when only the CompiledModel is available (e.g. the model was
+// compiled from streamed weights and no `::litert::Model` is retained).
+//
+// Arguments:
+// - model: The compiled model whose signatures are inspected.
+// - signature_name_base: Prefix of the prefill signature names, e.g.
+//   "prefill". Signatures whose key does not start with this prefix are
+//   ignored.
+// - input_positions_name: Name of the input positions tensor in each prefill
+//   signature, e.g. "input_pos". Its shape ([seq_len] or
+//   [batch_size, seq_len]) determines the prefill length of the signature.
+// - selected_signatures: If nonempty, only signatures whose key is in this
+//   list are considered. If empty, all signatures are considered.
+//
+// Returns a map from prefill length to signature name, sorted by prefill
+// length in descending order. Returns an error if a matching signature does
+// not have an `input_positions_name` input, or if that input has an
+// unsupported rank.
+absl::StatusOr<SortedPrefillSignatureMap> GetPrefillRunnerSetFromModel(
+    CompiledModel& model, absl::string_view signature_name_base,
+    absl::string_view input_positions_name,
+    absl::Span<const std::string> selected_signatures = {});
 
 // Get a list of prefill work groups, each of which contains the signature
 // runner and prefill length for a single prefill call.
@@ -171,6 +211,19 @@ struct AttentionMaskParams {
 // If metadata is null or does not specify types, defaults to causal type.
 AttentionMaskParams GetAttentionMaskParams(
     const proto::ExecutorMetadata* executor_metadata);
+
+// Returns true if host-side attention mask initialization and filling can be
+// skipped because the GPU compiled model pruned the boolean causal mask
+// input(s) (e.g., when FlashAttention / FlashDecode SDPA computes causal
+// masking directly on the GPU from `param_tensor`). When
+// `signatures.input_attn_mask_local` is present, both `attn_mask_buffer` and
+// `attn_mask_local_buffer` must be causal boolean masks on host memory
+// (pruned by the GPU delegate) in order to skip.
+bool ShouldSkipGlobalCausalAttentionMask(
+    Backend backend, bool gpu_optimized_single_buffer_cache,
+    const ModelSignatures& signatures, const AttentionMaskParams& attn_params,
+    const ::litert::TensorBuffer* attn_mask_buffer = nullptr,
+    const ::litert::TensorBuffer* attn_mask_local_buffer = nullptr);
 
 // The operational mode for filling the ring-buffer attention mask.
 enum class RingBufferAttentionMaskMode {
@@ -297,17 +350,55 @@ struct ExternalWeightResources {
   litert::Options::ScopedWeightSectionMap sections;
 };
 
-// Returns the external weights for model_type when present. An empty result
-// means the model has embedded weights or its resource format does not support
-// external weight sections.
+// Returns the external weights for the model type wire string
+// `model_type_str` (e.g. "tf_lite_prefill_decode") when present. An empty
+// result means the model has embedded weights or its resource format does not
+// support external weight sections.
+//
+// args:
+//   resources: The model resources to read the weights section from.
+//   model_type_str: The model type wire string.
+// returns:
+//   The external weight resources, or an error if reading the section failed.
 absl::StatusOr<ExternalWeightResources> GetExternalWeightResources(
-    ModelResources& resources, ModelType model_type);
+    ModelResources& resources, absl::string_view model_type_str);
 
-// Adds model_type's external weight section to compilation_options when one is
-// present.
+// Returns the external weights for a capability-scoped Protobuf model type
+// enum (e.g. proto::LlmMetadata::TF_LITE_PREFILL_DECODE or
+// proto::EmbeddingMetadata::TF_LITE_TEXT_ENCODER). See
+// GetExternalWeightResources(ModelResources&, absl::string_view).
+template <typename TfLiteModelTypeT,
+          typename = std::enable_if_t<kIsTfLiteModelType<TfLiteModelTypeT>>>
+absl::StatusOr<ExternalWeightResources> GetExternalWeightResources(
+    ModelResources& resources, TfLiteModelTypeT model_type) {
+  return GetExternalWeightResources(resources,
+                                    TfLiteModelTypeToWireString(model_type));
+}
+
+// Adds the external weight section of the model type wire string
+// `model_type_str` to compilation_options when one is present.
+//
+// args:
+//   resources: The model resources to read the weights section from.
+//   model_type_str: The model type wire string.
+//   compilation_options: The compilation options to update.
+// returns:
+//   OkStatus, or an error if reading the section failed.
 absl::Status SetExternalWeightOptions(ModelResources& resources,
-                                      ModelType model_type,
+                                      absl::string_view model_type_str,
                                       litert::Options& compilation_options);
+
+// Adds the external weight section of a capability-scoped Protobuf model type
+// enum to compilation_options when one is present. See
+// SetExternalWeightOptions(ModelResources&, absl::string_view, ...).
+template <typename TfLiteModelTypeT,
+          typename = std::enable_if_t<kIsTfLiteModelType<TfLiteModelTypeT>>>
+absl::Status SetExternalWeightOptions(ModelResources& resources,
+                                      TfLiteModelTypeT model_type,
+                                      litert::Options& compilation_options) {
+  return SetExternalWeightOptions(
+      resources, TfLiteModelTypeToWireString(model_type), compilation_options);
+}
 
 // Initializes the embedding lookup and per-layer embedding lookup managers from
 // the given model resources and environment.

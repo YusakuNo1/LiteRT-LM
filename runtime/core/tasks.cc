@@ -33,6 +33,7 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "litert/cc/litert_common.h"  // from @litert
 #include "litert/cc/litert_element_type.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
@@ -49,12 +50,15 @@
 #include "runtime/components/sampler.h"
 #include "runtime/components/scoring_cpu_util.h"
 #include "runtime/components/stop_token_detector.h"
+#include "runtime/engine/engine_defaults.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/executor/executor_settings_base.h"
+#include "runtime/executor/executor_stats.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/executor/llm_litert_compiled_model_executor.h"
-#include "runtime/proto/sampler_params.pb.h"
+#include "runtime/executor/speculative_decoding_mode.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/status_macros.h"  //NOLINT
 #include "support/tokenizer/buffered_streaming_detokenizer.h"
@@ -76,7 +80,6 @@ void ConvertFp16ToFp32(absl::Span<const tflite::half> fp16_values,
 // TODO(b/423364170): all LLM Executors should respect the max number of tokens
 // returned by the model. We should remove this default value once all Executors
 // are compliant with the max number of tokens.
-constexpr int kDefaultMaxNumTokens = 4096;
 int TryGetMaxNumTokens(const LlmExecutor& executor) {
   auto settings = executor.GetExecutorSettings();
   if (!settings.ok()) {
@@ -200,16 +203,16 @@ class StopTokenStreamFilter {
 // and external sampling.
 class DecodeOneStep {
  private:
-  DecodeOneStep(LlmExecutor* absl_nonnull executor,
-                Tokenizer* absl_nonnull tokenizer, int num_output_candidates,
-                const StopTokenDetector& stop_token_detector,
-                std::optional<BenchmarkInfo>& benchmark_info,
-                std::optional<Sampler*> sampler,
-                std::unique_ptr<CompositeConstraint> composite_constraint,
-                std::unique_ptr<ConstrainedDecoder> constrained_decoder,
-                std::optional<litert::TensorBuffer> scores_tensor,
-                const std::atomic<bool>* cancelled,
-                std::optional<bool> enable_speculative_decoding = std::nullopt)
+  DecodeOneStep(
+      LlmExecutor* absl_nonnull executor, Tokenizer* absl_nonnull tokenizer,
+      int num_output_candidates, const StopTokenDetector& stop_token_detector,
+      std::optional<BenchmarkInfo>& benchmark_info,
+      std::optional<Sampler*> sampler,
+      std::unique_ptr<CompositeConstraint> composite_constraint,
+      std::unique_ptr<ConstrainedDecoder> constrained_decoder,
+      std::optional<litert::TensorBuffer> scores_tensor,
+      const std::atomic<bool>* cancelled,
+      const SpeculativeDecodingConfig& speculative_decoding_config = {})
       : executor_(*executor),
         tokenizer_(*tokenizer),
         detokenizer_(&tokenizer_, num_output_candidates),
@@ -223,7 +226,7 @@ class DecodeOneStep {
         result_text_(num_output_candidates, ""),
         result_token_ids_(num_output_candidates),
         cancelled_(cancelled),
-        enable_speculative_decoding_(enable_speculative_decoding) {
+        speculative_decoding_config_(speculative_decoding_config) {
     if (scores_tensor.has_value()) {
       scores_tensor_ = std::move(*scores_tensor);
     }
@@ -241,7 +244,7 @@ class DecodeOneStep {
       const std::atomic<bool>* cancelled =
           nullptr,  // Add cancelled signal for one decode step (eg.
                     // for diffusion-llm)
-      std::optional<bool> enable_speculative_decoding = std::nullopt) {
+      const SpeculativeDecodingConfig& speculative_decoding_config = {}) {
     ABSL_ASSIGN_OR_RETURN(auto composite_constraint,
                           CompositeConstraint::Create());
     if (repetition_penalty_config.enabled()) {
@@ -266,8 +269,22 @@ class DecodeOneStep {
     }
     std::unique_ptr<ConstrainedDecoder> constrained_decoder;
     if (!composite_constraint->empty()) {
-      constrained_decoder = std::make_unique<ConstrainedDecoder>(
-          composite_constraint.get(), num_output_candidates);
+      ABSL_ASSIGN_OR_RETURN(const auto settings,
+                            executor->GetExecutorSettings());
+      const litert::HwAccelerators accelerator =
+          GetHwAcceleratorForBackend(settings.GetBackend());
+      auto* env = executor->GetEnvironment();
+      if (env == nullptr || accelerator == litert::HwAccelerators::kNone) {
+        ABSL_ASSIGN_OR_RETURN(
+            constrained_decoder,
+            ConstrainedDecoder::CreateForHost(composite_constraint.get(),
+                                              num_output_candidates));
+      } else {
+        ABSL_ASSIGN_OR_RETURN(constrained_decoder,
+                              ConstrainedDecoder::Create(
+                                  composite_constraint.get(),
+                                  num_output_candidates, *env, accelerator));
+      }
     }
     std::optional<litert::TensorBuffer> scores_tensor;
     if (sampler.has_value()) {  // External sampling setup
@@ -278,7 +295,7 @@ class DecodeOneStep {
         executor, tokenizer, num_output_candidates, stop_token_detector,
         benchmark_info, sampler, std::move(composite_constraint),
         std::move(constrained_decoder), std::move(scores_tensor), cancelled,
-        enable_speculative_decoding));
+        speculative_decoding_config));
   }
 
   // Runs one step of the decode process and returns if all stops for all
@@ -497,7 +514,7 @@ class DecodeOneStep {
       auto decode_params = ExecutorDecodeParams();
       // Convey the cancellation token for the decode process.
       decode_params.SetCancelled(cancelled_);
-      decode_params.SetEnableSpeculativeDecoding(enable_speculative_decoding_);
+      decode_params.SetSpeculativeDecodingConfig(speculative_decoding_config_);
       if (constrained_decoder_ != nullptr) {
         decode_params.SetConstrainedDecoder(constrained_decoder_.get());
       }
@@ -533,8 +550,25 @@ class DecodeOneStep {
 
   bool is_first_step_ = true;
   const std::atomic<bool>* cancelled_ = nullptr;
-  std::optional<bool> enable_speculative_decoding_ = std::nullopt;
+  SpeculativeDecodingConfig speculative_decoding_config_;
 };
+
+// Prefills the tokens sampled by the external sampler at the last decode step
+// again, at the step that the decode already counted for them, so that the
+// executor holds them as pending input tokens. This does not take more space in
+// the context window, so unlike `Prefill()`, it does not leave room for a
+// following decode step.
+absl::Status PrefillLastSampledTokens(LlmExecutor& executor,
+                                      const litert::TensorBuffer& decoded_ids) {
+  LITERT_ASSIGN_OR_RETURN(auto duplicated_decoded_ids, decoded_ids.Duplicate());
+  ExecutorInputs inputs;
+  inputs.SetTextData(ExecutorTextData(std::move(duplicated_decoded_ids)));
+  ABSL_ASSIGN_OR_RETURN(int current_step, executor.GetCurrentStep());
+  ABSL_RETURN_IF_ERROR(executor.SetCurrentStep(current_step - 1));
+  ExecutorPrefillParams params;
+  params.SetWaitForCompletion(true);
+  return executor.Prefill(inputs, params);
+}
 
 }  // namespace
 
@@ -552,6 +586,18 @@ absl::StatusOr<Responses> Prefill(
         "Input token ids are too long. Exceeding the maximum number of tokens "
         "allowed: ",
         num_tokens, " >= ", max_num_tokens));
+  }
+  // The input is appended after the tokens already in the context (e.g.
+  // previous turns), so they count against the limit too. As above, at least
+  // one token must remain for the decode that follows, which runs a step before
+  // it checks the limit. Otherwise the prefill or that decode step would go
+  // past `max_num_tokens`.
+  if (auto current_step = executor.GetCurrentStep();
+      current_step.ok() && *current_step + num_tokens >= max_num_tokens) {
+    return absl::ResourceExhaustedError(absl::StrCat(
+        "Not enough space left in the context window for the input: ",
+        *current_step, " tokens in the context + ", num_tokens,
+        " input tokens >= ", max_num_tokens, " max number of tokens."));
   }
   size_t num_token_ids;
   {
@@ -572,6 +618,11 @@ absl::StatusOr<Responses> Prefill(
   ABSL_RETURN_IF_ERROR(executor.Prefill(inputs, params));
   if (benchmark_info.has_value()) {
     ABSL_RETURN_IF_ERROR(benchmark_info->TimePrefillTurnEnd(num_token_ids));
+    // Unlike TryGetMaxNumTokens(), don't fall back to a default value: report
+    // only the max number of tokens that the executor actually resolved.
+    if (auto settings = executor.GetExecutorSettings(); settings.ok()) {
+      benchmark_info->SetMaxNumTokens(settings->GetMaxNumTokens());
+    }
     auto profile_summary = executor.GetProfileSummary();
     if (profile_summary.ok()) {
       if (profile_summary->empty()) {
@@ -604,12 +655,17 @@ absl::StatusOr<Responses> Decode(
     std::optional<int> thinking_token_budget,
     const std::vector<int>& thinking_end_token_ids,
     const std::vector<int>& thinking_start_token_ids,
-    std::optional<bool> enable_speculative_decoding) {
+    const SpeculativeDecodingConfig& speculative_decoding_config) {
   const bool is_streaming = callback != nullptr;
   const bool is_custom_sampling = sampler.has_value();
 
   int benchmark_decode_token_count = 0;
   if (benchmark_info.has_value()) {
+    if (benchmark_info->GetTotalDecodeTurns() == 0) {
+      // Stats are executor-wide; this also clears steps of other sessions
+      // sharing the executor. Benchmarks are expected to run single-session.
+      executor.ResetExecutorStats();
+    }
     // Initialize sampler early if the executor supports it.
     auto* compiled_model_executor =
         dynamic_cast<LlmLiteRtCompiledModelExecutorBase*>(&executor);
@@ -636,8 +692,29 @@ absl::StatusOr<Responses> Decode(
                         executor.GetCurrentStep());
   const int max_num_tokens = TryGetMaxNumTokens(executor);
 
+  // Copies the executor's profile summary and stats into `benchmark_info` at
+  // the end of a decode turn, whether it completed or was cancelled.
+  auto record_executor_benchmark_info = [&]() {
+    auto profile_summary = executor.GetProfileSummary();
+    if (profile_summary.ok()) {
+      if (profile_summary->empty()) {
+        ABSL_LOG(WARNING) << "Decode profile summary is empty!";
+      } else {
+        benchmark_info->SetProfileSummary(*profile_summary);
+      }
+    } else if (profile_summary.status().code() ==
+               absl::StatusCode::kFailedPrecondition) {
+      ABSL_VLOG(1) << "Profiling is not enabled.";
+    } else {
+      ABSL_LOG(WARNING) << "Failed to get decode profile summary: "
+                        << profile_summary.status();
+    }
+    if (auto stats = executor.GetExecutorStats(); stats.has_value()) {
+      benchmark_info->SetExecutorStats(*std::move(stats));
+    }
+  };
+
   std::unique_ptr<Constraint> thinking_budget_constraint;
-  int vocab_size = tokenizer.GetTokens().size();
 
   // Apply the thinking budget constraint whenever thinking is enabled (budget
   // != 0). Even if the budget is -1 (unlimited), the constraint is required to
@@ -650,7 +727,7 @@ absl::StatusOr<Responses> Decode(
     } else {
       thinking_budget_constraint = std::make_unique<ThinkingBudgetConstraint>(
           constraint, *thinking_token_budget, thinking_start_token_ids,
-          thinking_end_token_ids, vocab_size);
+          thinking_end_token_ids, tokenizer.GetTokens().size());
       constraint = thinking_budget_constraint.get();
     }
   }
@@ -661,7 +738,7 @@ absl::StatusOr<Responses> Decode(
           &executor, &tokenizer, num_output_candidates, stop_token_detector,
           benchmark_info, sampler, std::move(repetition_penalty_config),
           std::move(no_repeat_ngram_config), std::move(suppress_tokens_config),
-          constraint, cancelled, enable_speculative_decoding));
+          constraint, cancelled, speculative_decoding_config));
   while (true) {
     if (cancelled != nullptr && cancelled->load()) {
       if (benchmark_info.has_value()) {
@@ -670,27 +747,13 @@ absl::StatusOr<Responses> Decode(
         // If the process is cancelled, we need to end this benchmark phase.
         ABSL_RETURN_IF_ERROR(benchmark_info->TimeDecodeTurnEnd(
             num_decode_steps * num_output_candidates));
-        auto profile_summary = executor.GetProfileSummary();
-        if (profile_summary.ok() && !profile_summary->empty()) {
-          benchmark_info->SetProfileSummary(*profile_summary);
-        }
+        record_executor_benchmark_info();
       }
       if (is_custom_sampling) {
         // For external sampling, the sampled tokens are provided by the
         // sampler. We must run one prefill to add the last token as pending
         // token in the LLM Executor when cancellation happens.
-        LITERT_ASSIGN_OR_RETURN(auto duplicated_decoded_ids,
-                                decoded_ids->Duplicate());
-        ExecutorInputs inputs;
-        inputs.SetTextData(ExecutorTextData(std::move(duplicated_decoded_ids)));
-        std::optional<BenchmarkInfo> unused_benchmark_info;
-        ABSL_ASSIGN_OR_RETURN(auto current_step, executor.GetCurrentStep());
-        ABSL_RETURN_IF_ERROR(executor.SetCurrentStep(current_step - 1));
-        auto status = Prefill(executor, inputs, /*wait_for_completion=*/true,
-                              unused_benchmark_info);
-        if (!status.ok()) {
-          return status.status();
-        }
+        ABSL_RETURN_IF_ERROR(PrefillLastSampledTokens(executor, *decoded_ids));
       }
       return absl::CancelledError("Process cancelled.");
     }
@@ -792,38 +855,14 @@ absl::StatusOr<Responses> Decode(
   if (benchmark_info.has_value()) {
     ABSL_RETURN_IF_ERROR(benchmark_info->TimeDecodeTurnEnd(
         num_decode_steps * num_output_candidates));
-    auto profile_summary = executor.GetProfileSummary();
-    if (profile_summary.ok()) {
-      if (profile_summary->empty()) {
-        ABSL_LOG(WARNING) << "Decode profile summary is empty!";
-      } else {
-        benchmark_info->SetProfileSummary(*profile_summary);
-      }
-    } else if (profile_summary.status().code() ==
-               absl::StatusCode::kFailedPrecondition) {
-      ABSL_VLOG(1) << "Profiling is not enabled.";
-    } else {
-      ABSL_LOG(WARNING) << "Failed to get decode profile summary: "
-                        << profile_summary.status();
-    }
+    record_executor_benchmark_info();
   }
 
   if (is_custom_sampling) {
     // For external sampling, the sampled tokens are provided by the sampler. We
     // must run one prefill to add the stop token as pending token in the LLM
     // Executor when stop condition is met.
-    LITERT_ASSIGN_OR_RETURN(auto duplicated_decoded_ids,
-                            decoded_ids->Duplicate());
-    ExecutorInputs inputs;
-    inputs.SetTextData(ExecutorTextData(std::move(duplicated_decoded_ids)));
-    std::optional<BenchmarkInfo> unused_benchmark_info;
-    ABSL_ASSIGN_OR_RETURN(auto current_step, executor.GetCurrentStep());
-    ABSL_RETURN_IF_ERROR(executor.SetCurrentStep(current_step - 1));
-    auto status = Prefill(executor, inputs, /*wait_for_completion=*/true,
-                          unused_benchmark_info);
-    if (!status.ok()) {
-      return status.status();
-    }
+    ABSL_RETURN_IF_ERROR(PrefillLastSampledTokens(executor, *decoded_ids));
   }
 
   if (is_streaming) {

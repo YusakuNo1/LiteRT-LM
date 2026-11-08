@@ -15,6 +15,7 @@
 #include <jni.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,7 @@
 #include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json_fwd.hpp"  // from @nlohmann_json
 #include "litert/cc/internal/scoped_file.h"  // from @litert
+#include "c/engine.h"
 #include "c/model_info.h"
 #include "kotlin/java/com/google/ai/edge/litertlm/jni/jni_utils.h"
 #include "runtime/components/constrained_decoding/llg_constraint_config.h"
@@ -58,6 +60,7 @@
 #include "runtime/engine/io_types.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/executor/speculative_decoding_mode.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/file_util.h"
 #include "runtime/util/litert_lm_loader.h"
@@ -103,6 +106,7 @@ using litert::lm::proto::SamplerParameters;
 
 using litert::lm::jni::GetJniEnvAndAttach;
 using litert::lm::jni::NewStringStandardUTF;
+using litert::lm::jni::ScopedLocalRef;
 
 void ThrowLiteRtLmJniException(JNIEnv* env, const std::string& message) {
   jclass exClass =
@@ -158,10 +162,31 @@ jobject CreateBenchmarkInfoJni(
   double last_decode_tokens_per_second = benchmark_info.GetDecodeTokensPerSec(
       benchmark_info.GetTotalDecodeTurns() - 1);
 
-  jclass benchmark_info_cls =
-      env->FindClass("com/google/ai/edge/litertlm/BenchmarkInfo");
-  jmethodID benchmark_info_ctor =
-      env->GetMethodID(benchmark_info_cls, "<init>", "(DDIIDD)V");
+  ScopedLocalRef<jclass> hash_map_cls(env, env->FindClass("java/util/HashMap"));
+  jmethodID hash_map_ctor =
+      env->GetMethodID(hash_map_cls.get(), "<init>", "()V");
+  jmethodID hash_map_put = env->GetMethodID(
+      hash_map_cls.get(), "put",
+      "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+  ScopedLocalRef<jobject> mark_durations_map(
+      env, env->NewObject(hash_map_cls.get(), hash_map_ctor));
+
+  ScopedLocalRef<jclass> double_cls(env, env->FindClass("java/lang/Double"));
+  jmethodID double_ctor = env->GetMethodID(double_cls.get(), "<init>", "(D)V");
+  for (const auto& [mark_name, duration] : benchmark_info.GetMarkDurations()) {
+    ScopedLocalRef<jstring> key(env, NewStringStandardUTF(env, mark_name));
+    ScopedLocalRef<jobject> val(
+        env, env->NewObject(double_cls.get(), double_ctor,
+                            absl::ToDoubleSeconds(duration)));
+    ScopedLocalRef<jobject> prev(
+        env, env->CallObjectMethod(mark_durations_map.get(), hash_map_put,
+                                   key.get(), val.get()));
+  }
+
+  ScopedLocalRef<jclass> benchmark_info_cls(
+      env, env->FindClass("com/google/ai/edge/litertlm/BenchmarkInfo"));
+  jmethodID benchmark_info_ctor = env->GetMethodID(
+      benchmark_info_cls.get(), "<init>", "(DDIIDDLjava/util/Map;I)V");
 
   double total_init_time_ms = 0.0;
   for (const auto& phase : benchmark_info.GetInitPhases()) {
@@ -171,10 +196,12 @@ jobject CreateBenchmarkInfoJni(
   }
 
   return env->NewObject(
-      benchmark_info_cls, benchmark_info_ctor, total_init_time_ms / 1000.0,
-      benchmark_info.GetTimeToFirstToken(), last_prefill_token_count,
-      last_decode_token_count, last_prefill_tokens_per_second,
-      last_decode_tokens_per_second);
+      benchmark_info_cls.get(), benchmark_info_ctor,
+      total_init_time_ms / 1000.0, benchmark_info.GetTimeToFirstToken(),
+      last_prefill_token_count, last_decode_token_count,
+      last_prefill_tokens_per_second, last_decode_tokens_per_second,
+      mark_durations_map.get(),
+      static_cast<jint>(benchmark_info.GetMaxNumTokens()));
 }
 
 // Converts a Java InputData array to a C++ vector of InputData.
@@ -423,6 +450,67 @@ std::optional<bool> GetOptionalBoolean(JNIEnv* env, jobject boolean_obj) {
   return (value == JNI_TRUE);
 }
 
+// Values of the Kotlin `SpeculativeDecodingMode.value`, which match the C API's
+// `LiteRtLmSpeculativeDecodingMode`.
+constexpr int kSpeculativeDecodingModeOff = 0;
+constexpr int kSpeculativeDecodingModeOn = 1;
+constexpr int kSpeculativeDecodingModeAdaptive = 2;
+
+// Converts the optional speculative decoding mode (boxed Integer holding a
+// Kotlin `SpeculativeDecodingMode.value`) to the runtime's mode. Returns false
+// and throws a Java exception if the value is out of range.
+bool GetOptionalSpeculativeDecodingMode(
+    JNIEnv* env, jobject mode_obj,
+    std::optional<litert::lm::SpeculativeDecodingMode>& runtime_mode) {
+  runtime_mode = std::nullopt;
+  std::optional<int> mode = GetOptionalInt(env, mode_obj);
+  if (!mode.has_value()) return true;
+  switch (*mode) {
+    case kSpeculativeDecodingModeOff:
+      runtime_mode = litert::lm::SpeculativeDecodingMode::kOff;
+      return true;
+    case kSpeculativeDecodingModeOn:
+      runtime_mode = litert::lm::SpeculativeDecodingMode::kOn;
+      return true;
+    case kSpeculativeDecodingModeAdaptive:
+      runtime_mode = litert::lm::SpeculativeDecodingMode::kAdaptive;
+      return true;
+    default:
+      ThrowLiteRtLmJniException(
+          env, absl::StrCat("Invalid speculative decoding mode: ", *mode));
+      return false;
+  }
+}
+
+// Sets the speculative decoding mode of `config` (an `EngineSettings` or a
+// `SessionConfig`) from the optional `mode_obj` (boxed Integer holding a Kotlin
+// `SpeculativeDecodingMode.value`) or, when that is null, from the deprecated
+// optional `enable_speculative_decoding_obj` (boxed Boolean; true is on).
+// Leaves `config` unchanged when both are null. Returns false and throws a Java
+// exception if the mode is out of range.
+template <typename ConfigT>
+bool ApplyOptionalSpeculativeDecodingMode(
+    JNIEnv* env, jobject mode_obj, jobject enable_speculative_decoding_obj,
+    ConfigT& config) {
+  std::optional<litert::lm::SpeculativeDecodingMode> runtime_mode;
+  if (!GetOptionalSpeculativeDecodingMode(env, mode_obj, runtime_mode)) {
+    return false;
+  }
+  if (!runtime_mode.has_value()) {
+    std::optional<bool> enable_speculative_decoding =
+        GetOptionalBoolean(env, enable_speculative_decoding_obj);
+    if (!enable_speculative_decoding.has_value()) return true;
+    runtime_mode = *enable_speculative_decoding
+                       ? litert::lm::SpeculativeDecodingMode::kOn
+                       : litert::lm::SpeculativeDecodingMode::kOff;
+  }
+  litert::lm::SpeculativeDecodingConfig speculative_decoding_config =
+      config.GetSpeculativeDecodingConfig();
+  speculative_decoding_config.mode = runtime_mode;
+  config.SetSpeculativeDecodingConfig(speculative_decoding_config);
+  return true;
+}
+
 std::optional<litert::lm::DataProcessorArguments> GetDataProcessorArguments(
     JNIEnv* env, Conversation* conversation, jobject visual_token_budget_obj) {
   std::optional<int> budget = GetOptionalInt(env, visual_token_budget_obj);
@@ -437,6 +525,44 @@ std::optional<litert::lm::DataProcessorArguments> GetDataProcessorArguments(
     }
   }
   return std::nullopt;
+}
+
+// Calls a model info C API accessor that returns a status code and writes its
+// result to an out-parameter. The Kotlin model info API predates status codes:
+// on any failure, including a value the model does not define
+// (kLiteRtLmStatusNotFound), it expects the legacy sentinel `fallback`.
+template <typename T, typename Fn>
+T GetModelInfoValue(T fallback, Fn&& fn) {
+  T value = fallback;
+  if (fn(&value) != kLiteRtLmStatusOk) {
+    return fallback;
+  }
+  return value;
+}
+
+// Reads a two-pass `int32_t` array from a model info `*_selection` C API
+// function. Returns nullptr if the model does not define the values or the call
+// fails.
+template <typename Fn>
+jintArray GetModelInfoIntArray(JNIEnv* env, LiteRtLmLoadedFile* model_info,
+                               Fn&& fn) {
+  size_t count = 0;
+  if (fn(model_info, nullptr, 0, &count) != kLiteRtLmStatusOk) {
+    return nullptr;
+  }
+  std::vector<int32_t> lengths(count);
+  size_t written = 0;
+  if (fn(model_info, lengths.data(), count, &written) != kLiteRtLmStatusOk) {
+    return nullptr;
+  }
+  const jsize size = static_cast<jsize>(std::min(count, written));
+  jintArray result = env->NewIntArray(size);
+  if (result == nullptr) {
+    return nullptr;
+  }
+  env->SetIntArrayRegion(result, 0, size,
+                         reinterpret_cast<const jint*>(lengths.data()));
+  return result;
 }
 
 }  // namespace
@@ -460,7 +586,8 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEngine)(
     jobject enable_speculative_decoding, jstring main_npu_native_library_dir,
     jstring vision_npu_native_library_dir, jstring audio_npu_native_library_dir,
     jint main_backend_num_threads, jint audio_backend_num_threads,
-    jint max_vision_tokens_per_image, jint activation_data_type) {
+    jint max_vision_tokens_per_image, jint activation_data_type,
+    jobject enable_ynnpack, jobject speculative_decoding_mode) {
   const char* model_path_chars = env->GetStringUTFChars(model_path, nullptr);
   std::string model_path_str(model_path_chars);
   env->ReleaseStringUTFChars(model_path, model_path_chars);
@@ -604,20 +731,10 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEngine)(
     settings->GetMutableBenchmarkParams();
   }
 
-  if (enable_speculative_decoding != nullptr) {
-    jclass boolean_class = env->FindClass("java/lang/Boolean");
-    jmethodID boolean_value_mid =
-        env->GetMethodID(boolean_class, "booleanValue", "()Z");
-    jboolean is_enabled =
-        env->CallBooleanMethod(enable_speculative_decoding, boolean_value_mid);
-    env->DeleteLocalRef(boolean_class);
-
-    auto advanced_settings =
-        settings->GetMainExecutorSettings().GetAdvancedSettings().value_or(
-            litert::lm::AdvancedSettings());
-    advanced_settings.enable_speculative_decoding = (is_enabled == JNI_TRUE);
-    settings->GetMutableMainExecutorSettings().SetAdvancedSettings(
-        advanced_settings);
+  if (!ApplyOptionalSpeculativeDecodingMode(env, speculative_decoding_mode,
+                                            enable_speculative_decoding,
+                                            *settings)) {
+    return 0;
   }
 
   if (max_vision_tokens_per_image > 0) {
@@ -642,6 +759,17 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEngine)(
     }
   }
 
+  if (std::optional<bool> enable_ynnpack_opt =
+          GetOptionalBoolean(env, enable_ynnpack);
+      enable_ynnpack_opt.has_value()) {
+    if (auto cpu_config = settings->GetMutableMainExecutorSettings()
+                              .MutableBackendConfig<litert::lm::CpuConfig>();
+        cpu_config.ok()) {
+      cpu_config->enable_ynnpack = *enable_ynnpack_opt;
+      settings->GetMutableMainExecutorSettings().SetBackendConfig(*cpu_config);
+    }
+  }
+
   auto engine = EngineFactory::CreateDefault(*settings);
   if (!engine.ok()) {
     ThrowLiteRtLmJniException(
@@ -654,8 +782,11 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEngine)(
 
 LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
     JNIEnv* env, jclass thiz, jstring model_path, jstring backend,
-    jint prefill_tokens, jint decode_tokens, jstring cache_dir,
-    jstring main_npu_native_library_dir, jobject enable_speculative_decoding) {
+    jstring vision_backend, jstring audio_backend, jint prefill_tokens,
+    jint decode_tokens, jstring cache_dir, jstring main_npu_native_library_dir,
+    jstring vision_npu_native_library_dir, jstring audio_npu_native_library_dir,
+    jobject enable_speculative_decoding, jobject enable_ynnpack,
+    jint max_num_tokens) {
   const char* model_path_chars = env->GetStringUTFChars(model_path, nullptr);
   std::string model_path_str(model_path_chars);
   env->ReleaseStringUTFChars(model_path, model_path_chars);
@@ -682,7 +813,43 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
     return 0;
   }
 
-  auto settings = EngineSettings::CreateDefault(*model_assets, *backend_enum);
+  const char* vision_backend_chars =
+      env->GetStringUTFChars(vision_backend, nullptr);
+  std::string vision_backend_str(vision_backend_chars);
+  env->ReleaseStringUTFChars(vision_backend, vision_backend_chars);
+
+  std::optional<Backend> vision_backend_optional = std::nullopt;
+  if (!vision_backend_str.empty()) {
+    auto vision_backend_enum =
+        litert::lm::GetBackendFromString(vision_backend_str);
+    if (!vision_backend_enum.ok()) {
+      ThrowLiteRtLmJniException(env, vision_backend_enum.status().ToString());
+      return 0;
+    }
+
+    vision_backend_optional = vision_backend_enum.value();
+  }
+
+  const char* audio_backend_chars =
+      env->GetStringUTFChars(audio_backend, nullptr);
+  std::string audio_backend_str(audio_backend_chars);
+  env->ReleaseStringUTFChars(audio_backend, audio_backend_chars);
+
+  std::optional<Backend> audio_backend_optional = std::nullopt;
+  if (!audio_backend_str.empty()) {
+    auto audio_backend_enum =
+        litert::lm::GetBackendFromString(audio_backend_str);
+    if (!audio_backend_enum.ok()) {
+      ThrowLiteRtLmJniException(env, audio_backend_enum.status().ToString());
+      return 0;
+    }
+
+    audio_backend_optional = audio_backend_enum.value();
+  }
+
+  auto settings = EngineSettings::CreateDefault(*model_assets, *backend_enum,
+                                                vision_backend_optional,
+                                                audio_backend_optional);
   if (!settings.ok()) {
     ThrowLiteRtLmJniException(env, "Failed to create engine settings: " +
                                        settings.status().ToString());
@@ -694,6 +861,12 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
   env->ReleaseStringUTFChars(cache_dir, cache_dir_chars);
   if (!cache_dir_str.empty()) {
     settings->GetMutableMainExecutorSettings().SetCacheDir(cache_dir_str);
+    if (vision_backend_optional.has_value()) {
+      settings->GetMutableVisionExecutorSettings()->SetCacheDir(cache_dir_str);
+    }
+    if (audio_backend_optional.has_value()) {
+      settings->GetMutableAudioExecutorSettings()->SetCacheDir(cache_dir_str);
+    }
   }
 
   const char* main_npu_native_library_dir_chars =
@@ -705,6 +878,30 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
   if (!main_npu_native_library_dir_str.empty()) {
     settings->GetMutableMainExecutorSettings().SetLitertDispatchLibDir(
         main_npu_native_library_dir_str);
+  }
+
+  const char* vision_npu_native_library_dir_chars =
+      env->GetStringUTFChars(vision_npu_native_library_dir, nullptr);
+  std::string vision_npu_native_library_dir_str(
+      vision_npu_native_library_dir_chars);
+  env->ReleaseStringUTFChars(vision_npu_native_library_dir,
+                             vision_npu_native_library_dir_chars);
+  if (!vision_npu_native_library_dir_str.empty() &&
+      vision_backend_optional.has_value()) {
+    settings->GetMutableVisionExecutorSettings()->SetLitertDispatchLibDir(
+        vision_npu_native_library_dir_str);
+  }
+
+  const char* audio_npu_native_library_dir_chars =
+      env->GetStringUTFChars(audio_npu_native_library_dir, nullptr);
+  std::string audio_npu_native_library_dir_str(
+      audio_npu_native_library_dir_chars);
+  env->ReleaseStringUTFChars(audio_npu_native_library_dir,
+                             audio_npu_native_library_dir_chars);
+  if (!audio_npu_native_library_dir_str.empty() &&
+      audio_backend_optional.has_value()) {
+    settings->GetMutableAudioExecutorSettings()->SetLitertDispatchLibDir(
+        audio_npu_native_library_dir_str);
   }
 
   auto advanced_settings =
@@ -720,9 +917,24 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
   settings->GetMutableMainExecutorSettings().SetAdvancedSettings(
       advanced_settings);
 
+  if (std::optional<bool> enable_ynnpack_opt =
+          GetOptionalBoolean(env, enable_ynnpack);
+      enable_ynnpack_opt.has_value()) {
+    if (auto cpu_config = settings->GetMutableMainExecutorSettings()
+                              .MutableBackendConfig<litert::lm::CpuConfig>();
+        cpu_config.ok()) {
+      cpu_config->enable_ynnpack = *enable_ynnpack_opt;
+      settings->GetMutableMainExecutorSettings().SetBackendConfig(*cpu_config);
+    }
+  }
+
   auto& benchmark_params = settings->GetMutableBenchmarkParams();
   benchmark_params.set_num_prefill_tokens(prefill_tokens);
   benchmark_params.set_num_decode_tokens(decode_tokens);
+
+  if (max_num_tokens > 0) {
+    settings->GetMutableMainExecutorSettings().SetMaxNumTokens(max_num_tokens);
+  }
 
   auto engine = EngineFactory::CreateDefault(*settings);
   if (!engine.ok()) {
@@ -742,12 +954,12 @@ JNI_METHOD(nativeDeleteEngine)(JNIEnv* env, jclass thiz, jlong engine_pointer) {
 LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateSession)(
     JNIEnv* env, jclass thiz, jlong engine_pointer, jobject sampler_config_obj,
     jstring lora_path_str, jstring audio_lora_path_str,
-    jobject enable_speculative_decoding) {
+    jobject enable_speculative_decoding, jobject speculative_decoding_mode) {
   auto session_config = SessionConfig::CreateDefault();
-  if (auto enable_spec_dec =
-          GetOptionalBoolean(env, enable_speculative_decoding);
-      enable_spec_dec.has_value()) {
-    session_config.SetEnableSpeculativeDecoding(*enable_spec_dec);
+  if (!ApplyOptionalSpeculativeDecodingMode(env, speculative_decoding_mode,
+                                            enable_speculative_decoding,
+                                            session_config)) {
+    return 0;
   }
 
   if (sampler_config_obj != nullptr) {
@@ -802,6 +1014,20 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateSession)(
 LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeDeleteSession)(
     JNIEnv* env, jclass thiz, jlong session_pointer) {
   delete reinterpret_cast<Engine::Session*>(session_pointer);
+}
+
+LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCloneSession)(
+    JNIEnv* env, jclass thiz, jlong session_pointer) {
+  Engine::Session* session =
+      reinterpret_cast<Engine::Session*>(session_pointer);
+  auto cloned_session = session->Clone();
+  if (!cloned_session.ok()) {
+    ThrowLiteRtLmJniException(env,
+                              absl::StrCat("Failed to clone session: ",
+                                           cloned_session.status().ToString()));
+    return 0;
+  }
+  return reinterpret_cast<jlong>(cloned_session->release());
 }
 
 LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeRunPrefill)(
@@ -1015,15 +1241,16 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateConversation)(
     jstring overwrite_prompt_template, jstring lora_path_str,
     jstring audio_lora_path_str, jboolean prefill_preface_on_init,
     jint max_output_token, jobject thinking_config_obj,
-    jboolean enable_response_format, jobject enable_speculative_decoding) {
+    jboolean enable_response_format, jobject enable_speculative_decoding,
+    jobject speculative_decoding_mode) {
   Engine* engine = reinterpret_cast<Engine*>(engine_pointer);
 
   // Create a native SessionConfig
   auto session_config = SessionConfig::CreateDefault();
-  if (auto enable_spec_dec =
-          GetOptionalBoolean(env, enable_speculative_decoding);
-      enable_spec_dec.has_value()) {
-    session_config.SetEnableSpeculativeDecoding(*enable_spec_dec);
+  if (!ApplyOptionalSpeculativeDecodingMode(env, speculative_decoding_mode,
+                                            enable_speculative_decoding,
+                                            session_config)) {
+    return 0;
   }
   if (max_output_token > 0) {
     session_config.SetMaxOutputTokens(max_output_token);
@@ -1183,6 +1410,20 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateConversation)(
 LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeDeleteConversation)(
     JNIEnv* env, jclass thiz, jlong conversation_pointer) {
   delete reinterpret_cast<Conversation*>(conversation_pointer);
+}
+
+LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCloneConversation)(
+    JNIEnv* env, jclass thiz, jlong conversation_pointer) {
+  Conversation* conversation =
+      reinterpret_cast<Conversation*>(conversation_pointer);
+  auto cloned_conversation = conversation->Clone();
+  if (!cloned_conversation.ok()) {
+    ThrowLiteRtLmJniException(
+        env, absl::StrCat("Failed to clone conversation: ",
+                          cloned_conversation.status().ToString()));
+    return 0;
+  }
+  return reinterpret_cast<jlong>(cloned_conversation->release());
 }
 
 LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeSendMessageAsync)(
@@ -1481,8 +1722,9 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateModelInfo)(
   std::string model_path_str(model_path_chars);
   env->ReleaseStringUTFChars(model_path, model_path_chars);
 
-  auto model_info = litert_lm_loaded_file_create(model_path_str.c_str());
-  if (model_info == nullptr) {
+  LiteRtLmLoadedFile* model_info = nullptr;
+  if (litert_lm_loaded_file_create(model_path_str.c_str(), &model_info) !=
+      kLiteRtLmStatusOk) {
     ThrowLiteRtLmJniException(
         env, "Failed to open LiteRT-LM file: " + model_path_str);
     return 0;
@@ -1501,99 +1743,112 @@ LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeDeleteModelInfo)(
 LITERTLM_JNIEXPORT jboolean JNICALL
 JNI_METHOD(nativeHasSpeculativeDecodingSupport)(JNIEnv* env, jclass thiz,
                                                 jlong model_info_pointer) {
-  return litert_lm_loaded_file_has_speculative_decoding_support(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(false, [&](bool* out) {
+    return litert_lm_loaded_file_has_speculative_decoding_support(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+  });
 }
 
 // JNI bridge method to check thinking/reasoning budget support.
 LITERTLM_JNIEXPORT jboolean JNICALL JNI_METHOD(nativeSupportsThinking)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return litert_lm_loaded_file_supports_thinking(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(false, [&](bool* out) {
+    return litert_lm_loaded_file_supports_thinking(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+  });
 }
 
 // JNI bridge method to check function calling/tool use support.
 LITERTLM_JNIEXPORT jboolean JNICALL JNI_METHOD(nativeSupportsFunctionCalling)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return litert_lm_loaded_file_supports_function_calling(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(false, [&](bool* out) {
+    return litert_lm_loaded_file_supports_function_calling(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+  });
 }
 
 LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeSamplerType)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return litert_lm_loaded_file_sampler_type(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(
+      kLiteRtLmSamplerTypeUnspecified, [&](LiteRtLmSamplerType* out) {
+        return litert_lm_loaded_file_sampler_type(
+            reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+      });
 }
 
 LITERTLM_JNIEXPORT jfloat JNICALL JNI_METHOD(nativeSamplerTemp)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return litert_lm_loaded_file_sampler_temperature(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(0.0f, [&](float* out) {
+    return litert_lm_loaded_file_sampler_temperature(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+  });
 }
 
 LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeSamplerTopK)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return litert_lm_loaded_file_sampler_top_k(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(int32_t{0}, [&](int32_t* out) {
+    return litert_lm_loaded_file_sampler_top_k(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+  });
 }
 
 LITERTLM_JNIEXPORT jfloat JNICALL JNI_METHOD(nativeSamplerTopP)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return litert_lm_loaded_file_sampler_top_p(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(0.0f, [&](float* out) {
+    return litert_lm_loaded_file_sampler_top_p(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+  });
 }
 
 // JNI bridge method to check if the model supports the requested input
 // modality.
 LITERTLM_JNIEXPORT jboolean JNICALL JNI_METHOD(nativeSupportsInputModality)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer, jint modality) {
-  return litert_lm_loaded_file_supports_input_modality(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
-      static_cast<LiteRtLmModality>(modality));
+  return GetModelInfoValue(false, [&](bool* out) {
+    return litert_lm_loaded_file_supports_input_modality(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
+        static_cast<LiteRtLmModality>(modality), out);
+  });
 }
 
 LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeMaxVisionTokenBudget)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return litert_lm_loaded_file_max_vision_token_budget(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(int32_t{-1}, [&](int32_t* out) {
+    return litert_lm_loaded_file_max_vision_token_budget(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+  });
 }
 
 LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeMaxContextTokens)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return litert_lm_loaded_file_max_context_tokens(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(uint32_t{0}, [&](uint32_t* out) {
+    return litert_lm_loaded_file_max_context_tokens(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+  });
 }
 
 LITERTLM_JNIEXPORT jboolean JNICALL JNI_METHOD(nativeIsDynamicContext)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return litert_lm_loaded_file_is_dynamic_context(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(false, [&](bool* out) {
+    return litert_lm_loaded_file_is_dynamic_context(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+  });
 }
 
 LITERTLM_JNIEXPORT jintArray JNICALL JNI_METHOD(nativeVisionSignatureSelection)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  auto* model_info = reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer);
-  int32_t count =
-      litert_lm_loaded_file_vision_signature_selection(model_info, nullptr, 0);
-  if (count == -1) {
-    return nullptr;
-  }
-  std::vector<int32_t> lengths(count);
-  litert_lm_loaded_file_vision_signature_selection(model_info, lengths.data(),
-                                                   count);
-  jintArray result = env->NewIntArray(count);
-  if (result == nullptr) {
-    return nullptr;
-  }
-  env->SetIntArrayRegion(result, 0, count,
-                         reinterpret_cast<const jint*>(lengths.data()));
-  return result;
+  return GetModelInfoIntArray(
+      env, reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
+      litert_lm_loaded_file_vision_signature_selection);
 }
 
 LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(nativeMinRuntimeVersion)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  const char* version = litert_lm_loaded_file_min_runtime_version(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  const char* version = GetModelInfoValue(
+      static_cast<const char*>(nullptr), [&](const char** out) {
+        return litert_lm_loaded_file_min_runtime_version(
+            reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+      });
   if (version == nullptr) {
     return nullptr;
   }
@@ -1604,38 +1859,53 @@ LITERTLM_JNIEXPORT jintArray JNICALL JNI_METHOD(
     nativeModalitySupportedBackends)(JNIEnv* env, jclass thiz,
                                      jlong model_info_pointer, jint modality) {
   auto* model_info = reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer);
-  int32_t count = litert_lm_loaded_file_modality_supported_backends(
-      model_info, static_cast<LiteRtLmModality>(modality), nullptr, 0);
-  if (count <= 0) {
+  const auto c_modality = static_cast<LiteRtLmModality>(modality);
+  size_t count = GetModelInfoValue(size_t{0}, [&](size_t* out) {
+    return litert_lm_loaded_file_modality_supported_backends(
+        model_info, c_modality, nullptr, 0, out);
+  });
+  if (count == 0) {
     return nullptr;
   }
   std::vector<LiteRtLmBackendType> backends(count);
-  litert_lm_loaded_file_modality_supported_backends(
-      model_info, static_cast<LiteRtLmModality>(modality), backends.data(),
-      count);
-  jintArray result = env->NewIntArray(count);
+  size_t written = GetModelInfoValue(size_t{0}, [&](size_t* out) {
+    return litert_lm_loaded_file_modality_supported_backends(
+        model_info, c_modality, backends.data(), count, out);
+  });
+  count = std::min(count, written);
+  if (count == 0) {
+    return nullptr;
+  }
+  const jsize size = static_cast<jsize>(count);
+  jintArray result = env->NewIntArray(size);
   if (result == nullptr) return nullptr;
   std::vector<jint> j_backends(count);
-  for (int i = 0; i < count; ++i) {
+  for (size_t i = 0; i < count; ++i) {
     j_backends[i] = static_cast<jint>(backends[i]);
   }
-  env->SetIntArrayRegion(result, 0, count, j_backends.data());
+  env->SetIntArrayRegion(result, 0, size, j_backends.data());
   return result;
 }
 
 LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeModalityNpuBrand)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer, jint modality) {
-  return static_cast<jint>(litert_lm_loaded_file_modality_npu_brand(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
-      static_cast<LiteRtLmModality>(modality)));
+  return static_cast<jint>(
+      GetModelInfoValue(kLiteRtLmNpuBrandUnknown, [&](LiteRtLmNpuBrand* out) {
+        return litert_lm_loaded_file_modality_npu_brand(
+            reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
+            static_cast<LiteRtLmModality>(modality), out);
+      }));
 }
 
 // JNI bridge method to get the NPU SoC name string for a given modality.
 LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(nativeModalitySocName)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer, jint modality) {
-  const char* soc_name = litert_lm_loaded_file_modality_soc_name(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
-      static_cast<LiteRtLmModality>(modality));
+  const char* soc_name = GetModelInfoValue(
+      static_cast<const char*>(nullptr), [&](const char** out) {
+        return litert_lm_loaded_file_modality_soc_name(
+            reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
+            static_cast<LiteRtLmModality>(modality), out);
+      });
   if (soc_name == nullptr) {
     return nullptr;
   }
@@ -1644,35 +1914,27 @@ LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(nativeModalitySocName)(
 
 LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeModelType)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return static_cast<jint>(litert_lm_loaded_file_model_type(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer)));
+  return static_cast<jint>(
+      GetModelInfoValue(kLiteRtLmModelTypeUnknown, [&](LiteRtLmModelType* out) {
+        return litert_lm_loaded_file_model_type(
+            reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+      }));
 }
 
 LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeEmbeddingDimension)(
     JNIEnv* env, jclass thiz, jlong model_info_pointer) {
-  return litert_lm_loaded_file_embedding_dimension(
-      reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer));
+  return GetModelInfoValue(int32_t{-1}, [&](int32_t* out) {
+    return litert_lm_loaded_file_embedding_dimension(
+        reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer), out);
+  });
 }
 
 LITERTLM_JNIEXPORT jintArray JNICALL
 JNI_METHOD(nativeEmbeddingSignatureSelection)(JNIEnv* env, jclass thiz,
                                               jlong model_info_pointer) {
-  auto* model_info = reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer);
-  int32_t count = litert_lm_loaded_file_embedding_signature_selection(
-      model_info, nullptr, 0);
-  if (count == -1) {
-    return nullptr;
-  }
-  std::vector<int32_t> lengths(count);
-  litert_lm_loaded_file_embedding_signature_selection(
-      model_info, lengths.data(), count);
-  jintArray result = env->NewIntArray(count);
-  if (result == nullptr) {
-    return nullptr;
-  }
-  env->SetIntArrayRegion(result, 0, count,
-                         reinterpret_cast<const jint*>(lengths.data()));
-  return result;
+  return GetModelInfoIntArray(
+      env, reinterpret_cast<LiteRtLmLoadedFile*>(model_info_pointer),
+      litert_lm_loaded_file_embedding_signature_selection);
 }
 
 LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEmbeddingEngine)(

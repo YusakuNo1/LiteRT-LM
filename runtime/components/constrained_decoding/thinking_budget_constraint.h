@@ -29,10 +29,15 @@ namespace litert::lm {
 //
 // It wraps an optional user-defined constraint (`user_constraint`) using the
 // decorator pattern, forwarding constraint logic to it. When the budget of
-// thinking tokens is exceeded, it overrides the allowed token list to force the
+// thinking tokens is reached, it overrides the allowed token list to force the
 // generation of the thinking end-delimiters (`end_token_ids`, such as
 // `<channel|>`), after which it transitions control back to the wrapped
 // constraint for content generation.
+//
+// Before thinking starts, the mask is the wrapped constraint's mask plus
+// `start_token_ids[0]`. Once `start_token_ids[0]` is sampled, the rest of the
+// start sequence is forced, so `start_token_ids[0]` must only ever begin the
+// thinking channel.
 //
 // Note: For models where the start-of-thought token is prefilled (part of the
 // prompt) instead of decoded, we can set `start_token_ids` to an empty vector.
@@ -60,11 +65,15 @@ class ThinkingBudgetConstraint : public Constraint {
     // or -1 if we are not matching or have finished matching.
     int matching_start_index = 0;
 
-    // The state of the wrapped user constraint, active during the content
-    // phase.
+    // The state of the wrapped user constraint. Set on step 0 and during the
+    // content phase; null while matching later start tokens and while
+    // thinking. A skipped thinking phase advances the step 0 state.
     std::unique_ptr<Constraint::State> user_state = nullptr;
   };
 
+  // `budget` is the maximum number of thinking tokens allowed. A value of 0
+  // forces `end_token_ids` as soon as thinking starts, and a negative value
+  // means unlimited.
   ThinkingBudgetConstraint(Constraint* absl_nullable user_constraint,
                            int budget, std::vector<int> start_token_ids,
                            std::vector<int> end_token_ids, int vocab_size)

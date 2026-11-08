@@ -26,7 +26,6 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json           // from @nlohmann_json
 #include "runtime/components/constrained_decoding/constraint.h"
-#include "runtime/components/prompt_template.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/lfm2_data_processor_config.h"
 #include "runtime/conversation/model_data_processor/model_data_processor.h"
@@ -54,10 +53,6 @@ class Lfm2DataProcessor
   // Returns the config of the Lfm2DataProcessor.
   const Lfm2DataProcessorConfig& GetConfig() const override { return config_; }
 
-  // Formats tool declarations.
-  absl::StatusOr<nlohmann::ordered_json> FormatTools(
-      const nlohmann::ordered_json& tools) const override;
-
   absl::StatusOr<std::unique_ptr<Constraint>> CreateConstraint(
       const nlohmann::ordered_json& tools) const override;
 
@@ -66,12 +61,6 @@ class Lfm2DataProcessor
 
   // Returns the end of tool call blocks.
   absl::string_view CodeFenceEnd() const override;
-
-  absl::StatusOr<SingleTurnTemplateRenderResult> RenderSingleTurnTemplate(
-      std::vector<Message>& history, const Preface& preface,
-      const Message& message, const PromptTemplate& prompt_template,
-      bool current_is_appending_message, bool append_message,
-      std::optional<nlohmann::ordered_json> extra_context) const override;
 
  private:
   explicit Lfm2DataProcessor(

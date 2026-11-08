@@ -28,6 +28,7 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
 #include "flatbuffers/buffer.h"  // from @flatbuffers
 #include "flatbuffers/flatbuffer_builder.h"  // from @flatbuffers
 #include "litert/cc/litert_buffer_ref.h"  // from @litert
@@ -35,6 +36,8 @@
 #include "litert/cc/litert_model.h"  // from @litert
 #include "litert/test/matchers.h"  // from @litert
 #include "runtime/components/model_resources.h"
+#include "runtime/proto/embedding_metadata.pb.h"
+#include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/util/scoped_file.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
 #include "tflite/schema/schema_generated.h"  // from @litert
@@ -201,15 +204,20 @@ class FakeModelResources : public ModelResources {
       : text_model_(text_model), vision_model_(vision_model) {}
 
   absl::StatusOr<const litert::Model*> GetTFLiteModel(
-      ModelType model_type) override {
-    if (model_type == ModelType::kTfLiteTextEncoder) {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    return GetTFLiteModel(TfLiteModelTypeToWireString(model_type));
+  }
+
+  absl::StatusOr<const litert::Model*> GetTFLiteModel(
+      absl::string_view model_type_str) override {
+    if (model_type_str == "tf_lite_text_encoder") {
       if (text_model_ == nullptr) {
         return absl::NotFoundError("Text encoder model not found.");
       }
       return text_model_;
     }
-    if (model_type == ModelType::kTfLiteVisionEncoder ||
-        model_type == ModelType::kTfLiteVisionAdapter) {
+    if (model_type_str == "tf_lite_vision_encoder" ||
+        model_type_str == "tf_lite_vision_adapter") {
       if (vision_model_ == nullptr) {
         return absl::NotFoundError("Vision model not found.");
       }
@@ -219,22 +227,22 @@ class FakeModelResources : public ModelResources {
   }
 
   absl::StatusOr<absl::string_view> GetTFLiteModelBuffer(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return absl::UnimplementedError("");
   }
   absl::StatusOr<std::reference_wrapper<ScopedFile>> GetScopedFile() override {
     return absl::UnimplementedError("");
   }
   absl::StatusOr<std::pair<size_t, size_t>> GetWeightsSectionOffset(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return absl::UnimplementedError("");
   }
   std::optional<std::string> GetTFLiteModelBackendConstraint(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return std::nullopt;
   }
   std::optional<std::string> GetTFLiteModelPreferActivationType(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return std::nullopt;
   }
   absl::StatusOr<std::unique_ptr<Tokenizer>> GetTokenizer() override {
@@ -244,7 +252,7 @@ class FakeModelResources : public ModelResources {
     return absl::UnimplementedError("");
   }
   absl::StatusOr<FileRegion> GetTFLiteModelSectionFileRegion(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return absl::UnimplementedError("");
   }
   absl::StatusOr<const proto::ExecutorMetadata*> GetExecutorMetadata()
@@ -272,7 +280,8 @@ TEST(ModelSignatureUtilsTest, GetAvailableSignaturesForTextEncoder) {
 
   ASSERT_OK_AND_ASSIGN(
       auto signatures,
-      GetAvailableSignatures(model, ModelType::kTfLiteTextEncoder));
+      GetAvailableSignatures(model,
+                             proto::EmbeddingMetadata::TF_LITE_TEXT_ENCODER));
 
   ASSERT_THAT(signatures, SizeIs(3));
 
@@ -306,7 +315,8 @@ TEST(ModelSignatureUtilsTest, GetAvailableSignaturesForVisionModel) {
 
   ASSERT_OK_AND_ASSIGN(
       auto signatures,
-      GetAvailableSignatures(model, ModelType::kTfLiteVisionEncoder));
+      GetAvailableSignatures(model,
+                             proto::EmbeddingMetadata::TF_LITE_VISION_ENCODER));
 
   ASSERT_THAT(signatures, SizeIs(2));
 
@@ -344,14 +354,16 @@ TEST(ModelSignatureUtilsTest, GetAvailableSignaturesFromModelResources) {
 
   ASSERT_OK_AND_ASSIGN(
       auto text_signatures,
-      GetAvailableSignatures(resources, ModelType::kTfLiteTextEncoder));
+      GetAvailableSignatures(resources,
+                             proto::EmbeddingMetadata::TF_LITE_TEXT_ENCODER));
   ASSERT_THAT(text_signatures, SizeIs(1));
   EXPECT_EQ(text_signatures[0].signature_name, "encoder_128");
   EXPECT_EQ(text_signatures[0].length, 128);
 
   ASSERT_OK_AND_ASSIGN(
       auto vision_signatures,
-      GetAvailableSignatures(resources, ModelType::kTfLiteVisionEncoder));
+      GetAvailableSignatures(resources,
+                             proto::EmbeddingMetadata::TF_LITE_VISION_ENCODER));
   ASSERT_THAT(vision_signatures, SizeIs(1));
   EXPECT_EQ(vision_signatures[0].signature_name, "vision_280");
   EXPECT_EQ(vision_signatures[0].length, 280);
@@ -368,9 +380,9 @@ TEST(ModelSignatureUtilsTest, UnsupportedModelTypeReturnsError) {
                            env, ::litert::BufferRef<uint8_t>(
                                     text_buffer.data(), text_buffer.size())));
 
-  EXPECT_THAT(
-      GetAvailableSignatures(text_model, ModelType::kTfLitePrefillDecode),
-      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(GetAvailableSignatures(
+                  text_model, proto::EmbeddingMetadata::TF_LITE_EMBEDDER),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST(ModelSignatureUtilsTest, SelectTextEncoderSignatures_Success) {
@@ -400,6 +412,15 @@ TEST(ModelSignatureUtilsTest, SelectTextEncoderSignatures_Success) {
       SelectTextEncoderSignatures(signatures, /*max_input_length=*/2000),
       StatusIs(absl::StatusCode::kInvalidArgument,
                HasSubstr("exceeds maximum available signature length")));
+
+  // Same, but with min_input_length filtering every signature out first. The
+  // error must still name the real ceiling instead of reporting that nothing
+  // could be selected.
+  EXPECT_THAT(
+      SelectTextEncoderSignatures(signatures, /*max_input_length=*/2000,
+                                  /*min_input_length=*/2000),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("exceeds maximum available signature length (1024)")));
 
   // min_input_length filtering
   ASSERT_OK_AND_ASSIGN(
@@ -520,6 +541,65 @@ TEST(ModelSignatureUtilsTest,
   std::vector<SignatureInfo> signatures;
   EXPECT_THAT(SelectVisionEncoderSignatures(signatures, 100),
               StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(ModelSignatureUtilsTest,
+     SelectVisionEncoderSignatures_MinVisionTokensSkipsSmallerSignatures) {
+  std::vector<SignatureInfo> signatures = {
+      {.signature_name = "vision_280", .length = 280},
+      {.signature_name = "vision_70", .length = 70},
+      {.signature_name = "vision_140", .length = 140},
+  };
+
+  // min == max selects a single signature.
+  ASSERT_OK_AND_ASSIGN(
+      auto result_140,
+      SelectVisionEncoderSignatures(signatures, /*vision_tokens_per_image=*/140,
+                                    /*min_vision_tokens_per_image=*/140));
+  EXPECT_THAT(result_140.signature_names, ElementsAre("vision_140"));
+
+  // min == max between signature sizes selects the next larger signature.
+  ASSERT_OK_AND_ASSIGN(
+      auto result_200,
+      SelectVisionEncoderSignatures(signatures, /*vision_tokens_per_image=*/200,
+                                    /*min_vision_tokens_per_image=*/200));
+  EXPECT_THAT(result_200.signature_names, ElementsAre("vision_280"));
+
+  // A lower min keeps the signatures in [min, max].
+  ASSERT_OK_AND_ASSIGN(
+      auto result_100_280,
+      SelectVisionEncoderSignatures(signatures, /*vision_tokens_per_image=*/280,
+                                    /*min_vision_tokens_per_image=*/100));
+  EXPECT_THAT(result_100_280.signature_names,
+              ElementsAre("vision_140", "vision_280"));
+}
+
+TEST(ModelSignatureUtilsTest,
+     SelectVisionEncoderSignatures_InvalidMinVisionTokensReturnsError) {
+  std::vector<SignatureInfo> signatures = {
+      {.signature_name = "vision_70", .length = 70},
+      {.signature_name = "vision_140", .length = 140},
+  };
+  EXPECT_THAT(SelectVisionEncoderSignatures(signatures, 140, -1),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(SelectVisionEncoderSignatures(signatures, 70, 140),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("must not exceed")));
+}
+
+TEST(ModelSignatureUtilsTest,
+     SelectVisionAdapterSignatures_MinVisionTokensSelectsSingleSignature) {
+  std::vector<SignatureInfo> signatures = {
+      {.signature_name = "adapter_280", .length = 280},
+      {.signature_name = "adapter_70", .length = 70},
+      {.signature_name = "adapter_140", .length = 140},
+  };
+  ASSERT_OK_AND_ASSIGN(
+      auto result,
+      SelectVisionAdapterSignatures(signatures, /*vision_tokens_per_image=*/280,
+                                    /*min_vision_tokens_per_image=*/280));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_THAT(result->signature_names, ElementsAre("adapter_280"));
 }
 
 TEST(ModelSignatureUtilsTest, SelectVisionAdapterSignatures_Success) {

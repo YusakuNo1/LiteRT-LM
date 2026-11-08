@@ -28,7 +28,10 @@ target_include_directories(schema_model_info
 
 target_link_libraries(schema_model_info
   PUBLIC
+    LiteRTLM::Runtime::Engine::Defaults
     LiteRTLM::Schema::Core::HeaderSchema
     LiteRTLM::Schema::Core::Read
+    LiteRTLM::Support::Util::MemoryMappedFile
+    LiteRTLM::Support::Util::ScopedFile
     LITERTLM_DEPS
 )

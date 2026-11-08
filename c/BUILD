@@ -15,6 +15,7 @@
 # [Google-internal load of `cc_binary`]
 # [Google-internal load of `cc_library`]
 # [Google-internal load of `cc_test`]
+load("//:version.bzl", "C_API_VERSION")
 
 package(
     default_hdrs_check = "strict",
@@ -67,6 +68,7 @@ ENGINE_LITE_COMMON_DEPS = [
     "//runtime/engine:io_types",
     "//runtime/executor:executor_settings_base",
     "//runtime/executor:llm_executor_settings",
+    "//runtime/executor:speculative_decoding_mode",
     "//runtime/proto:engine_cc_proto",
     "//runtime/proto:llm_metadata_cc_proto",
     "//runtime/proto:sampler_params_cc_proto",
@@ -95,6 +97,7 @@ EMBEDDING_ENGINE_DEPS = [
     "//runtime/engine:embedding_engine_settings",
     "//runtime/executor:embedding_executor_base",
     "//runtime/executor:litert_compiled_model_executor_utils",
+    "//runtime/proto:embedding_metadata_cc_proto",
 ]
 
 MODEL_INFO_DEPS = [
@@ -166,7 +169,10 @@ cc_library(
     name = "conversation_headers",
     hdrs = ["conversation.h"],
     visibility = ["//visibility:public"],
-    deps = [":engine_headers"],
+    deps = [
+        ":engine_headers",
+        ":error_reporter_headers",
+    ],
 )
 
 # Header library for model info C API.
@@ -174,7 +180,10 @@ cc_library(
     name = "model_info_headers",
     hdrs = ["model_info.h"],
     visibility = ["//visibility:public"],
-    deps = [":engine_headers"],
+    deps = [
+        ":engine_headers",
+        ":error_reporter_headers",
+    ],
 )
 
 # Header library for embedding engine C API.
@@ -182,7 +191,11 @@ cc_library(
     name = "embedding_engine_headers",
     hdrs = ["embedding_engine.h"],
     visibility = ["//visibility:public"],
-    deps = [":engine_headers"],
+    deps = [
+        ":api_export_headers",
+        ":engine_headers",
+        ":error_reporter_headers",
+    ],
 )
 
 # Header library for experimental C API.
@@ -192,7 +205,47 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":api_export_headers",
+        ":conversation_headers",
         ":engine_headers",
+        ":error_reporter_headers",
+    ],
+)
+
+# Checks that all public C API headers compile together as C. Outside Windows,
+# it uses strict C99 so that C11-only constructs (such as a repeated typedef)
+# and declarations without prototypes fail the build.
+cc_test(
+    name = "litert_lm_c_api_common_test",
+    srcs = ["litert_lm_c_api_common_test.c"],
+    copts = select({
+        # clang-cl has no C99 mode, so Windows uses the toolchain defaults.
+        "@platforms//os:windows": [],
+        "//conditions:default": [
+            "-std=c99",
+            "-pedantic-errors",
+            "-Wstrict-prototypes",
+            "-Werror",
+            # The toolchain may treat headers under third_party/ as system
+            # headers, which hides the diagnostics above. Check these headers
+            # like user code.
+            "--no-system-header-prefix=c/",
+        ],
+    }),
+    target_compatible_with = select({
+        "@platforms//os:ios": [],
+        "@platforms//os:linux": [],
+        "@platforms//os:osx": [],
+        "@platforms//os:windows": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":api_export_headers",
+        ":conversation_headers",
+        ":embedding_engine_headers",
+        ":engine_headers",
+        ":error_reporter_headers",
+        ":experimental_headers",
+        ":model_info_headers",
     ],
 )
 
@@ -208,6 +261,7 @@ cc_library(
         "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
+        "//runtime/executor:speculative_decoding_mode",
         "//runtime/proto:token_cc_proto",
     ],
 )
@@ -267,7 +321,7 @@ cc_library(
     defines = LITERT_LM_DEBUGGER_DEFINES,
     visibility = ["//visibility:public"],
     deps = ENGINE_LITE_COMMON_DEPS + [
-        "//runtime/core:engine_impl",
+        "//runtime/engine:engine_impl_selected",
     ],
     alwayslink = True,
 )
@@ -287,8 +341,9 @@ cc_library(
     defines = LITERT_LM_DEBUGGER_DEFINES,
     visibility = ["//visibility:public"],
     deps = ENGINE_LITE_COMMON_DEPS + [
-        "//runtime/core:engine_advanced_impl_cpu_only",
+        "//runtime/engine:engine_impl_cpu_only_selected",
     ],
+    alwayslink = True,
 )
 
 cc_test(
@@ -340,7 +395,7 @@ cc_library(
     defines = LITERT_LM_DEBUGGER_DEFINES,
     visibility = ["//visibility:public"],
     deps = ENGINE_COMMON_DEPS + [
-        "//runtime/core:engine_impl",
+        "//runtime/engine:engine_impl_selected",
     ],
     alwayslink = True,
 )
@@ -368,8 +423,9 @@ cc_library(
     defines = LITERT_LM_DEBUGGER_DEFINES,
     visibility = ["//visibility:public"],
     deps = ENGINE_COMMON_DEPS + [
-        "//runtime/core:engine_advanced_impl_cpu_only",
+        "//runtime/engine:engine_impl_cpu_only_selected",
     ],
+    alwayslink = True,
 )
 
 cc_test(
@@ -399,6 +455,10 @@ cc_test(
     data = [
         "//runtime/testdata",
     ],
+    # Lets the test check that the version macros in engine.h match version.bzl.
+    local_defines = [
+        'LITERT_LM_EXPECTED_C_API_VERSION=\\"' + C_API_VERSION + '\\"',
+    ],
     tags = ["requires-mac-inputs:hard"],
     target_compatible_with = select({
         "@platforms//os:ios": [],
@@ -413,16 +473,22 @@ cc_test(
         ":engine",
         ":engine_headers",
         ":engine_internal",
+        ":experimental_headers",
+        ":experimental_internal",
         "@com_google_googletest//:gtest_main",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "//runtime/conversation",
         "//runtime/conversation:io_types",
         "//runtime/conversation:thinking_config",
         "//runtime/engine:engine_settings",
+        "//runtime/engine:io_types",
         "//runtime/executor:executor_settings_base",
         "//runtime/executor:llm_executor_settings",
+        "//runtime/executor:speculative_decoding_mode",
+        "//runtime/util:test_utils",
     ],
 )
 
@@ -469,6 +535,7 @@ cc_test(
         ":error_reporter_internal",
         "@com_google_googletest//:gtest_main",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
     ],
 )
 
@@ -482,11 +549,23 @@ cc_binary(
         "experimental.cc",
         "model_info.cc",
     ],
+    # Used only on Linux and Android; see the default branch of `linkopts`.
+    additional_linker_inputs = [":litert_lm_c_api_linux.lds"],
     copts = ["-fvisibility=hidden"],
     features = ["-legacy_whole_archive"],
     linkopts = select({
-        "@platforms//os:macos": [],
-        "@platforms//os:ios": [],
+        "@platforms//os:macos": [
+            # Export only the public C API symbols to hide internal C++ symbols.
+            "-Wl,-exported_symbol,_litert_lm_*",
+            # Remove unreachable code and data to reduce library size.
+            "-Wl,-dead_strip",
+        ],
+        "@platforms//os:ios": [
+            # Export only the public C API symbols to hide internal C++ symbols.
+            "-Wl,-exported_symbol,_litert_lm_*",
+            # Remove unreachable code and data to reduce library size.
+            "-Wl,-dead_strip",
+        ],
         "@platforms//os:windows": [],
         "//conditions:default": [
             # Report unresolved symbol references as errors during linking.
@@ -499,6 +578,10 @@ cc_binary(
             "-Wl,-Bsymbolic",
             # Update the rpath
             "-Wl,-rpath,$$ORIGIN",
+            # Export only the public C API symbols, in version node
+            # LITERT_LM_C_API_1.0, to hide internal C++ symbols. -fvisibility
+            # above does not apply to statically linked dependencies.
+            "-Wl,--version-script=$(execpath :litert_lm_c_api_linux.lds)",
         ],
     }),
     linkshared = 1,
@@ -508,7 +591,7 @@ cc_binary(
         ":engine_headers",
         ":experimental_headers",
         ":model_info_headers",
-        "//runtime/core:engine_impl",
+        "//runtime/engine:engine_impl_selected",
     ] + select({
         "//conditions:default": [],
     }),

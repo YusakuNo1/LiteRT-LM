@@ -16,9 +16,17 @@
 #define THIRD_PARTY_ODML_LITERT_LM_SUPPORT_PREPROCESSOR_AUDIO_PREPROCESSOR_H_
 
 #include <array>
+#include <cstddef>
 #include <ostream>
+#include <utility>
 
+#include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "litert/cc/litert_element_type.h"  // from @litert
+#include "litert/cc/litert_layout.h"  // from @litert
+#include "litert/cc/litert_macros.h"  // from @litert
+#include "litert/cc/litert_ranked_tensor_type.h"  // from @litert
+#include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "support/util/io_types.h"
 #include "support/util/status_macros.h"  // IWYU pragma: keep
 
@@ -144,6 +152,8 @@ class AudioPreprocessorConfig {
     os << "  non_zero_hanning: " << config.GetNonZeroHanning() << "\n";
     os << "  periodic_hanning: " << config.GetPeriodicHanning() << "\n";
     os << "  fft_padding_type: " << config.GetFftPaddingType() << "\n";
+    os << "  slaney_mel: " << config.GetSlaneyMel() << "\n";
+    os << "  power_spectrum: " << config.GetPowerSpectrum() << "\n";
     os << "  skip_mel_spectrogram_extraction: "
        << config.SkipMelSpectrogramExtraction() << "\n";
     os << "  buffer_last_frame: " << config.BufferLastFrame() << "\n";
@@ -200,6 +210,11 @@ class AudioPreprocessorConfig {
   bool GetPeriodicHanning() const { return periodic_hanning_; }
   // The padding type used for FFT.
   FftPaddingType GetFftPaddingType() const { return fft_padding_type_; }
+  // librosa-compatible mel filterbank (Slaney scale and normalization) and
+  // power-spectrum summation (applied when `slaney_mel` is true); off by
+  // default to keep existing models as is.
+  bool GetSlaneyMel() const { return slaney_mel_; }
+  bool GetPowerSpectrum() const { return power_spectrum_; }
   // Whether to skip the Mel spectrogram extraction.
   bool SkipMelSpectrogramExtraction() const {
     return skip_mel_spectrogram_extraction_;
@@ -242,6 +257,10 @@ class AudioPreprocessorConfig {
   }
   void SetFftPaddingType(FftPaddingType fft_padding_type) {
     fft_padding_type_ = fft_padding_type;
+  }
+  void SetSlaneyMel(bool slaney_mel) { slaney_mel_ = slaney_mel; }
+  void SetPowerSpectrum(bool power_spectrum) {
+    power_spectrum_ = power_spectrum;
   }
   void SetSkipMelSpectrogramExtraction(bool skip_mel_spectrogram_extraction) {
     skip_mel_spectrogram_extraction_ = skip_mel_spectrogram_extraction;
@@ -399,6 +418,8 @@ class AudioPreprocessorConfig {
   FftPaddingType fft_padding_type_;
   bool skip_mel_spectrogram_extraction_;
   bool buffer_last_frame_;
+  bool slaney_mel_ = false;
+  bool power_spectrum_ = false;
 };
 
 // Interface for audio preprocessing.
@@ -412,6 +433,48 @@ class AudioPreprocessor {
 
   // Reset the audio preprocessor to the initial state.
   virtual void Reset() = 0;
+
+  // Returns the dimensions of the tensor that Preprocess() would produce for
+  // `input_audio` in the preprocessor's current state, without computing the
+  // preprocessed audio or modifying the preprocessor's state.
+  //
+  // This lets callers that only need the shape of the preprocessed audio, such
+  // as PreprocessDryRun(), avoid the cost of a full Preprocess() call.
+  virtual absl::StatusOr<Dimensions> GetPreprocessedAudioDimensions(
+      const InputAudio& input_audio) const {
+    return absl::UnimplementedError(
+        "Getting the preprocessed audio dimensions is not implemented.");
+  }
+
+  // A dry run of Preprocess(): returns an InputAudio holding an uninitialized
+  // tensor with the shape Preprocess() would produce, which is enough to count
+  // the tokens the audio consumes, without computing the audio features or
+  // modifying the preprocessor's state. The result must not be fed to an audio
+  // encoder.
+  //
+  // Falls back to a full Preprocess() call if GetPreprocessedAudioDimensions()
+  // is not implemented.
+  absl::StatusOr<InputAudio> PreprocessDryRun(const InputAudio& input_audio) {
+    absl::StatusOr<Dimensions> dimensions =
+        GetPreprocessedAudioDimensions(input_audio);
+    if (absl::IsUnimplemented(dimensions.status())) {
+      return Preprocess(input_audio);
+    }
+    if (!dimensions.ok()) {
+      return dimensions.status();
+    }
+    size_t num_elements = 1;
+    for (const int dimension : *dimensions) {
+      num_elements *= dimension;
+    }
+    LITERT_ASSIGN_OR_RETURN(
+        ::litert::TensorBuffer audio_tensor,
+        ::litert::TensorBuffer::CreateManagedHostMemory(
+            ::litert::RankedTensorType(::litert::GetElementType<float>(),
+                                       ::litert::Layout(*dimensions)),
+            num_elements * sizeof(float)));
+    return InputAudio(std::move(audio_tensor));
+  }
 };
 
 std::ostream& operator<<(

@@ -133,6 +133,18 @@ enum AnySectionDataType:ubyte {
 
   // A litert.lm.proto.ExecutorMetadata Protobuf.
   ExecutorMetadataProto,
+
+  // A litert.lm.proto.Text2SpeechMetadata Protobuf.
+  Text2SpeechMetadataProto,
+
+  // A litert.lm.proto.Speech2TextMetadata Protobuf.
+  Speech2TextMetadataProto,
+
+  // A litert.lm.proto.Text2ImageMetadata Protobuf.
+  Text2ImageMetadataProto,
+
+  // A litert.lm.proto.Any2AnyMetadata Protobuf.
+  Any2AnyMetadataProto,
 }
 
 // Section offsets and datatype

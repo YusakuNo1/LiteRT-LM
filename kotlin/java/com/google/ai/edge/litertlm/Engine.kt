@@ -71,6 +71,10 @@ class Engine(val engineConfig: EngineConfig) : AutoCloseable {
           ?.let { it.threadCount ?: it.numOfThreads }
           ?.let { if (it > 0) it else -1 } ?: -1
 
+      // Keep backward compatibility with the deprecated
+      // ExperimentalFlags.enableSpeculativeDecoding; the native side uses it only when
+      // EngineConfig.speculativeDecodingConfig sets no mode.
+      @Suppress("DEPRECATION")
       handle =
         LiteRtLmJni.nativeCreateEngine(
           engineConfig.modelPath,
@@ -91,6 +95,8 @@ class Engine(val engineConfig: EngineConfig) : AutoCloseable {
           audioBackendNumThreads,
           @OptIn(ExperimentalApi::class) ExperimentalFlags.visualTokenBudget ?: -1,
           engineConfig.activationDataType?.value ?: -1,
+          @OptIn(ExperimentalApi::class) ExperimentalFlags.enableYnnpack,
+          engineConfig.speculativeDecodingConfig?.mode?.value,
         )
     }
   }
@@ -147,6 +153,10 @@ class Engine(val engineConfig: EngineConfig) : AutoCloseable {
         }
 
       @OptIn(ExperimentalApi::class) // opt-in experimental flags
+      // Keep backward compatibility with deprecated ExperimentalFlags.overwritePromptTemplate and
+      // ConversationConfig.enableSpeculativeDecoding; these fallbacks will be removed when the
+      // deprecated properties are deleted.
+      @Suppress("DEPRECATION")
       return Conversation(
         LiteRtLmJni.nativeCreateConversation(
           handle!!, // Using !! is okay. Checked initialization already.
@@ -165,6 +175,7 @@ class Engine(val engineConfig: EngineConfig) : AutoCloseable {
           conversationConfig.thinkingConfig,
           conversationConfig.enableResponseFormat,
           conversationConfig.enableSpeculativeDecoding,
+          conversationConfig.speculativeDecodingConfig?.mode?.value,
         ),
         toolManager,
         conversationConfig.automaticToolCalling,
@@ -185,6 +196,8 @@ class Engine(val engineConfig: EngineConfig) : AutoCloseable {
       checkInitialized()
 
       // Using !! is okay. Checked initialization already.
+      // Keep backward compatibility with deprecated SessionConfig.enableSpeculativeDecoding.
+      @Suppress("DEPRECATION")
       return Session(
         LiteRtLmJni.nativeCreateSession(
           handle!!,
@@ -192,6 +205,7 @@ class Engine(val engineConfig: EngineConfig) : AutoCloseable {
           sessionConfig.loraConfig?.loraPath,
           sessionConfig.loraConfig?.audioLoraPath,
           sessionConfig.enableSpeculativeDecoding,
+          sessionConfig.speculativeDecodingConfig?.mode?.value,
         )
       )
     }

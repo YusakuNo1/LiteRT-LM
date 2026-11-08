@@ -31,14 +31,18 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "flatbuffers/buffer.h"  // from @flatbuffers
 #include "flatbuffers/flatbuffer_builder.h"  // from @flatbuffers
+#include "flatbuffers/vector.h"  // from @flatbuffers
 #include "litert/c/litert_common.h"  // from @litert
 #include "litert/c/options/litert_gpu_options.h"  // from @litert
 #include "litert/cc/litert_buffer_ref.h"  // from @litert
+#include "litert/cc/litert_common.h"  // from @litert
+#include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_element_type.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_layout.h"  // from @litert
@@ -55,6 +59,7 @@
 #include "runtime/components/model_resources.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/proto/executor_metadata.pb.h"
+#include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/util/file_util.h"
 #include "runtime/util/litert_lm_loader.h"
 #include "runtime/util/memory_mapped_file.h"
@@ -63,6 +68,7 @@
 #include "schema/core/litertlm_header.h"
 #include "schema/core/litertlm_header_schema_generated.h"
 #include "tensorflow/compiler/mlir/lite/allocation.h"  // from @org_tensorflow
+#include "tflite/schema/schema_generated.h"  // from @litert
 #include "tflite/types/half.h"  // from @litert
 
 namespace litert::lm {
@@ -88,7 +94,8 @@ void BuildAotTestHeader(flatbuffers::FlatBufferBuilder& builder,
   builder.Clear();
   auto prefill_model_type = schema::CreateKeyValuePair(
       builder, "model_type",
-      ModelTypeToString(ModelType::kTfLitePrefillDecode));
+      proto::LlmMetadata::TfLiteModelType_Name(
+          proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
   auto prefill_items = builder.CreateVector(
       std::vector<flatbuffers::Offset<schema::KeyValuePair>>{
           prefill_model_type});
@@ -96,8 +103,10 @@ void BuildAotTestHeader(flatbuffers::FlatBufferBuilder& builder,
       builder, prefill_items, prefill_begin, prefill_end,
       schema::AnySectionDataType_TFLiteModel);
 
-  auto aux_model_type = schema::CreateKeyValuePair(
-      builder, "model_type", ModelTypeToString(ModelType::kTfLiteAux));
+  auto aux_model_type =
+      schema::CreateKeyValuePair(builder, "model_type",
+                                 proto::LlmMetadata::TfLiteModelType_Name(
+                                     proto::LlmMetadata::TF_LITE_AUX));
   auto aux_items = builder.CreateVector(
       std::vector<flatbuffers::Offset<schema::KeyValuePair>>{aux_model_type});
   auto aux_section =
@@ -298,6 +307,16 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest, GetKVCacheRootNames_KvCacheC) {
       GetKVCacheRootNames(input_names, output_names, k_root_name, v_root_name));
   EXPECT_EQ(k_root_name, "kv_cache_c_");
   EXPECT_EQ(v_root_name, "kv_cache_c_");
+}
+
+TEST(LlmLiteRTCompiledModelExecutorUtilsTest, IsLinearAttentionStateName) {
+  EXPECT_TRUE(IsLinearAttentionStateName("kv_cache_c_0"));
+  EXPECT_TRUE(IsLinearAttentionStateName("kv_cache_r_12"));
+  EXPECT_FALSE(IsLinearAttentionStateName("kv_cache_k_0"));
+  EXPECT_FALSE(IsLinearAttentionStateName("kv_cache_v_0"));
+  EXPECT_FALSE(IsLinearAttentionStateName("k_cache_0"));
+  EXPECT_FALSE(IsLinearAttentionStateName("input_pos"));
+  EXPECT_FALSE(IsLinearAttentionStateName(""));
 }
 
 TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
@@ -536,8 +555,9 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest, GetPrefillRunnerSetFromModel) {
   ASSERT_OK_AND_ASSIGN(auto model_resources,
                        BuildLiteRtCompiledModelResources(*model_assets));
   ASSERT_NE(model_resources, nullptr);
-  ASSERT_OK_AND_ASSIGN(auto litert_model, model_resources->GetTFLiteModel(
-                                              ModelType::kTfLitePrefillDecode));
+  ASSERT_OK_AND_ASSIGN(auto litert_model,
+                       model_resources->GetTFLiteModel(
+                           proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
   ASSERT_NE(litert_model, nullptr);
 
   ASSERT_OK_AND_ASSIGN(
@@ -545,6 +565,104 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest, GetPrefillRunnerSetFromModel) {
       GetPrefillRunnerSetFromModel(*litert_model, "prefill",
                                    /*input_positions_name=*/"input_pos"));
   EXPECT_THAT(prefill_runner_set, ElementsAre(Pair(160, "prefill")));
+}
+
+class GetPrefillRunnerSetFromCompiledModelTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    auto model_path =
+        std::filesystem::path(::testing::SrcDir()) /
+        "litert_lm/runtime/testdata/test_lm.task";
+    ASSERT_OK_AND_ASSIGN(auto model_assets,
+                         ModelAssets::Create(model_path.string()));
+    ASSERT_OK_AND_ASSIGN(model_resources_,
+                         BuildLiteRtCompiledModelResources(model_assets));
+    ASSERT_NE(model_resources_, nullptr);
+    ASSERT_OK_AND_ASSIGN(auto model_buffer_view,
+                         model_resources_->GetTFLiteModelBuffer(
+                             proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
+    ::litert::BufferRef<uint8_t> model_buffer(
+        reinterpret_cast<const uint8_t*>(model_buffer_view.data()),
+        model_buffer_view.size());
+
+    LITERT_ASSERT_OK_AND_ASSIGN(auto env, ::litert::Environment::Create({}));
+    env_.emplace(std::move(env));
+    LITERT_ASSERT_OK_AND_ASSIGN(::litert::Options compilation_options,
+                                ::litert::Options::Create());
+    compilation_options.SetHardwareAccelerators(::litert::HwAccelerators::kCpu);
+    LITERT_ASSERT_OK_AND_ASSIGN(auto compiled_model,
+                                ::litert::CompiledModel::Create(
+                                    *env_, model_buffer, compilation_options));
+    compiled_model_.emplace(std::move(compiled_model));
+  }
+
+  std::unique_ptr<ModelResources> model_resources_;
+  std::optional<::litert::Environment> env_;
+  std::optional<::litert::CompiledModel> compiled_model_;
+};
+
+TEST_F(GetPrefillRunnerSetFromCompiledModelTest, ReturnsPrefillSignatures) {
+  ASSERT_OK_AND_ASSIGN(
+      auto prefill_runner_set,
+      GetPrefillRunnerSetFromModel(*compiled_model_, "prefill",
+                                   /*input_positions_name=*/"input_pos"));
+  EXPECT_THAT(prefill_runner_set, ElementsAre(Pair(160, "prefill")));
+}
+
+TEST_F(GetPrefillRunnerSetFromCompiledModelTest,
+       MatchesFlatbufferModelOverload) {
+  ASSERT_OK_AND_ASSIGN(auto litert_model,
+                       model_resources_->GetTFLiteModel(
+                           proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
+  ASSERT_NE(litert_model, nullptr);
+  ASSERT_OK_AND_ASSIGN(
+      auto expected,
+      GetPrefillRunnerSetFromModel(*litert_model, "prefill",
+                                   /*input_positions_name=*/"input_pos"));
+  ASSERT_OK_AND_ASSIGN(auto actual, GetPrefillRunnerSetFromModel(
+                                        *compiled_model_, "prefill",
+                                        /*input_positions_name=*/"input_pos"));
+  EXPECT_EQ(actual, expected);
+}
+
+TEST_F(GetPrefillRunnerSetFromCompiledModelTest,
+       MatchingSelectedSignatureIsKept) {
+  const std::vector<std::string> selected_signatures = {"prefill"};
+  ASSERT_OK_AND_ASSIGN(
+      auto prefill_runner_set,
+      GetPrefillRunnerSetFromModel(*compiled_model_, "prefill",
+                                   /*input_positions_name=*/"input_pos",
+                                   selected_signatures));
+  EXPECT_THAT(prefill_runner_set, ElementsAre(Pair(160, "prefill")));
+}
+
+TEST_F(GetPrefillRunnerSetFromCompiledModelTest,
+       NonMatchingSelectedSignatureFiltersAll) {
+  // A non-matching selected signature filters out all prefill runners.
+  const std::vector<std::string> selected_signatures = {"decode"};
+  ASSERT_OK_AND_ASSIGN(
+      auto prefill_runner_set,
+      GetPrefillRunnerSetFromModel(*compiled_model_, "prefill",
+                                   /*input_positions_name=*/"input_pos",
+                                   selected_signatures));
+  EXPECT_TRUE(prefill_runner_set.empty());
+}
+
+TEST_F(GetPrefillRunnerSetFromCompiledModelTest,
+       NonMatchingSignatureNameBaseReturnsEmpty) {
+  ASSERT_OK_AND_ASSIGN(
+      auto prefill_runner_set,
+      GetPrefillRunnerSetFromModel(*compiled_model_, "nonexistent_prefix",
+                                   /*input_positions_name=*/"input_pos"));
+  EXPECT_TRUE(prefill_runner_set.empty());
+}
+
+TEST_F(GetPrefillRunnerSetFromCompiledModelTest,
+       MissingInputPositionsTensorReturnsError) {
+  EXPECT_FALSE(
+      GetPrefillRunnerSetFromModel(*compiled_model_, "prefill",
+                                   /*input_positions_name=*/"nonexistent_input")
+          .ok());
 }
 
 TEST(LlmLiteRTCompiledModelExecutorUtilsTest, InitializeAttentionMask_Float32) {
@@ -1300,7 +1418,8 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
   ASSERT_OK_AND_ASSIGN(auto model_resources,
                        BuildLiteRtCompiledModelResources(*model_assets));
   ASSERT_NE(model_resources, nullptr);
-  ASSERT_OK(model_resources->GetTFLiteModel(ModelType::kTfLitePrefillDecode));
+  ASSERT_OK(model_resources->GetTFLiteModel(
+      proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
 }
 
 TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
@@ -1313,7 +1432,7 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
   ASSERT_OK_AND_ASSIGN(auto source_loader,
                        LitertLmLoader::Create(std::move(source_file)));
   auto model_buffer =
-      source_loader->GetTFLiteModel(ModelType::kTfLitePrefillDecode);
+      source_loader->GetTFLiteModel(proto::LlmMetadata::TF_LITE_PREFILL_DECODE);
   ASSERT_GT(model_buffer.Size(), 0);
 
   const auto aot_model_path = std::filesystem::path(::testing::TempDir()) /
@@ -1327,8 +1446,9 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
       BuildLiteRtCompiledModelResources(
           model_assets, /*enable_file_backed_model_loading=*/false,
           /*enable_file_backed_for_aot_npu=*/true));
-  ASSERT_OK_AND_ASSIGN(const auto* model, model_resources->GetTFLiteModel(
-                                              ModelType::kTfLitePrefillDecode));
+  ASSERT_OK_AND_ASSIGN(const auto* model,
+                       model_resources->GetTFLiteModel(
+                           proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
   EXPECT_TRUE(IsFileBacked(*model));
 }
 
@@ -1345,8 +1465,9 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
       BuildLiteRtCompiledModelResources(
           model_assets, /*enable_file_backed_model_loading=*/false,
           /*enable_file_backed_for_aot_npu=*/true));
-  ASSERT_OK_AND_ASSIGN(const auto* model, model_resources->GetTFLiteModel(
-                                              ModelType::kTfLitePrefillDecode));
+  ASSERT_OK_AND_ASSIGN(const auto* model,
+                       model_resources->GetTFLiteModel(
+                           proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
   EXPECT_FALSE(IsFileBacked(*model));
 }
 
@@ -1364,7 +1485,8 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
   ASSERT_OK_AND_ASSIGN(auto model_resources,
                        BuildLiteRtCompiledModelResources(*model_assets));
   ASSERT_NE(model_resources, nullptr);
-  ASSERT_OK(model_resources->GetTFLiteModel(ModelType::kTfLitePrefillDecode));
+  ASSERT_OK(model_resources->GetTFLiteModel(
+      proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
 }
 
 TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
@@ -1380,7 +1502,8 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
   ASSERT_OK_AND_ASSIGN(auto model_resources,
                        BuildLiteRtCompiledModelResources(*model_assets));
   ASSERT_NE(model_resources, nullptr);
-  ASSERT_OK(model_resources->GetTFLiteModel(ModelType::kTfLitePrefillDecode));
+  ASSERT_OK(model_resources->GetTFLiteModel(
+      proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
 }
 
 TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
@@ -1397,7 +1520,8 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
   ASSERT_OK_AND_ASSIGN(auto model_resources,
                        BuildLiteRtCompiledModelResources(*model_assets));
   ASSERT_NE(model_resources, nullptr);
-  ASSERT_OK(model_resources->GetTFLiteModel(ModelType::kTfLitePrefillDecode));
+  ASSERT_OK(model_resources->GetTFLiteModel(
+      proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
 }
 
 TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
@@ -1750,10 +1874,17 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
   EXPECT_EQ(cache_data.cache_key, expected_cache_key);
 }
 
+ModelAssets CreateDummyModelAssets() {
+  absl::StatusOr<ModelAssets> assets = ModelAssets::Create("dummy_path");
+  if (!assets.ok()) {
+    std::abort();
+  }
+  return *std::move(assets);
+}
+
 class DummyExecutorSettings : public ExecutorSettingsBase {
  public:
-  DummyExecutorSettings()
-      : ExecutorSettingsBase(*ModelAssets::Create("dummy_path")) {}
+  DummyExecutorSettings() : ExecutorSettingsBase(CreateDummyModelAssets()) {}
 };
 
 LiteRtDelegatePrecision GetGpuPrecision(const litert::GpuOptions& gpu_options) {
@@ -1794,6 +1925,17 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
                 &convert_weights, gpu_options.Get()),
             kLiteRtStatusOk);
   EXPECT_TRUE(convert_weights);
+
+  bool use_ir_model = true;
+  EXPECT_EQ(LrtGetGpuOptionsUseIrModel(&use_ir_model, gpu_options.Get()),
+            kLiteRtStatusOk);
+  EXPECT_FALSE(use_ir_model);
+
+  executor_settings.SetUseIrModel(true);
+  EXPECT_OK(SetCommonGpuOptions(executor_settings, gpu_options));
+  EXPECT_EQ(LrtGetGpuOptionsUseIrModel(&use_ir_model, gpu_options.Get()),
+            kLiteRtStatusOk);
+  EXPECT_TRUE(use_ir_model);
 
   bool prefer_texture = false;
   EXPECT_EQ(LrtGetGpuAcceleratorCompilationOptionsPreferTextureWeights(
@@ -1911,8 +2053,25 @@ class FakeExternalWeightModelResources : public ModelResources {
         scoped_file_(std::move(scoped_file)) {}
   ~FakeExternalWeightModelResources() override = default;
 
+  // Serves `model_buffer` from GetTFLiteModelBuffer so that the external
+  // buffer groups declared by the model drive the section lookup.
+  void SetModelBuffer(std::string model_buffer) {
+    model_buffer_ = std::move(model_buffer);
+  }
+
+  // Registers the TFLiteWeights section of another model type. Model types
+  // without a registered section use the constructor's `section_offset`.
+  void SetWeightsSection(proto::LlmMetadata::TfLiteModelType model_type,
+                         std::pair<size_t, size_t> offsets) {
+    weights_sections_[model_type] = offsets;
+  }
+
   absl::StatusOr<std::pair<size_t, size_t>> GetWeightsSectionOffset(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    if (const auto it = weights_sections_.find(model_type);
+        it != weights_sections_.end()) {
+      return it->second;
+    }
     return section_offset_;
   }
 
@@ -1924,27 +2083,30 @@ class FakeExternalWeightModelResources : public ModelResources {
   }
 
   absl::StatusOr<const litert::Model*> GetTFLiteModel(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return absl::UnimplementedError("Unimplemented");
   }
 
   absl::StatusOr<absl::string_view> GetTFLiteModelBuffer(
-      ModelType model_type) override {
-    return absl::UnimplementedError("Unimplemented");
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    if (!model_buffer_.has_value()) {
+      return absl::UnimplementedError("Unimplemented");
+    }
+    return absl::string_view(*model_buffer_);
   }
 
   absl::StatusOr<FileRegion> GetTFLiteModelSectionFileRegion(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return absl::UnimplementedError("Unimplemented");
   }
 
   std::optional<std::string> GetTFLiteModelBackendConstraint(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return std::nullopt;
   }
 
   std::optional<std::string> GetTFLiteModelPreferActivationType(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return std::nullopt;
   }
 
@@ -1964,7 +2126,38 @@ class FakeExternalWeightModelResources : public ModelResources {
  private:
   absl::StatusOr<std::pair<size_t, size_t>> section_offset_;
   std::optional<ScopedFile> scoped_file_;
+  std::optional<std::string> model_buffer_;
+  absl::flat_hash_map<proto::LlmMetadata::TfLiteModelType,
+                      std::pair<size_t, size_t>>
+      weights_sections_;
 };
+
+// Serializes a minimal TFLite model that declares the given external buffer
+// groups (and nothing else).
+std::string BuildModelWithExternalBufferGroups(
+    const std::vector<std::string>& group_names) {
+  flatbuffers::FlatBufferBuilder builder;
+  std::vector<flatbuffers::Offset<tflite::ExternalBufferGroup>> groups;
+  groups.reserve(group_names.size());
+  for (const std::string& name : group_names) {
+    groups.push_back(
+        tflite::CreateExternalBufferGroup(builder, builder.CreateString(name)));
+  }
+  flatbuffers::Offset<
+      flatbuffers::Vector<flatbuffers::Offset<tflite::ExternalBufferGroup>>>
+      groups_vector;
+  if (!groups.empty()) {
+    groups_vector = builder.CreateVector(groups);
+  }
+  tflite::ModelBuilder model_builder(builder);
+  model_builder.add_version(3);
+  if (!groups.empty()) {
+    model_builder.add_external_buffer_groups(groups_vector);
+  }
+  tflite::FinishModelBuffer(builder, model_builder.Finish());
+  return std::string(reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                     builder.GetSize());
+}
 
 // Returns the path to the shared test .task model.
 std::string TestModelPath() {
@@ -1982,7 +2175,8 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
 
   ASSERT_OK_AND_ASSIGN(
       auto external_weights,
-      GetExternalWeightResources(resources, ModelType::kTfLitePrefillDecode));
+      GetExternalWeightResources(resources,
+                                 proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
   EXPECT_FALSE(external_weights.scoped_file.has_value());
   EXPECT_TRUE(external_weights.sections.empty());
 }
@@ -1996,7 +2190,8 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
 
   ASSERT_OK_AND_ASSIGN(
       auto external_weights,
-      GetExternalWeightResources(resources, ModelType::kTfLitePrefillDecode));
+      GetExternalWeightResources(resources,
+                                 proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
   EXPECT_FALSE(external_weights.scoped_file.has_value());
   EXPECT_TRUE(external_weights.sections.empty());
 }
@@ -2007,9 +2202,9 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
   FakeExternalWeightModelResources resources(
       absl::InvalidArgumentError("Bad section."), /*scoped_file=*/std::nullopt);
 
-  EXPECT_THAT(
-      GetExternalWeightResources(resources, ModelType::kTfLitePrefillDecode),
-      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(GetExternalWeightResources(
+                  resources, proto::LlmMetadata::TF_LITE_PREFILL_DECODE),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
@@ -2022,13 +2217,102 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
 
   ASSERT_OK_AND_ASSIGN(
       auto external_weights,
-      GetExternalWeightResources(resources, ModelType::kTfLitePrefillDecode));
+      GetExternalWeightResources(resources,
+                                 proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
   ASSERT_TRUE(external_weights.scoped_file.has_value());
   EXPECT_TRUE(external_weights.scoped_file->IsValid());
   ASSERT_TRUE(external_weights.sections.contains("tflite_weights"));
   const auto& section = external_weights.sections.at("tflite_weights");
   EXPECT_EQ(section.offset, 100);
   EXPECT_EQ(section.length, 150);
+}
+
+TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
+     GetExternalWeightResources_ModelWithoutExternalBuffersIgnoresSections) {
+  ASSERT_OK_AND_ASSIGN(auto scoped_file, ScopedFile::Open(TestModelPath()));
+  FakeExternalWeightModelResources resources(
+      std::pair<size_t, size_t>(100, 250), std::move(scoped_file));
+  // A model with embedded weights declares no external buffer groups, so no
+  // section is attached even if the container happens to have one.
+  resources.SetModelBuffer(BuildModelWithExternalBufferGroups({}));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto external_weights,
+      GetExternalWeightResources(resources,
+                                 proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
+  EXPECT_FALSE(external_weights.scoped_file.has_value());
+  EXPECT_TRUE(external_weights.sections.empty());
+}
+
+TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
+     GetExternalWeightResources_MapsOtherModelWeightGroup) {
+  ASSERT_OK_AND_ASSIGN(auto scoped_file, ScopedFile::Open(TestModelPath()));
+  FakeExternalWeightModelResources resources(
+      std::pair<size_t, size_t>(100, 250), std::move(scoped_file));
+  // "tflite_weights" resolves to the model's own TFLiteWeights section and
+  // "tflite_weights:<model_type>" to the TFLiteWeights section of that model.
+  resources.SetModelBuffer(BuildModelWithExternalBufferGroups(
+      {"tflite_weights", "tflite_weights:tf_lite_embedder"}));
+  resources.SetWeightsSection(proto::LlmMetadata::TF_LITE_EMBEDDER,
+                              {1000, 1600});
+
+  ASSERT_OK_AND_ASSIGN(
+      auto external_weights,
+      GetExternalWeightResources(resources,
+                                 proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
+  ASSERT_TRUE(external_weights.scoped_file.has_value());
+  EXPECT_TRUE(external_weights.scoped_file->IsValid());
+  ASSERT_EQ(external_weights.sections.size(), 2);
+  EXPECT_EQ(external_weights.sections.at("tflite_weights").offset, 100);
+  EXPECT_EQ(external_weights.sections.at("tflite_weights").length, 150);
+  const auto& other =
+      external_weights.sections.at("tflite_weights:tf_lite_embedder");
+  EXPECT_EQ(other.offset, 1000);
+  EXPECT_EQ(other.length, 600);
+}
+
+TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
+     GetExternalWeightResources_OtherModelWeightGroupOnly) {
+  ASSERT_OK_AND_ASSIGN(auto scoped_file, ScopedFile::Open(TestModelPath()));
+  // E.g. an embedder whose only large weight (the embedding table) is stored in
+  // the prefill/decode model's TFLiteWeights section: it has no TFLiteWeights
+  // section of its own.
+  FakeExternalWeightModelResources resources(
+      absl::NotFoundError("No weights section."), std::move(scoped_file));
+  resources.SetModelBuffer(BuildModelWithExternalBufferGroups(
+      {"tflite_weights:tf_lite_prefill_decode"}));
+  resources.SetWeightsSection(proto::LlmMetadata::TF_LITE_PREFILL_DECODE,
+                              {1000, 1600});
+
+  ASSERT_OK_AND_ASSIGN(auto external_weights,
+                       GetExternalWeightResources(
+                           resources, proto::LlmMetadata::TF_LITE_EMBEDDER));
+  ASSERT_TRUE(external_weights.scoped_file.has_value());
+  ASSERT_EQ(external_weights.sections.size(), 1);
+  const auto& other =
+      external_weights.sections.at("tflite_weights:tf_lite_prefill_decode");
+  EXPECT_EQ(other.offset, 1000);
+  EXPECT_EQ(other.length, 600);
+}
+
+TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
+     GetExternalWeightResources_UnsupportedGroupIsSkipped) {
+  ASSERT_OK_AND_ASSIGN(auto scoped_file, ScopedFile::Open(TestModelPath()));
+  FakeExternalWeightModelResources resources(
+      std::pair<size_t, size_t>(100, 250), std::move(scoped_file));
+  // A group name the runtime cannot resolve is skipped (the weight loader
+  // reports the missing data when the model is compiled), while the model's
+  // own section is still attached. "tflite_weightsfoo" lacks the ':' separator
+  // and must not be treated as a reference to model type "foo".
+  resources.SetModelBuffer(BuildModelWithExternalBufferGroups(
+      {"tflite_weights", "unsupported", "tflite_weightsfoo"}));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto external_weights,
+      GetExternalWeightResources(resources,
+                                 proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
+  ASSERT_EQ(external_weights.sections.size(), 1);
+  EXPECT_TRUE(external_weights.sections.contains("tflite_weights"));
 }
 
 TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
@@ -2039,7 +2323,8 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
       absl::NotFoundError("No weights section."), /*scoped_file=*/std::nullopt);
 
   // With no external weights, the call is a no-op that still succeeds.
-  EXPECT_OK(SetExternalWeightOptions(resources, ModelType::kTfLitePrefillDecode,
+  EXPECT_OK(SetExternalWeightOptions(resources,
+                                     proto::LlmMetadata::TF_LITE_PREFILL_DECODE,
                                      compilation_options));
 }
 
@@ -2100,6 +2385,106 @@ TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
   EXPECT_EQ(params.global_type, proto::ATTENTION_MASK_TYPE_BIDIRECTIONAL);
   EXPECT_EQ(params.local_type, proto::ATTENTION_MASK_TYPE_BIDIRECTIONAL);
   EXPECT_FALSE(params.sliding_window_size.has_value());
+}
+
+TEST(LlmLiteRTCompiledModelExecutorUtilsTest,
+     ShouldSkipGlobalCausalAttentionMask) {
+  LITERT_ASSERT_OK_AND_ASSIGN(auto env, ::litert::Environment::Create({}));
+  auto bool_layout = ::litert::Layout(::litert::Dimensions({1, 1, 1, 128}));
+  RankedTensorType bool_tensor_type(ElementType::Bool, std::move(bool_layout));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto bool_host_mask,
+      TensorBuffer::CreateManaged(env, ::litert::TensorBufferType::kHostMemory,
+                                  bool_tensor_type, sizeof(bool) * 128));
+
+  auto float_layout = ::litert::Layout(::litert::Dimensions({1, 1, 1, 128}));
+  RankedTensorType float_tensor_type(ElementType::Float32,
+                                     std::move(float_layout));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto float_host_mask,
+      TensorBuffer::CreateManaged(env, ::litert::TensorBufferType::kHostMemory,
+                                  float_tensor_type, sizeof(float) * 128));
+
+  ModelSignatures signatures;
+  signatures.input_tokens = "tokens";
+  signatures.input_positions = "input_pos";
+  signatures.input_attn_mask = "mask";
+  signatures.input_int32_param = "param_tensor";
+  signatures.output_logits = "logits";
+
+  AttentionMaskParams causal_params;
+  causal_params.global_type = proto::ATTENTION_MASK_TYPE_CAUSAL;
+
+  // Pruned boolean mask on GPU with single-buffer cache params should be
+  // skipped.
+  EXPECT_TRUE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/true, signatures,
+      causal_params, &bool_host_mask));
+
+  // CPU backend must never skip initializing/filling the host attention mask.
+  EXPECT_FALSE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::CPU, /*gpu_optimized_single_buffer_cache=*/true, signatures,
+      causal_params, &bool_host_mask));
+
+  // Float attention masks are not pruned by Flash SDPA and must not be skipped.
+  EXPECT_FALSE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/true, signatures,
+      causal_params, &float_host_mask));
+
+  // Null mask buffer or disabled single-buffer cache must not skip.
+  EXPECT_FALSE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/true, signatures,
+      causal_params, /*attn_mask_buffer=*/nullptr));
+  EXPECT_FALSE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/false, signatures,
+      causal_params, &bool_host_mask));
+
+  // Bidirectional and vision-bidirectional masks must not be skipped.
+  AttentionMaskParams bidirectional_params;
+  bidirectional_params.global_type = proto::ATTENTION_MASK_TYPE_BIDIRECTIONAL;
+  EXPECT_FALSE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/true, signatures,
+      bidirectional_params, &bool_host_mask));
+
+  AttentionMaskParams vision_bidirectional_params;
+  vision_bidirectional_params.global_type =
+      proto::ATTENTION_MASK_TYPE_VISION_BIDIRECTIONAL;
+  EXPECT_FALSE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/true, signatures,
+      vision_bidirectional_params, &bool_host_mask));
+
+  // Models with a separate local attention mask only skip when the local mask
+  // buffer is also a pruned boolean causal mask on host memory.
+  ModelSignatures local_mask_signatures = signatures;
+  local_mask_signatures.input_attn_mask_local = "local_mask";
+  EXPECT_FALSE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/true,
+      local_mask_signatures, causal_params, &bool_host_mask,
+      /*attn_mask_local_buffer=*/nullptr));
+  EXPECT_FALSE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/true,
+      local_mask_signatures, causal_params, &bool_host_mask, &float_host_mask));
+  EXPECT_TRUE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/true,
+      local_mask_signatures, causal_params, &bool_host_mask, &bool_host_mask));
+
+  // Non-causal local_type must prevent skipping even when global_type is causal
+  // and both masks are boolean host buffers.
+  AttentionMaskParams local_bidirectional_params = causal_params;
+  local_bidirectional_params.local_type =
+      proto::ATTENTION_MASK_TYPE_BIDIRECTIONAL;
+  EXPECT_FALSE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/true,
+      local_mask_signatures, local_bidirectional_params, &bool_host_mask,
+      &bool_host_mask));
+
+  AttentionMaskParams local_vision_bidirectional_params = causal_params;
+  local_vision_bidirectional_params.local_type =
+      proto::ATTENTION_MASK_TYPE_VISION_BIDIRECTIONAL;
+  EXPECT_FALSE(ShouldSkipGlobalCausalAttentionMask(
+      Backend::GPU, /*gpu_optimized_single_buffer_cache=*/true,
+      local_mask_signatures, local_vision_bidirectional_params, &bool_host_mask,
+      &bool_host_mask));
 }
 
 }  // namespace

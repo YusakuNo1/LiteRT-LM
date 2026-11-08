@@ -25,6 +25,10 @@ namespace litert::support {
 // Main purpose is to process raw image bytes into a resized image TensorBuffer.
 class StbImagePreprocessor : public ImagePreprocessor {
  public:
+  // Declaring any Preprocess overload here would otherwise hide every
+  // Preprocess the base class declares, so pull them all back into scope.
+  using ImagePreprocessor::Preprocess;
+
   // Preprocesses the raw image bytes into a resized image TensorBuffer.
   //
   // If PatchifyConfig is set, the image will be patchified, with the image
@@ -34,9 +38,22 @@ class StbImagePreprocessor : public ImagePreprocessor {
       const InputImage& input_image,
       const ImagePreprocessParameter& parameter) override;
 
+  // Preprocesses already decoded 8-bit RGB pixels. Applies the same resize,
+  // rescale, normalization and patchify steps as the overload above; only the
+  // decode is skipped.
+  absl::StatusOr<InputImage> Preprocess(
+      const DecodedImage& decoded_image,
+      const ImagePreprocessParameter& parameter) override;
+
   // Decodes the raw image bytes into 8-bit RGB pixels using stb_image.
   absl::StatusOr<DecodedImage> Decode(
       absl::string_view image_bytes) const override;
+
+  // Returns the size Preprocess() resizes the raw image to, reading only the
+  // image header via stb_image.
+  absl::StatusOr<ImageSize> GetResizedImageSize(
+      const InputImage& input_image,
+      const ImagePreprocessParameter& parameter) const override;
 };
 
 }  // namespace litert::support

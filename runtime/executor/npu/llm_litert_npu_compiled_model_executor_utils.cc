@@ -33,6 +33,7 @@
 #include "absl/strings/match.h"  // from @com_google_absl
 #include "absl/strings/numbers.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/strings/str_join.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/c/litert_common.h"  // from @litert
@@ -47,6 +48,8 @@
 #include "litert/cc/litert_ranked_tensor_type.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer_types.h"  // from @litert
+#include "litert/cc/options/litert_google_tensor_options.h"  // from @litert  // IWYU pragma: keep
+#include "litert/cc/options/litert_qualcomm_options.h"  // from @litert  // IWYU pragma: keep
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep NOLINT
@@ -427,6 +430,7 @@ litert::Expected<litert::Options> CreateLiteRtNpuOptions(
   qnn_opts.SetLogLevel(::litert::qualcomm::QualcommOptions::LogLevel::kOff);
   qnn_opts.SetHtpPerformanceMode(
       ::litert::qualcomm::QualcommOptions::HtpPerformanceMode::kBurst);
+  qnn_opts.SetHtpFileReadMemoryBudgetMB(16);
   // Dynamic models embed fine-grained EdgetpuMemoryPowerState directives
   // directly in the graph bytecode. Setting PerformanceMode here causes
   // SouthBound to reject execution due to mutual exclusivity (Cannot mix
@@ -630,53 +634,185 @@ absl::StatusOr<NpuAuxiliaryContext> CreateNpuAuxiliaryContext(
                                      is_dynamic_model);
 }
 
+namespace {
+
+// Resolves "<base>_cache_<context_size>" when `model` has such a signature,
+// otherwise the single-context `base`.
+std::string ResolveContextSignature(const litert::Model& model,
+                                    absl::string_view base, int context_size) {
+  if (context_size > 0) {
+    std::string candidate = absl::StrCat(base, "_cache_", context_size);
+    if (model.FindSignature(candidate).HasValue()) {
+      return candidate;
+    }
+  }
+  return std::string(base);
+}
+
+bool IsKVCacheInput(absl::string_view input_name) {
+  return absl::StartsWith(input_name, kKvCacheKRootName) ||
+         absl::StartsWith(input_name, kKvCacheVRootName);
+}
+
+}  // namespace
+
+std::string ResolveMtpDrafterSignature(const litert::Model& mtp_drafter_model,
+                                       int context_size) {
+  return ResolveContextSignature(mtp_drafter_model, MtpSignatures::kMtpDrafter,
+                                 context_size);
+}
+
+std::string ResolveMtpMaskSignature(const litert::Model& mtp_aux_model,
+                                    int context_size) {
+  return ResolveContextSignature(mtp_aux_model, MtpSignatures::kMtpMask,
+                                 context_size);
+}
+
+absl::Status MissingContextSignatureError(absl::string_view model_description,
+                                          absl::string_view base_signature,
+                                          absl::string_view resolved_signature,
+                                          int context_size) {
+  std::string missing;
+  if (context_size > 0 && resolved_signature == base_signature) {
+    // The per-context candidate was looked up first and is missing too.
+    missing = absl::StrCat("neither signature \"", base_signature, "_cache_",
+                           context_size, "\" nor \"", base_signature, "\"");
+  } else {
+    missing = absl::StrCat("no signature \"", resolved_signature, "\"");
+  }
+  return absl::InvalidArgumentError(
+      absl::StrCat(model_description, " has ", missing,
+                   " for text decoder context size ", context_size, "."));
+}
+
+bool IsCompatibleTensorType(const ::litert::RankedTensorType& signature_type,
+                            const ::litert::RankedTensorType& buffer_type) {
+  if (signature_type.ElementType() != buffer_type.ElementType()) {
+    return false;
+  }
+  absl::Span<const int32_t> signature_dims =
+      signature_type.Layout().Dimensions();
+  absl::Span<const int32_t> buffer_dims = buffer_type.Layout().Dimensions();
+  if (signature_dims.size() != buffer_dims.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < signature_dims.size(); ++i) {
+    if (signature_dims[i] >= 0 && signature_dims[i] != buffer_dims[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 absl::StatusOr<DrafterContext> DrafterContext::Create(
     ::litert::Environment& env, const litert::Model& mtp_drafter_model,
-    absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
-        drafter_input_kv_cache_buffers,
-    ::litert::TensorBuffer& output_activations_buffers) {
+    absl::Span<const NpuContextGroup> context_groups) {
+  RET_CHECK(!context_groups.empty())
+      << "At least one text decoder context group is required.";
   LITERT_ASSIGN_OR_RETURN(
       auto mtp_compiled_model,
       CompiledModelWrapper::Create(env, mtp_drafter_model.Get(),
                                    litert::HwAccelerators::kCpu));
+
+  // Input buffers are shared between context groups whenever the input has
+  // the same tensor type in every drafter signature (activations, position,
+  // RoPE embeddings). Inputs whose shape depends on the context size (the
+  // attention masks) get a dedicated buffer per context group. KV cache inputs
+  // are not allocated at all: they alias the text decoder's KV cache buffers
+  // and are bound in `BindContextGroup`.
   absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>
-      mtp_input_buffers;
+      shared_input_buffers;
+  std::vector<ContextBinding> context_bindings;
+  context_bindings.reserve(context_groups.size());
+  for (const NpuContextGroup& context_group : context_groups) {
+    ContextBinding binding;
+    binding.signature = ResolveMtpDrafterSignature(mtp_drafter_model,
+                                                   context_group.context_size);
+    auto signature = mtp_compiled_model.FindSignature(binding.signature);
+    if (!signature) {
+      return MissingContextSignatureError(
+          "MTP drafter model", MtpSignatures::kMtpDrafter, binding.signature,
+          context_group.context_size);
+    }
+    for (absl::string_view input_name : signature->InputNames()) {
+      LITERT_ASSIGN_OR_RETURN(
+          auto input_type,
+          mtp_drafter_model.GetInputTensorType(binding.signature, input_name));
+      if (IsKVCacheInput(input_name)) {
+        auto kv_it = context_group.input_kv_cache_buffers.find(input_name);
+        if (kv_it == context_group.input_kv_cache_buffers.end()) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "MTP drafter input \"", input_name,
+              "\" has no matching KV cache buffer in the text decoder context "
+              "group of size ",
+              context_group.context_size, "."));
+        }
+        LITERT_ASSIGN_OR_RETURN(auto kv_type, kv_it->second.TensorType());
+        if (!IsCompatibleTensorType(input_type, kv_type)) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "MTP drafter signature \"", binding.signature, "\" expects \"",
+              input_name, "\" with shape [",
+              absl::StrJoin(input_type.Layout().Dimensions(), ", "),
+              "] but the text decoder context group of size ",
+              context_group.context_size, " provides shape [",
+              absl::StrJoin(kv_type.Layout().Dimensions(), ", "),
+              "]. The drafter must provide a signature per text decoder "
+              "context size."));
+        }
+        continue;
+      }
+      auto shared_it = shared_input_buffers.find(input_name);
+      if (shared_it != shared_input_buffers.end()) {
+        LITERT_ASSIGN_OR_RETURN(auto shared_type,
+                                shared_it->second.TensorType());
+        if (shared_type == input_type) {
+          LITERT_ASSIGN_OR_RETURN(binding.input_buffers[input_name],
+                                  shared_it->second.Duplicate());
+          continue;
+        }
+      }
+      LITERT_ASSIGN_OR_RETURN(
+          auto input_buffer,
+          mtp_compiled_model.CreateInputBuffer(binding.signature, input_name));
+      input_buffer.Clear();
+      if (shared_it == shared_input_buffers.end()) {
+        LITERT_ASSIGN_OR_RETURN(shared_input_buffers[input_name],
+                                input_buffer.Duplicate());
+      }
+      binding.input_buffers[input_name] = std::move(input_buffer);
+    }
+    context_bindings.push_back(std::move(binding));
+  }
+
+  // Output shapes do not depend on the context size, so the outputs are
+  // allocated once for all context groups.
   absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>
       mtp_output_buffers;
+  const std::string& first_signature = context_bindings.front().signature;
+  LITERT_ASSIGN_OR_RETURN(
+      auto output_names,
+      mtp_compiled_model.GetSignatureOutputNames(first_signature));
+  for (absl::string_view output_name : output_names) {
+    LITERT_ASSIGN_OR_RETURN(
+        mtp_output_buffers[output_name],
+        mtp_compiled_model.CreateOutputBuffer(first_signature, output_name));
+  }
 
-  // Create input and output buffers for the MTP drafter.
-  auto mtp_signature =
-      mtp_compiled_model.FindSignature(MtpSignatures::kMtpDrafter);
-  for (const auto& input_name : mtp_signature->InputNames()) {
-    // Reuse kv cache buffers from main model
-    if (absl::StartsWith(input_name, kKvCacheKRootName) ||
-        absl::StartsWith(input_name, kKvCacheVRootName)) {
-      LITERT_ASSIGN_OR_RETURN(
-          mtp_input_buffers[input_name],
-          drafter_input_kv_cache_buffers[input_name].Duplicate());
-    } else {
-      LITERT_ASSIGN_OR_RETURN(mtp_input_buffers[input_name],
-                              mtp_compiled_model.CreateInputBuffer(
-                                  MtpSignatures::kMtpDrafter, input_name));
-      mtp_input_buffers[input_name].Clear();
-    }
-  }
-  for (const auto& output_name : mtp_signature->OutputNames()) {
-    {
-      LITERT_ASSIGN_OR_RETURN(mtp_output_buffers[output_name],
-                              mtp_compiled_model.CreateOutputBuffer(
-                                  MtpSignatures::kMtpDrafter, output_name));
-    }
-  }
-  return DrafterContext(std::move(mtp_compiled_model),
-                        std::move(mtp_input_buffers),
-                        std::move(mtp_output_buffers));
+  DrafterContext drafter_context(std::move(mtp_compiled_model),
+                                 std::move(context_bindings),
+                                 std::move(mtp_output_buffers));
+  LITERT_RETURN_IF_ERROR(
+      drafter_context.BindContextGroup(0, context_groups.front()));
+  return drafter_context;
 }
 
 absl::Status DrafterContext::SetInputPos(int32_t pos) {
   auto it = mtp_input_buffers.find(MtpSignatures::kInputPos);
   if (it == mtp_input_buffers.end()) {
-    return absl::NotFoundError("Drafter input pos buffer not found.");
+    // Drafters with externalized RoPE and attention masks do not consume the
+    // position; converters that drop unused inputs leave it out of the
+    // signature.
+    return absl::OkStatus();
   }
   LITERT_ASSIGN_OR_RETURN(
       auto lock, ::litert::TensorBufferScopedLock::Create(
@@ -685,13 +821,31 @@ absl::Status DrafterContext::SetInputPos(int32_t pos) {
   return absl::OkStatus();
 }
 
-absl::Status DrafterContext::UpdateKVCacheBuffers(
-    const absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
-        new_input_kv_cache_buffers) {
-  for (const auto& [name, buf] : new_input_kv_cache_buffers) {
-    if (mtp_input_buffers.contains(name)) {
-      LITERT_ASSIGN_OR_RETURN(mtp_input_buffers[name], buf.Duplicate());
+absl::Status DrafterContext::BindContextGroup(
+    size_t index, const NpuContextGroup& context_group) {
+  RET_CHECK_LT(index, context_bindings.size())
+      << "Drafter context group index out of range.";
+  const ContextBinding& binding = context_bindings[index];
+  signature = binding.signature;
+  // Every entry is a duplicate of a binding or KV cache buffer, so rebuilding
+  // the map from scratch only drops references.
+  mtp_input_buffers.clear();
+  for (const auto& [name, buffer] : binding.input_buffers) {
+    LITERT_ASSIGN_OR_RETURN(mtp_input_buffers[name], buffer.Duplicate());
+  }
+  // KV cache inputs alias the text decoder's KV cache buffers of the group.
+  LITERT_ASSIGN_OR_RETURN(auto compiled_signature,
+                          mtp_compiled_model.FindSignature(signature));
+  for (absl::string_view input_name : compiled_signature.InputNames()) {
+    if (!IsKVCacheInput(input_name)) {
+      continue;
     }
+    auto kv_it = context_group.input_kv_cache_buffers.find(input_name);
+    RET_CHECK(kv_it != context_group.input_kv_cache_buffers.end())
+        << "Text decoder context group has no KV cache buffer \"" << input_name
+        << "\" for the drafter.";
+    LITERT_ASSIGN_OR_RETURN(mtp_input_buffers[input_name],
+                            kv_it->second.Duplicate());
   }
   return absl::OkStatus();
 }
@@ -770,9 +924,334 @@ absl::StatusOr<std::vector<uint8_t>> CopyRawBytesFromTensorBuffer(
   }
 }
 
+absl::flat_hash_map<std::string, NpuGraphLayout::KVCacheBuffer>
+ExtractKVCacheBufferInfoMap(
+    const absl::flat_hash_map<absl::string_view, TensorBuffer>&
+        input_kv_cache_buffers,
+    int global_cache_length, const proto::ExecutorMetadata* executor_metadata) {
+  absl::flat_hash_map<std::string, NpuGraphLayout::KVCacheBuffer>
+      buffer_info_map;
+  if (executor_metadata != nullptr &&
+      executor_metadata->has_llm_executor_metadata()) {
+    for (const auto& sb :
+         executor_metadata->llm_executor_metadata().state_buffers()) {
+      NpuGraphLayout::KVCacheBuffer info;
+      if (sb.has_sequence_axis()) {
+        info.sequence_axis = sb.sequence_axis();
+      }
+      info.is_local = (sb.type() == proto::StateBuffer::TYPE_LOCAL_KEY_CACHE ||
+                       sb.type() == proto::StateBuffer::TYPE_LOCAL_VALUE_CACHE);
+      if (sb.has_minimum_sequence_length()) {
+        info.min_sequence_length = sb.minimum_sequence_length();
+      }
+      if (sb.has_maximum_sequence_length()) {
+        info.max_sequence_length = sb.maximum_sequence_length();
+      }
+
+      // Check the actual tensor buffer to determine the true physical sequence
+      // length.
+      auto find_buf = [&](absl::string_view buf_name) -> const TensorBuffer* {
+        if (buf_name.empty()) return nullptr;
+        auto it = input_kv_cache_buffers.find(buf_name);
+        return (it != input_kv_cache_buffers.end()) ? &it->second : nullptr;
+      };
+      const TensorBuffer* buf = find_buf(sb.decode_input_name());
+      if (!buf) buf = find_buf(sb.prefill_input_name());
+      if (buf) {
+        auto type = buf->TensorType();
+        if (type.HasValue()) {
+          auto dims = type->Layout().Dimensions();
+          int rank = dims.size();
+          if (info.sequence_axis >= 0 && info.sequence_axis < rank) {
+            info.min_sequence_length = dims[info.sequence_axis];
+          } else if (rank >= 2) {
+            info.min_sequence_length = std::max(dims[rank - 1], dims[rank - 2]);
+          }
+        }
+      }
+      if (global_cache_length > 0 && info.min_sequence_length > 0 &&
+          info.min_sequence_length < global_cache_length) {
+        info.is_local = true;
+      }
+
+      auto register_name = [&](absl::string_view name) {
+        if (!name.empty()) {
+          buffer_info_map[name] = info;
+          int64_t hidden_dim = -1;
+          if (buf) {
+            auto type = buf->TensorType();
+            if (type.HasValue()) {
+              auto dims = type->Layout().Dimensions();
+              int rank = dims.size();
+              if (rank >= 2) {
+                int seq_axis =
+                    (info.sequence_axis >= 0 && info.sequence_axis < rank)
+                        ? info.sequence_axis
+                        : ((dims[rank - 1] >= dims[rank - 2]) ? rank - 1
+                                                              : rank - 2);
+                int hidden_axis = (seq_axis == rank - 1) ? rank - 2 : rank - 1;
+                hidden_dim = dims[hidden_axis];
+              }
+            }
+          }
+          auto make_slice_info = [&](absl::string_view slice_name) {
+            NpuGraphLayout::KVCacheBuffer slice_info = info;
+            auto it = input_kv_cache_buffers.find(slice_name);
+            if (it != input_kv_cache_buffers.end()) {
+              auto type = it->second.TensorType();
+              if (type.HasValue()) {
+                auto dims = type->Layout().Dimensions();
+                int s_rank = dims.size();
+                if (s_rank >= 2) {
+                  if (hidden_dim > 0 && dims[s_rank - 1] == hidden_dim) {
+                    slice_info.sequence_axis = s_rank - 2;
+                  } else if (hidden_dim > 0 && dims[s_rank - 2] == hidden_dim) {
+                    slice_info.sequence_axis = s_rank - 1;
+                  }
+                }
+              }
+            }
+            return slice_info;
+          };
+          if (absl::StartsWith(name, "kv_cache_k_")) {
+            std::string s1 = absl::StrCat("kv_slice_k_", name.substr(11));
+            buffer_info_map[s1] = make_slice_info(s1);
+            std::string s2 = absl::StrCat("kv_cache_slice_k_", name.substr(11));
+            buffer_info_map[s2] = make_slice_info(s2);
+          } else if (absl::StartsWith(name, "kv_cache_v_")) {
+            std::string s1 = absl::StrCat("kv_slice_v_", name.substr(11));
+            buffer_info_map[s1] = make_slice_info(s1);
+            std::string s2 = absl::StrCat("kv_cache_slice_v_", name.substr(11));
+            buffer_info_map[s2] = make_slice_info(s2);
+          } else if (absl::StartsWith(name, "kv_cache_c_")) {
+            std::string s1 = absl::StrCat("kv_slice_c_", name.substr(11));
+            buffer_info_map[s1] = make_slice_info(s1);
+            std::string s2 = absl::StrCat("kv_cache_slice_c_", name.substr(11));
+            buffer_info_map[s2] = make_slice_info(s2);
+          }
+        }
+      };
+      register_name(sb.prefill_input_name());
+      register_name(sb.prefill_output_name());
+      register_name(sb.decode_input_name());
+      register_name(sb.decode_output_name());
+    }
+  }
+
+  // Fallback: Populate buffer info from tensor dimensions for any buffer
+  // missing metadata.
+  for (const auto& [name, buffer] : input_kv_cache_buffers) {
+    if (absl::StartsWith(name, "kv_slice_") ||
+        absl::StartsWith(name, "kv_cache_slice_")) {
+      continue;
+    }
+    std::string name_str(name);
+    if (buffer_info_map.contains(name_str)) {
+      continue;
+    }
+    auto type_expected = buffer.TensorType();
+    if (!type_expected.HasValue()) {
+      continue;
+    }
+    auto dims = type_expected->Layout().Dimensions();
+    int rank = dims.size();
+    if (rank < 2) {
+      continue;
+    }
+    int last_dim = dims[rank - 1];
+    int second_last_dim = dims[rank - 2];
+    int cache_seq = std::max(last_dim, second_last_dim);
+    int cache_seq_dim = (last_dim == cache_seq) ? rank - 1 : rank - 2;
+    int hidden_dim_axis = (cache_seq_dim == rank - 1) ? rank - 2 : rank - 1;
+    int64_t hidden_dim = dims[hidden_dim_axis];
+
+    NpuGraphLayout::KVCacheBuffer info;
+    info.sequence_axis = cache_seq_dim;
+    info.min_sequence_length = cache_seq;
+    info.max_sequence_length = global_cache_length;
+    info.is_local =
+        (global_cache_length > 0 && cache_seq < global_cache_length);
+
+    auto make_slice_info = [&](absl::string_view slice_name) {
+      NpuGraphLayout::KVCacheBuffer slice_info = info;
+      auto it = input_kv_cache_buffers.find(slice_name);
+      if (it != input_kv_cache_buffers.end()) {
+        auto type = it->second.TensorType();
+        if (type.HasValue()) {
+          auto s_dims = type->Layout().Dimensions();
+          int s_rank = s_dims.size();
+          if (s_rank >= 2) {
+            if (s_dims[s_rank - 1] == hidden_dim) {
+              slice_info.sequence_axis = s_rank - 2;
+            } else if (s_dims[s_rank - 2] == hidden_dim) {
+              slice_info.sequence_axis = s_rank - 1;
+            }
+          }
+        }
+      }
+      return slice_info;
+    };
+
+    buffer_info_map[name_str] = info;
+    if (absl::StartsWith(name_str, "kv_cache_k_")) {
+      std::string s1 = absl::StrCat("kv_slice_k_", name_str.substr(11));
+      buffer_info_map[s1] = make_slice_info(s1);
+      std::string s2 = absl::StrCat("kv_cache_slice_k_", name_str.substr(11));
+      buffer_info_map[s2] = make_slice_info(s2);
+    } else if (absl::StartsWith(name_str, "kv_cache_v_")) {
+      std::string s1 = absl::StrCat("kv_slice_v_", name_str.substr(11));
+      buffer_info_map[s1] = make_slice_info(s1);
+      std::string s2 = absl::StrCat("kv_cache_slice_v_", name_str.substr(11));
+      buffer_info_map[s2] = make_slice_info(s2);
+    } else if (absl::StartsWith(name_str, "kv_cache_c_")) {
+      std::string s1 = absl::StrCat("kv_slice_c_", name_str.substr(11));
+      buffer_info_map[s1] = make_slice_info(s1);
+      std::string s2 = absl::StrCat("kv_cache_slice_c_", name_str.substr(11));
+      buffer_info_map[s2] = make_slice_info(s2);
+    }
+  }
+
+  // Ensure any remaining slice buffers in input_kv_cache_buffers have an entry.
+  for (const auto& [name, buffer] : input_kv_cache_buffers) {
+    if (!absl::StartsWith(name, "kv_slice_") &&
+        !absl::StartsWith(name, "kv_cache_slice_")) {
+      continue;
+    }
+    std::string name_str(name);
+    if (buffer_info_map.contains(name_str)) {
+      continue;
+    }
+    auto type_expected = buffer.TensorType();
+    if (!type_expected.HasValue()) {
+      continue;
+    }
+    auto dims = type_expected->Layout().Dimensions();
+    int rank = dims.size();
+    if (rank < 2) {
+      continue;
+    }
+    NpuGraphLayout::KVCacheBuffer info;
+    info.sequence_axis = rank - 2;
+    buffer_info_map[name_str] = info;
+  }
+
+  return buffer_info_map;
+}
+
+NpuGraphLayout NpuGraphLayout::Resolve(
+    int prefill_chunk_size, int global_cache_length,
+    const absl::flat_hash_map<absl::string_view, TensorBuffer>&
+        input_kv_cache_buffers,
+    const proto::ExecutorMetadata* executor_metadata) {
+  NpuGraphLayout layout;
+  layout.prefill_chunk_size = prefill_chunk_size;
+  layout.global_cache_length = global_cache_length;
+  layout.uses_ringbuffer =
+      DetectUsesRingbuffer(input_kv_cache_buffers, executor_metadata);
+  layout.kv_cache_buffers = ExtractKVCacheBufferInfoMap(
+      input_kv_cache_buffers, global_cache_length, executor_metadata);
+
+  // 1. Try resolving local_cache_length from ExecutorMetadata state buffers.
+  if (executor_metadata != nullptr &&
+      executor_metadata->has_llm_executor_metadata()) {
+    const auto& llm_meta = executor_metadata->llm_executor_metadata();
+    for (const auto& sb : llm_meta.state_buffers()) {
+      if (sb.type() == proto::StateBuffer::TYPE_LOCAL_KEY_CACHE ||
+          sb.type() == proto::StateBuffer::TYPE_LOCAL_VALUE_CACHE) {
+        // Check actual physical tensor buffer first if present.
+        auto find_buf = [&](absl::string_view buf_name) -> const TensorBuffer* {
+          if (buf_name.empty()) return nullptr;
+          auto it = input_kv_cache_buffers.find(buf_name);
+          return (it != input_kv_cache_buffers.end()) ? &it->second : nullptr;
+        };
+        const TensorBuffer* buf = find_buf(sb.decode_input_name());
+        if (!buf) buf = find_buf(sb.prefill_input_name());
+        if (buf) {
+          auto type = buf->TensorType();
+          if (type.HasValue()) {
+            auto dims = type->Layout().Dimensions();
+            int rank = dims.size();
+            if (sb.has_sequence_axis() && sb.sequence_axis() >= 0 &&
+                sb.sequence_axis() < rank) {
+              layout.local_cache_length = dims[sb.sequence_axis()];
+              break;
+            } else if (rank >= 2) {
+              layout.local_cache_length =
+                  std::max(dims[rank - 1], dims[rank - 2]);
+              break;
+            }
+          }
+        }
+        // Fallback to metadata sequence length fields (< global_cache_length).
+        if (sb.has_minimum_sequence_length() &&
+            sb.minimum_sequence_length() > 0 &&
+            sb.minimum_sequence_length() < global_cache_length) {
+          layout.local_cache_length = sb.minimum_sequence_length();
+          break;
+        } else if (sb.has_maximum_sequence_length() &&
+                   sb.maximum_sequence_length() > 0 &&
+                   sb.maximum_sequence_length() < global_cache_length) {
+          layout.local_cache_length = sb.maximum_sequence_length();
+          break;
+        } else if (sb.has_minimum_sequence_length() &&
+                   sb.minimum_sequence_length() > 0) {
+          layout.local_cache_length = sb.minimum_sequence_length();
+          break;
+        }
+      }
+    }
+  }
+
+  // 2. If local_cache_length was not found in metadata, inspect
+  // layout.kv_cache_buffers.
+  if (!layout.local_cache_length.has_value() && layout.uses_ringbuffer) {
+    for (const auto& [name, info] : layout.kv_cache_buffers) {
+      if (info.is_local && info.min_sequence_length > 0 &&
+          info.min_sequence_length < global_cache_length) {
+        if (!layout.local_cache_length.has_value() ||
+            info.min_sequence_length < *layout.local_cache_length) {
+          layout.local_cache_length = info.min_sequence_length;
+        }
+      }
+    }
+  }
+
+  // 3. Resolve attention mask sliding window size.
+  if (executor_metadata != nullptr &&
+      executor_metadata->has_llm_executor_metadata()) {
+    const auto& llm_meta = executor_metadata->llm_executor_metadata();
+    if (llm_meta.has_attention_mask_settings() &&
+        llm_meta.attention_mask_settings().sliding_window_size() > 0) {
+      layout.sliding_window_size =
+          llm_meta.attention_mask_settings().sliding_window_size();
+    } else if (layout.local_cache_length.has_value()) {
+      layout.sliding_window_size = *layout.local_cache_length;
+    }
+  } else if (layout.local_cache_length.has_value()) {
+    layout.sliding_window_size = *layout.local_cache_length;
+  }
+
+  return layout;
+}
+
 bool DetectUsesRingbuffer(
     const absl::flat_hash_map<absl::string_view, TensorBuffer>&
-        input_kv_cache_buffers) {
+        input_kv_cache_buffers,
+    const proto::ExecutorMetadata* executor_metadata) {
+  if (executor_metadata != nullptr &&
+      executor_metadata->has_llm_executor_metadata()) {
+    const auto& llm_meta = executor_metadata->llm_executor_metadata();
+    if (!llm_meta.state_buffers().empty()) {
+      for (const auto& sb : llm_meta.state_buffers()) {
+        if (sb.type() == proto::StateBuffer::TYPE_LOCAL_KEY_CACHE ||
+            sb.type() == proto::StateBuffer::TYPE_LOCAL_VALUE_CACHE) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+
   std::set<int64_t> cache_seqs;
   for (const auto& [name, buffer] : input_kv_cache_buffers) {
     if (name.starts_with(kKvCacheKRootName) ||

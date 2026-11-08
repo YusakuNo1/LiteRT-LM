@@ -33,7 +33,9 @@
 #include "runtime/conversation/model_data_processor/generic_data_processor_config.h"
 #include "runtime/conversation/model_data_processor/multimodal_processor_helper.h"
 #include "runtime/conversation/model_data_processor/test_utils.h"
+#include "runtime/conversation/prompt_utils.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/util/test_utils.h"  // NOLINT
 
 namespace litert::lm {
@@ -245,12 +247,13 @@ TEST(GenericDataProcessorTest, RenderSingleTurnTemplateAppendUser) {
   // 1. Append user message (first part)
   Message message1 = {{"role", "user"}, {"content", "Hello"}};
   {
-    ASSERT_OK_AND_ASSIGN(auto result,
-                         processor->RenderSingleTurnTemplate(
-                             history, preface, message1, prompt_template,
-                             /*current_is_appending_message=*/false,
-                             /*append_message=*/true,
-                             /*extra_context=*/std::nullopt));
+    ASSERT_OK_AND_ASSIGN(
+        auto result,
+        RenderSingleTurnTemplate(*processor, history, preface, message1,
+                                 prompt_template,
+                                 /*current_is_appending_message=*/false,
+                                 /*append_message=*/true,
+                                 /*extra_context=*/std::nullopt));
     EXPECT_EQ(
         result.text,
         "<start_of_turn>system\nYou are a helpful assistant.<end_of_turn>\n"
@@ -262,16 +265,173 @@ TEST(GenericDataProcessorTest, RenderSingleTurnTemplateAppendUser) {
   // 2. Append user message (last part)
   Message message2 = {{"role", "user"}, {"content", " world!"}};
   {
-    ASSERT_OK_AND_ASSIGN(auto result,
-                         processor->RenderSingleTurnTemplate(
-                             history, preface, message2, prompt_template,
-                             /*current_is_appending_message=*/true,
-                             /*append_message=*/false,
-                             /*extra_context=*/std::nullopt));
+    ASSERT_OK_AND_ASSIGN(auto result, RenderSingleTurnTemplate(
+                                          *processor, history, preface,
+                                          message2, prompt_template,
+                                          /*current_is_appending_message=*/true,
+                                          /*append_message=*/false,
+                                          /*extra_context=*/std::nullopt));
     EXPECT_EQ(result.text, " world!<end_of_turn>\n<start_of_turn>model\n");
     EXPECT_FALSE(result.is_appending_message);
   }
   history.push_back(message2);
+}
+
+TEST(GenericDataProcessorTest, ToMessageWithRegexToolCall) {
+  proto::ToolCallConfig tool_call_config;
+  tool_call_config.set_fence_start("<tool_call>");
+  tool_call_config.set_fence_end("</tool_call>");
+  tool_call_config.mutable_regex_syntax()->set_tool_call_regex(
+      R"((?s)<function=([^>]+)>(.*?)</function>)");
+  tool_call_config.mutable_regex_syntax()->set_argument_regex(
+      R"((?s)<parameter=([^>]+)>\s*(.*?)\s*</parameter>)");
+  GenericDataProcessorConfig config = {
+      .tool_call_config = tool_call_config,
+  };
+  Preface preface = JsonPreface{.tools = json::parse(R"json([
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {"type": "string"},
+                "zip_code": {"type": "string"},
+                "days": {"type": "integer"}
+              }
+            }
+          }
+        }
+      ])json")};
+  ASSERT_OK_AND_ASSIGN(auto processor,
+                       GenericDataProcessor::Create(config, preface));
+  EXPECT_EQ(processor->CodeFenceStart(), "<tool_call>");
+  EXPECT_EQ(processor->CodeFenceEnd(), "</tool_call>");
+
+  ASSERT_OK_AND_ASSIGN(
+      const Message message,
+      processor->ToMessage(Responses(TaskState::kProcessing, {R"(<tool_call>
+<function=get_weather>
+<parameter=location>
+Paris
+</parameter>
+<parameter=zip_code>
+12345
+</parameter>
+<parameter=days>
+3
+</parameter>
+</function>
+</tool_call>)"}),
+                           std::monostate{}));
+
+  EXPECT_EQ(message, json::parse(R"json({
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": {
+                      "location": "Paris",
+                      "zip_code": "12345",
+                      "days": 3
+                    }
+                  }
+                }
+              ]
+            })json"));
+}
+
+TEST(GenericDataProcessorTest, ToMessageWithMiniCpm5RegexToolCall) {
+  proto::ToolCallConfig tool_call_config;
+  tool_call_config.set_fence_start("<function");
+  tool_call_config.set_fence_end("</function>");
+  tool_call_config.mutable_regex_syntax()->set_tool_call_regex(
+      R"((?s)\s*name\s*=\s*["']([^"']+)["']\s*>(.*))");
+  tool_call_config.mutable_regex_syntax()->set_argument_regex(
+      R"((?s)<param\s+name\s*=\s*["']([^"']+)["']\s*>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</param>)");
+  GenericDataProcessorConfig config = {
+      .tool_call_config = tool_call_config,
+  };
+  Preface preface = JsonPreface{.tools = json::parse(R"json([
+        {
+          "type": "function",
+          "function": {
+            "name": "execute_code",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "code": {"type": "string"},
+                "timeout": {"type": "integer"}
+              }
+            }
+          }
+        }
+      ])json")};
+  ASSERT_OK_AND_ASSIGN(auto processor,
+                       GenericDataProcessor::Create(config, preface));
+  EXPECT_EQ(processor->CodeFenceStart(), "<function");
+  EXPECT_EQ(processor->CodeFenceEnd(), "</function>");
+
+  ASSERT_OK_AND_ASSIGN(
+      const Message message,
+      processor->ToMessage(
+          Responses(
+              TaskState::kProcessing,
+              {R"(<function name="execute_code"><param name="code"><![CDATA[x < 1 && y > 2]]></param><param name="timeout">10</param></function>)"}),
+          std::monostate{}));
+
+  EXPECT_EQ(message, json::parse(R"json({
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "type": "function",
+                  "function": {
+                    "name": "execute_code",
+                    "arguments": {
+                      "code": "x < 1 && y > 2",
+                      "timeout": 10
+                    }
+                  }
+                }
+              ]
+            })json"));
+}
+
+TEST(GenericDataProcessorTest, InvalidToolCallConfigReturnsError) {
+  // Empty fence_start / fence_end.
+  {
+    proto::ToolCallConfig tool_call_config;
+    tool_call_config.mutable_regex_syntax()->set_tool_call_regex(
+        R"((?s)<function=([^>]+)>(.*?)</function>)");
+    EXPECT_FALSE(
+        GenericDataProcessor::Create({.tool_call_config = tool_call_config})
+            .ok());
+  }
+
+  // Unset syntax_config.
+  {
+    proto::ToolCallConfig tool_call_config;
+    tool_call_config.set_fence_start("<tool_call>");
+    tool_call_config.set_fence_end("</tool_call>");
+    EXPECT_FALSE(
+        GenericDataProcessor::Create({.tool_call_config = tool_call_config})
+            .ok());
+  }
+
+  // Invalid tool_call_regex (fewer than 2 capture groups).
+  {
+    proto::ToolCallConfig tool_call_config;
+    tool_call_config.set_fence_start("<tool_call>");
+    tool_call_config.set_fence_end("</tool_call>");
+    tool_call_config.mutable_regex_syntax()->set_tool_call_regex(
+        R"(<function=([^>]+)>)");
+    EXPECT_FALSE(
+        GenericDataProcessor::Create({.tool_call_config = tool_call_config})
+            .ok());
+  }
 }
 
 }  // namespace

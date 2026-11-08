@@ -24,6 +24,9 @@
 
 namespace litert::lm::jni {
 
+// Helper to get JNIEnv and attach to the current thread if necessary.
+JNIEnv* GetJniEnvAndAttach(JavaVM* jvm, bool* attached);
+
 // RAII wrapper for JNI local references.
 template <typename T>
 class ScopedLocalRef {
@@ -49,13 +52,100 @@ class ScopedLocalRef {
 
   T get() const { return local_ref_; }
 
+  ScopedLocalRef(ScopedLocalRef&& other) noexcept
+      : env_(other.env_), local_ref_(other.release()) {}
+
+  ScopedLocalRef& operator=(ScopedLocalRef&& other) noexcept {
+    if (this != &other) {
+      reset();
+      env_ = other.env_;
+      local_ref_ = other.release();
+    }
+    return *this;
+  }
+
   ScopedLocalRef(const ScopedLocalRef&) = delete;
   ScopedLocalRef& operator=(const ScopedLocalRef&) = delete;
 
  private:
-  JNIEnv* const env_;
+  JNIEnv* env_;
   T local_ref_;
 };
+
+// RAII wrapper for JNI global references that safely attaches to JavaVM if
+// destroyed on a native worker thread.
+template <typename T>
+class ScopedGlobalRef {
+ public:
+  ScopedGlobalRef(JavaVM* jvm, T global_ref)
+      : jvm_(jvm), global_ref_(global_ref) {}
+
+  ScopedGlobalRef(JNIEnv* env, T local_or_global_ref) {
+    env->GetJavaVM(&jvm_);
+    global_ref_ =
+        local_or_global_ref != nullptr
+            ? reinterpret_cast<T>(env->NewGlobalRef(local_or_global_ref))
+            : nullptr;
+  }
+
+  ~ScopedGlobalRef() { reset(); }
+
+  void reset(T ptr = nullptr) {
+    if (ptr != global_ref_) {
+      if (global_ref_ != nullptr && jvm_ != nullptr) {
+        bool attached = false;
+        JNIEnv* env = GetJniEnvAndAttach(jvm_, &attached);
+        if (env != nullptr) {
+          env->DeleteGlobalRef(global_ref_);
+        }
+        if (attached) {
+          jvm_->DetachCurrentThread();
+        }
+      }
+      global_ref_ = ptr;
+    }
+  }
+
+  T release() {
+    T ref = global_ref_;
+    global_ref_ = nullptr;
+    return ref;
+  }
+
+  T get() const { return global_ref_; }
+
+  ScopedGlobalRef(ScopedGlobalRef&& other) noexcept
+      : jvm_(other.jvm_), global_ref_(other.release()) {}
+
+  ScopedGlobalRef& operator=(ScopedGlobalRef&& other) noexcept {
+    if (this != &other) {
+      reset();
+      jvm_ = other.jvm_;
+      global_ref_ = other.release();
+    }
+    return *this;
+  }
+
+  ScopedGlobalRef(const ScopedGlobalRef&) = delete;
+  ScopedGlobalRef& operator=(const ScopedGlobalRef&) = delete;
+
+ private:
+  JavaVM* jvm_ = nullptr;
+  T global_ref_ = nullptr;
+};
+
+// Holds a scoped local jclass reference and a resolved method/constructor ID.
+struct ClassAndMethod {
+  ScopedLocalRef<jclass> clazz;
+  jmethodID method_id = nullptr;
+};
+
+// Finds a JNI class and resolves a method or constructor ID on it.
+// On error (e.g., class or method not found), both `clazz.get()` and
+// `method_id` will be nullptr.
+ClassAndMethod GetClassAndMethod(JNIEnv* env, const char* class_name,
+                                 const char* method_name,
+                                 const char* signature);
 
 // Converts a jstring to a standard std::string, handling null and freeing
 // chars.
@@ -68,8 +158,11 @@ jstring NewStringStandardUTF(JNIEnv* env, const std::string& standard_utf8_str);
 jobjectArray ToJavaStringArray(JNIEnv* env,
                                const std::vector<std::string>& strings);
 
-// Helper to get JNIEnv and attach to the current thread if necessary.
-JNIEnv* GetJniEnvAndAttach(JavaVM* jvm, bool* attached);
+// Converts a jfloatArray to a std::vector<float>, handling null.
+std::vector<float> JFloatArrayToVector(JNIEnv* env, jfloatArray array);
+
+// Converts a vector of floats to a Java float[] array.
+jfloatArray ToJavaFloatArray(JNIEnv* env, const std::vector<float>& values);
 
 }  // namespace litert::lm::jni
 

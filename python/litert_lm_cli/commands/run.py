@@ -24,17 +24,21 @@ import prompt_toolkit
 from prompt_toolkit import key_binding
 
 import litert_lm
-from litert_lm_builder import litertlm_builder
 from litert_lm_cli import cli_helpers
 from litert_lm_cli import common
 from litert_lm_cli import help_formatter
 from litert_lm_cli import huggingface_download
 from litert_lm_cli import model
-from litert_lm_cli.commands import convert as _convert_module
+try:
+  # PyPI: litert-lm-builder bundles the protos under its own package.
+  from litert_lm_builder.runtime.proto import llm_metadata_pb2
+except ImportError:
+  # Bazel: the protos are importable from the workspace root.
+  from runtime.proto import llm_metadata_pb2
 
 try:
   # pylint: disable=g-import-not-at-top
-  from litert_lm.adb import adb_engine  # pytype: disable=import-error
+  from litert_lm.adb import adb_engine  # pyrefly: ignore[missing-import]
 
   _HAS_ADB = True
 except ImportError:
@@ -106,14 +110,12 @@ def _execute_prompt(
 
   try:
     for chunk in stream:
-      content_list = chunk.get("content", [])
-      for item in content_list:
-        if item.get("type") == "text":
-          state.close_channel()
-          click.echo(click.style(item.get("text", ""), fg="yellow"), nl=False)
+      text = str(chunk)
+      if text:
+        state.close_channel()
+        click.echo(click.style(text, fg="yellow"), nl=False)
 
-      channels = chunk.get("channels", {})
-      for channel_name, channel_content in channels.items():
+      for channel_name, channel_content in chunk.channels.items():
         if state.active_channel != channel_name:
           state.close_channel()
           click.echo(click.style(f"[{channel_name}] ", fg="blue"), nl=False)
@@ -179,8 +181,7 @@ def run_interactive(
     backend: str | None = None,
     preset: str | None = None,
     prompt: str | None = None,
-    speculative_decoding: bool | None = None,
-    enable_speculative_decoding: bool | None = None,
+    speculative_decoding: str | None = None,
     no_template: bool = False,
     chat_template: str | None = None,
     max_num_tokens: int | None = None,
@@ -203,9 +204,6 @@ def run_interactive(
     enable_ynnpack: bool | None = None,
 ) -> None:
   """Runs the model interactively or with a single prompt."""
-  if speculative_decoding is None:
-    speculative_decoding = enable_speculative_decoding
-
   if not model_obj.exists():
     click.echo(
         click.style(
@@ -219,8 +217,13 @@ def run_interactive(
   state = SessionState()
 
   try:
-    speculative_decoding = model.resolve_config_option(
-        speculative_decoding, model_obj, "speculative_decoding"
+    speculative_decoding = common.normalize_speculative_decoding(
+        model.resolve_config_option(
+            speculative_decoding, model_obj, "speculative_decoding"
+        )
+    )
+    speculative_decoding_config = model.speculative_decoding_config_from_mode(
+        speculative_decoding
     )
     max_num_tokens = model.resolve_config_option(
         max_num_tokens, model_obj, "max_num_tokens"
@@ -259,7 +262,7 @@ def run_interactive(
         vision_backend,
         model_obj=model_obj,
         target_model_types={
-            litertlm_builder.TfLiteModelType.VISION_ENCODER.value,
+            llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER,
         },
         label="vision",
     )
@@ -267,7 +270,7 @@ def run_interactive(
         audio_backend,
         model_obj=model_obj,
         target_model_types={
-            litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW.value,
+            llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW,
         },
         label="audio",
     )
@@ -300,10 +303,13 @@ def run_interactive(
           cache_dir=cache_dir_val,
       )
     else:
+      ringbuffers_local_attention = model.resolve_ringbuffers_local_attention(
+          ringbuffers_local_attention, model_obj
+      )
       engine_cm = litert_lm.Engine(
           model_obj.model_path,
           backend=backend_val,  # pyrefly: ignore[bad-argument-type]
-          enable_speculative_decoding=speculative_decoding,
+          speculative_decoding_config=speculative_decoding_config,
           max_num_tokens=max_num_tokens,
           max_num_images=max_num_images,
           vision_backend=vision_backend_val,
@@ -578,8 +584,7 @@ def run(
     preset: str | None = None,
     backend: str | None = None,
     android: bool = False,
-    speculative_decoding: bool | None = None,
-    enable_speculative_decoding: bool | None = None,
+    speculative_decoding: str | None = None,
     verbose: bool = False,
     no_template: bool = False,
     chat_template: str | None = None,
@@ -614,10 +619,8 @@ def run(
       instructions.
     backend: The backend to use (cpu or gpu).
     android: Run on Android via ADB.
-    speculative_decoding: Speculative decoding mode (True, False, or None for
-      auto).
-    enable_speculative_decoding: Speculative decoding mode (True, False, or None
-      for auto).
+    speculative_decoding: Speculative decoding mode ("on", "off", "adaptive", or
+      None for the model's configured value).
     verbose: Whether to enable verbose logging.
     no_template: Interact with the model directly without applying prompt
       templates or stripping stop tokens.
@@ -648,9 +651,6 @@ def run(
     enable_ynnpack: Whether to delegate supported CPU operations to YNNPACK
       before XNNPACK.
   """
-  if speculative_decoding is None:
-    speculative_decoding = enable_speculative_decoding
-
   if attachment and no_template:
     click.echo(
         click.style(
@@ -722,28 +722,6 @@ def run(
     model_obj = model.Model.from_model_path(model_path)
   else:
     model_obj = model.Model.from_model_reference(model_reference)
-    if not model_obj.exists():
-      # Only auto-convert if it looks like a HuggingFace repo ID (account/repo)
-      # and is not a local path.
-      parts = model_reference.split("/")
-      if len(parts) == 2 and all(parts) and not os.path.exists(model_reference):
-        click.echo(
-            click.style(
-                f"Model '{model_reference}' not found. Attempting to convert"
-                f" from https://huggingface.co/{model_reference} ...",
-                fg="yellow",
-            )
-        )
-        model_obj = model.Model.from_model_reference(model_reference)
-
-      if not model_obj.exists():
-        click.echo(
-            click.style(
-                f"Failed to find or convert model '{model_reference}'.",
-                fg="red",
-            )
-        )
-        return
 
   max_num_images = None if num_images == 0 else num_images
 
@@ -753,7 +731,7 @@ def run(
       is_android=android,
       backend=backend,
       preset=preset,
-      enable_speculative_decoding=speculative_decoding,
+      speculative_decoding=speculative_decoding,
       no_template=no_template,
       chat_template=chat_template_content,
       max_num_tokens=max_num_tokens,

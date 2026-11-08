@@ -16,7 +16,11 @@
 
 // taze: BigInt from //third_party/javascript/node_modules/typescript:es2020.bigint
 
-import {ReadableStreamDataStreamWrapper} from './readable_stream_data_stream_wrapper.js';
+import {
+  ReadableStreamDataStreamResult,
+  ReadableStreamDataStreamWrapper,
+  ReadableStreamDataStreamWrapperInterface,
+} from './readable_stream_data_stream_wrapper';
 
 describe('ReadableStreamDataStreamWrapper', () => {
   let wasmHeap: {heap: Uint8Array};
@@ -217,6 +221,54 @@ describe('ReadableStreamDataStreamWrapper', () => {
             .toContain('overlaps discarded regions: [[2, 10]]');
       });
 
+      it('reads past unfetched data that was discarded', async () => {
+        const data = new Uint8Array(40).fill(0).map((_, i) => i);
+        const wrapper = createTestWrapper(data, /* bytesPerSlice= */ 8);
+        const ptr = 100;
+
+        // Read part of a section, then discard the whole section, including
+        // its unread end, which spans partial and whole slices.
+        const status = await wrapper.readAndDiscard(ptr, 0, 6);
+        expect(status.error).toBeUndefined();
+        expect(wrapper.discard(0, 27).error).toBeUndefined();
+
+        // Read the next section.
+        const status2 = await wrapper.readAndDiscard(ptr, 27, 10);
+        expect(status2.error).toBeUndefined();
+        expect(wasmHeap.heap.subarray(ptr, ptr + 10))
+            .toEqual(data.subarray(27, 37));
+
+        // The discarded data still can't be read.
+        const status3 = await wrapper.readAndPreserve(ptr, 20, 4);
+        expect(status3.error).toBeDefined();
+        expect(status3.error?.message)
+            .toContain('overlaps discarded regions: [[16, 24]]');
+      });
+
+      it('caches undiscarded data when reading past discarded data',
+         async () => {
+           const data = new Uint8Array(30).fill(0).map((_, i) => i);
+           const wrapper = createTestWrapper(data, /* bytesPerSlice= */ 8);
+           const ptr = 100;
+
+           // Discard unfetched data between two regions that are read later.
+           expect(wrapper.discard(4, 14).error).toBeUndefined();
+           const status = await wrapper.readAndPreserve(ptr, 20, 6);
+           expect(status.error).toBeUndefined();
+           expect(wasmHeap.heap.subarray(ptr, ptr + 6))
+               .toEqual(data.subarray(20, 26));
+
+           // Data before and after the discarded region was cached.
+           const status2 = await wrapper.readAndPreserve(ptr, 0, 4);
+           expect(status2.error).toBeUndefined();
+           expect(wasmHeap.heap.subarray(ptr, ptr + 4))
+               .toEqual(data.subarray(0, 4));
+           const status3 = await wrapper.readAndPreserve(ptr, 18, 2);
+           expect(status3.error).toBeUndefined();
+           expect(wasmHeap.heap.subarray(ptr, ptr + 2))
+               .toEqual(data.subarray(18, 20));
+         });
+
       it('does not crash when wasm heap is detached and replaced', async () => {
         const data = new Uint8Array(10).map((_, i) => i);
         const wrapper = createTestWrapper(data, 10);
@@ -233,6 +285,72 @@ describe('ReadableStreamDataStreamWrapper', () => {
         const status2 = await wrapper.readAndPreserve(5, 5, 5);
         expect(status2.error).toBeUndefined();
         expect(wasmHeap.heap.subarray(0, 10)).toEqual(data);
+      });
+
+      it('implements ReadableStreamDataStreamWrapperInterface with valid BigInt args', async () => {
+        const data = new Uint8Array(20).fill(0).map((_, i) => i);
+        const wrapper: ReadableStreamDataStreamWrapperInterface =
+            createTestWrapper(data, /* bytesPerSlice= */ 8);
+        const ptr = 100;
+
+        // readAndPreserve with valid BigInt
+        const preserveStatus: ReadableStreamDataStreamResult =
+            await wrapper.readAndPreserve(ptr, 4n, 12n);
+        expect(preserveStatus.error).toBeUndefined();
+        expect(wasmHeap.heap.subarray(ptr, ptr + 12))
+            .toEqual(data.subarray(4, 16));
+
+        // discard with valid BigInt
+        const discardStatus: ReadableStreamDataStreamResult =
+            wrapper.discard(0n, 4n);
+        expect(discardStatus.error).toBeUndefined();
+
+        // readAndDiscard with valid BigInt
+        const readDiscardStatus: ReadableStreamDataStreamResult =
+            await wrapper.readAndDiscard(ptr + 20, 16n, 4n);
+        expect(readDiscardStatus.error).toBeUndefined();
+        expect(wasmHeap.heap.subarray(ptr + 20, ptr + 24))
+            .toEqual(data.subarray(16, 20));
+      });
+
+      it('readAndDiscard fails gracefully on stream error', async () => {
+        const data = new Uint8Array(10);
+        const wrapper = createTestWrapper(data, 10, {shouldError: true});
+
+        const status = await wrapper.readAndDiscard(0, 0, 5);
+        expect(status.error).toBeDefined();
+        expect(status.error?.message).toContain('Simulated stream error');
+      });
+
+      it('readAndDiscard fails when BigInt exceeds MAX_SAFE_INTEGER', async () => {
+        const data = new Uint8Array(10);
+        const wrapper = createTestWrapper(data, 10);
+        const largeValue = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+
+        const status = await wrapper.readAndDiscard(0, largeValue, 1n);
+        expect(status.error).toBeDefined();
+        expect(status.error?.message).toContain('too large');
+      });
+
+      it('discard fails gracefully when BigInt exceeds MAX_SAFE_INTEGER', () => {
+        const data = new Uint8Array(10);
+        const wrapper = createTestWrapper(data, 10);
+        const largeValue = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+
+        const status = wrapper.discard(largeValue, 1n);
+        expect(status.error).toBeDefined();
+        expect(status.error?.message).toContain('too large');
+      });
+
+      it('discard handles zero and negative count gracefully', () => {
+        const data = new Uint8Array(10);
+        const wrapper = createTestWrapper(data, 10);
+
+        const statusZero = wrapper.discard(0, 0);
+        expect(statusZero.error).toBeUndefined();
+
+        const statusNegative = wrapper.discard(0, -5);
+        expect(statusNegative.error).toBeUndefined();
       });
     });
   }

@@ -33,6 +33,7 @@
 #include "runtime/executor/audio/audio_executor_settings.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/executor/speculative_decoding_mode.h"
 #include "runtime/executor/vision/vision_executor_settings.h"
 #include "runtime/proto/engine.pb.h"
 #include "runtime/proto/llm_metadata.pb.h"
@@ -156,6 +157,30 @@ class EngineSettings {
   std::optional<int> GetMaxVisionTokensPerImage() const;
   void SetMaxVisionTokensPerImage(int max_vision_tokens_per_image);
 
+  // Smallest vision signature capacity to load, or std::nullopt for no
+  // minimum. Smaller signatures are skipped to save memory. On web, the engine
+  // defaults this to the max, so only one signature is loaded.
+  std::optional<int> GetMinVisionTokensPerImage() const;
+  // Must be non-negative and not exceed the max vision tokens per image.
+  void SetMinVisionTokensPerImage(int min_vision_tokens_per_image);
+
+  // Default speculative decoding (MTP) configuration for the sessions of the
+  // engine. Each session can override any field with
+  // `SessionConfig::SetSpeculativeDecodingConfig()`.
+  //
+  // `mode`:
+  // - std::nullopt (default): kOff, unless the deprecated
+  //   `AdvancedSettings::enable_speculative_decoding` is true, which means
+  //   kOn.
+  // - kOff: sessions don't speculate unless they request it.
+  // - kOn / kAdaptive: the MTP drafter is loaded when the engine is created,
+  //   and sessions use this mode unless they request another one.
+  //
+  // The settings are stored in the main executor settings.
+  const SpeculativeDecodingConfig& GetSpeculativeDecodingConfig() const;
+  void SetSpeculativeDecodingConfig(
+      const SpeculativeDecodingConfig& speculative_decoding_config);
+
  private:
   explicit EngineSettings(
       LlmExecutorSettings executor_settings,
@@ -188,6 +213,9 @@ class EngineSettings {
 
   // Desired maximum number of vision tokens generated per image.
   std::optional<int> max_vision_tokens_per_image_;
+
+  // Smallest vision signature capacity to load.
+  std::optional<int> min_vision_tokens_per_image_;
 };
 std::ostream& operator<<(std::ostream& os, const EngineSettings& settings);
 
@@ -298,29 +326,42 @@ class SessionConfig {
     max_output_tokens_ = max_output_tokens;
   }
 
-  // Speculative decoding:
-  // Getters and setters for configuring speculative decoding in the session.
+  // Speculative decoding (MTP) configuration for the session. Fields left
+  // unset inherit the engine's configuration
+  // (`EngineSettings::GetSpeculativeDecodingConfig()`) when the session is
+  // created; `MaybeUpdateAndValidate()` fills them in.
   //
-  // Semantics & Caveats:
-  // - std::nullopt (default): Inherits the engine's speculative decoding
-  // configuration.
-  // - true: Enables speculative decoding for this session. If the engine was
-  //   not initialized with speculative decoding (e.g. MTP drafter was not
-  //   loaded at startup), setting this flag to true causes the executor
-  //   to perform lazy loading of the MTP drafter on the first session request
-  //   that requires it. Note that lazy loading may incur a one-time
-  //   initialization latency and requires that the model asset package contains
-  //   MTP drafter artifacts.
-  // - false: Explicitly disables speculative decoding for this session even if
-  //   the engine was initialized with speculative decoding enabled.
+  // `mode`:
+  // - std::nullopt (default): inherits the engine's mode (kOff by default).
+  // - kOff: never speculate, even if the engine speculates by default.
+  // - kOn: speculate on every decode step.
+  // - kAdaptive: speculate only while it is measured to be faster than plain
+  //   decoding. Adaptive gating is best effort:
+  //   - Any decoding constraint (e.g. a constrained decoder, a repetition
+  //     penalty or a thinking budget) disables the gating for that request and
+  //     speculation stays on, like kOn, because the constraint state is
+  //     not carried across plain and speculative steps.
+  //   - If the model has no usable MTP drafter, the session decodes plainly
+  //     instead of failing (kOn fails).
+  //   - The NPU executor does not support gating and speculates on every step,
+  //     like kOn.
+  //
+  // Caveats:
+  // - Lazy loading: If the engine's mode is kOff (the MTP drafter was not
+  //   loaded at startup), kOn and kAdaptive lazily load the MTP drafter on the
+  //   first session request that requires it (CPU/GPU only). This may incur a
+  //   one-time initialization latency and requires that the model asset
+  //   package contains MTP drafter artifacts. Lazy loading is not available
+  //   on the NPU executor (the session decodes plainly) or when the engine
+  //   streams the model weights at creation, which skips the drafter weights.
   // - Batching: Speculative decoding (MTP) only supports a single output head
   //   (batch size 1).
-  const std::optional<bool>& GetEnableSpeculativeDecoding() const {
-    return enable_speculative_decoding_;
+  const SpeculativeDecodingConfig& GetSpeculativeDecodingConfig() const {
+    return speculative_decoding_config_;
   }
-  void SetEnableSpeculativeDecoding(
-      std::optional<bool> enable_speculative_decoding) {
-    enable_speculative_decoding_ = enable_speculative_decoding;
+  void SetSpeculativeDecodingConfig(
+      const SpeculativeDecodingConfig& speculative_decoding_config) {
+    speculative_decoding_config_ = speculative_decoding_config;
   }
 
  private:
@@ -389,10 +430,9 @@ class SessionConfig {
   // session.
   int max_output_tokens_ = std::numeric_limits<int>::max();
 
-  // Whether to enable speculative decoding for the session.
-  // By default, std::nullopt (inherits the engine's speculative decoding
-  // configuration).
-  std::optional<bool> enable_speculative_decoding_ = std::nullopt;
+  // Speculative decoding configuration for the session.
+  // By default, every field is unset (inherits the engine's configuration).
+  SpeculativeDecodingConfig speculative_decoding_config_;
 };
 
 std::ostream& operator<<(std::ostream& os, const SessionConfig& config);

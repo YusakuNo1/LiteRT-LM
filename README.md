@@ -3,23 +3,15 @@
 LiteRT-LM is Google's **production-ready** orchestration layer to run LLMs with
 LiteRT, engineered for **high-performance**, **cross-platform** execution.
 
-🔗 [Product Website](https://ai.google.dev/edge/litert-lm) | 🌐✨
-[Web Demo](https://google-ai-edge.github.io/LiteRT-LM/web_demos/chat/index.html)
+🔗 [Product Website](https://ai.google.dev/edge/litert-lm) | 💬✨
+[Chat Demo](https://google-ai-edge.github.io/LiteRT-LM/web_demos/chat/index.html) | 🔎✨ [Embedding Demo](https://google-ai-edge.github.io/LiteRT-LM/web_demos/embedding_search/index.html)
 
-## 🔥 What's New: `v0.16.0`
-
-This release is a quick follow up to [`v0.15.0`](https://github.com/google-ai-edge/LiteRT-LM/releases/tag/v0.15.0) (which brought Apple Foundation
-Framework integration, CLI configuration, and JavaScript API Updates).
-
--   **📦 C API Prebuilts**: Added the first versioned C API shared library
-    [prebuilts](https://github.com/google-ai-edge/LiteRT-LM/releases/download/v0.16.0/litert_lm_c_api-0.1.0.zip)
-    for all supported platforms. This allows natively integrating LiteRT-LM into
-    your applications and creating language bindings without the hassle of
-    building shared libraries.
--   **🚀 Experimental YNNPACK Delegate**: Added the experimental
-    [YNNPACK](https://github.com/google/XNNPACK/tree/master/ynnpack)
-    delegate, enabled for linux arm64 builds in the LiteRT-LM CLI and Python
-    API.
+## 🔥 What's New: v0.19.0
+-   * **🎯 Accelerated Logit Masking**: Enables faster constrained decoding on GPUs, with full support for MTP-enabled decoding.
+-   * **🌐 Web SDK**: @litert-lm/core now stream-loads all models, defaults to the GPU backend, and supports image and audio inputs.
+-   * **🎙️ Speech Models**: Added support for multiple ASR and TTS models, including Qwen3-ASR, Kokoro, and Qwen3-TTS.
+-   * **🧱 C API 1.0.0 (Breaking)**: Functions that can fail now return LiteRtLmStatusCode with results in out_* parameters, and only litert_lm_* symbols are exported.
+-   * **⚙️ Performance & Platform**: GPU sampling now matches CPU for the same seed, ModelInfo is faster and uses less memory.
 
 👉 Try Gemma4-E4B with MTP on Linux, macOS, Windows or Raspberry Pi with the
 [LiteRT-LM CLI](https://ai.google.dev/edge/litert-lm/cli):
@@ -29,7 +21,7 @@ litert-lm run  \
    --from-huggingface-repo=litert-community/gemma-4-E4B-it-litert-lm \
    gemma-4-E4B-it.litertlm \
    --backend=gpu \
-   --enable-speculative-decoding=true \
+   --speculative-decoding=on \
    --prompt="What is the capital of France?"
 ```
 

@@ -40,8 +40,10 @@
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/components/top_p_cpu_sampler.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/executor/executor_stats.h"
 #include "runtime/executor/fake_llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
+#include "runtime/executor/speculative_decoding_mode.h"
 #include "runtime/framework/threadpool.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/status_macros.h"
@@ -166,6 +168,95 @@ TEST_F(TasksTest, PrefillTooLong) {
   EXPECT_THAT(task_respones, StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
+TEST_F(TasksTest, PrefillExceedsRemainingContext) {
+  const std::string prompt = "Hello World!";
+  std::optional<BenchmarkInfo> benchmark_info;
+
+  ASSERT_OK_AND_ASSIGN(std::vector<int> token_ids,
+                       tokenizer_->TextToTokenIds(prompt));
+  // Prepend the bos token id.
+  token_ids.insert(token_ids.begin(), 2);
+  // The input alone fits, but not together with the tokens already in the
+  // context (e.g. from previous turns).
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       executor_->GetExecutorSettings());
+  executor_settings.SetMaxNumTokens(token_ids.size() + 4);
+  ASSERT_OK(executor_->UpdateExecutorSettings(executor_settings));
+  ASSERT_OK(executor_->SetCurrentStep(5));
+  ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                       tokenizer_->TokenIdsToTensorBuffer(token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+
+  auto task_responses =
+      Tasks::Prefill(*executor_, inputs,
+                     /*wait_for_completion=*/true, benchmark_info);
+
+  EXPECT_THAT(task_responses, StatusIs(absl::StatusCode::kResourceExhausted));
+  // The prefill must not have reached the executor.
+  ASSERT_OK_AND_ASSIGN(int current_step, executor_->GetCurrentStep());
+  EXPECT_EQ(current_step, 5);
+}
+
+TEST_F(TasksTest, PrefillFillingRemainingContextFails) {
+  const std::string prompt = "Hello World!";
+  std::optional<BenchmarkInfo> benchmark_info;
+
+  ASSERT_OK_AND_ASSIGN(std::vector<int> token_ids,
+                       tokenizer_->TextToTokenIds(prompt));
+  // Prepend the bos token id.
+  token_ids.insert(token_ids.begin(), 2);
+  // The input exactly fills the space left in the context, so no room would be
+  // left for the decode that follows.
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       executor_->GetExecutorSettings());
+  executor_settings.SetMaxNumTokens(5 + token_ids.size());
+  ASSERT_OK(executor_->UpdateExecutorSettings(executor_settings));
+  ASSERT_OK(executor_->SetCurrentStep(5));
+  ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                       tokenizer_->TokenIdsToTensorBuffer(token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+
+  auto task_responses =
+      Tasks::Prefill(*executor_, inputs,
+                     /*wait_for_completion=*/true, benchmark_info);
+
+  EXPECT_THAT(task_responses, StatusIs(absl::StatusCode::kResourceExhausted));
+  // The prefill must not have reached the executor.
+  ASSERT_OK_AND_ASSIGN(int current_step, executor_->GetCurrentStep());
+  EXPECT_EQ(current_step, 5);
+}
+
+TEST_F(TasksTest, PrefillLeavingOneTokenForDecodeSucceeds) {
+  const std::string prompt = "Hello World!";
+  std::optional<BenchmarkInfo> benchmark_info;
+
+  ASSERT_OK_AND_ASSIGN(std::vector<int> token_ids,
+                       tokenizer_->TextToTokenIds(prompt));
+  // Prepend the bos token id.
+  token_ids.insert(token_ids.begin(), 2);
+  // After the input, one token is left in the context for the decode.
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       executor_->GetExecutorSettings());
+  executor_settings.SetMaxNumTokens(5 + token_ids.size() + 1);
+  ASSERT_OK(executor_->UpdateExecutorSettings(executor_settings));
+  ASSERT_OK(executor_->SetCurrentStep(5));
+  ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                       tokenizer_->TokenIdsToTensorBuffer(token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+
+  ASSERT_OK_AND_ASSIGN(
+      auto task_response,
+      Tasks::Prefill(*executor_, inputs,
+                     /*wait_for_completion=*/true, benchmark_info));
+
+  EXPECT_EQ(task_response.GetTaskState(), TaskState::kDone);
+  ASSERT_OK_AND_ASSIGN(int current_step, executor_->GetCurrentStep());
+  EXPECT_EQ(current_step, 5 + static_cast<int>(token_ids.size()));
+}
+
 TEST_F(TasksTest, PrefillSucceed) {
   const std::string prompt = "Hello World!";
   std::optional<BenchmarkInfo> benchmark_info;
@@ -185,6 +276,25 @@ TEST_F(TasksTest, PrefillSucceed) {
                      /*wait_for_completion=*/true, benchmark_info));
 
   EXPECT_EQ(task_response.GetTaskState(), TaskState::kDone);
+}
+
+TEST_F(TasksTest, PrefillWithBenchmarkReportsMaxNumTokens) {
+  ASSERT_OK_AND_ASSIGN(auto* executor_settings,
+                       executor_->GetMutableExecutorSettings());
+  executor_settings->SetMaxNumTokens(512);
+  std::optional<BenchmarkInfo> benchmark_info(std::in_place,
+                                              proto::BenchmarkParams());
+  EXPECT_EQ(benchmark_info->GetMaxNumTokens(), 0);
+
+  std::vector<int> prefill_token_ids = {2, 90, 547, 58, 735, 210, 466, 2294};
+  ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                       tokenizer_->TokenIdsToTensorBuffer(prefill_token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+  ASSERT_OK(Tasks::Prefill(*executor_, inputs, /*wait_for_completion=*/true,
+                           benchmark_info));
+
+  EXPECT_EQ(benchmark_info->GetMaxNumTokens(), 512);
 }
 
 TEST_F(TasksTest, DecodeSucceed) {
@@ -222,6 +332,165 @@ TEST_F(TasksTest, DecodeSucceed) {
   EXPECT_EQ(task_responses.GetTokenIds().size(), 1);
   EXPECT_THAT(task_responses.GetTokenIds()[0],
               ElementsAre(224, 24, 8, 66, 246, 18, 2295));
+}
+
+// A fake executor that reports executor stats and counts stat resets.
+class StatsFakeLlmExecutor : public FakeLlmExecutor {
+ public:
+  using FakeLlmExecutor::FakeLlmExecutor;
+
+  std::optional<ExecutorStats> GetExecutorStats() const override {
+    return stats_;
+  }
+  void ResetExecutorStats() override {
+    ++num_resets_;
+    stats_ = ExecutorStats{.module_name = std::string(kLlmModuleName)};
+    stats_.AccumulatePlainStep(absl::Milliseconds(10));
+  }
+
+  ExecutorStats stats_{.module_name = "stale"};
+  int num_resets_ = 0;
+};
+
+TEST_F(TasksTest, DecodeWithBenchmarkResetsAndReportsExecutorStats) {
+  StatsFakeLlmExecutor executor(
+      tokenizer_->GetVocabSize(),
+      {{2, 90, 547, 58, 735, 210, 466, 2294}, {2, 90}},
+      {{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}, {224}, {2294}});
+  std::optional<BenchmarkInfo> benchmark_info(std::in_place,
+                                              proto::BenchmarkParams());
+  constexpr int kNumOutputCandidates = 1;
+  StopTokenDetector stop_token_detector(kNumOutputCandidates);
+  ASSERT_OK(stop_token_detector.AddStopTokenSequence({2294}));
+
+  const auto run_turn = [&](const std::vector<int>& prefill_token_ids) {
+    ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                         tokenizer_->TokenIdsToTensorBuffer(prefill_token_ids));
+    ExecutorTextData text_data(std::move(token_ids_buffer));
+    ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+    ASSERT_OK(Tasks::Prefill(executor, inputs, /*wait_for_completion=*/true,
+                             benchmark_info));
+    absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback = nullptr;
+    ASSERT_OK(Tasks::Decode(
+        executor, *tokenizer_, stop_token_detector, kNumOutputCandidates,
+        benchmark_info,
+        /*sampler=*/std::nullopt, RepetitionPenaltyConfig::Default(),
+        NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
+        /*constraint=*/nullptr, /*decoded_ids=*/std::nullopt,
+        /*callback=*/callback, /*cancelled=*/nullptr));
+  };
+
+  run_turn({2, 90, 547, 58, 735, 210, 466, 2294});
+  // The stale stats from before the first decode turn are discarded.
+  EXPECT_EQ(executor.num_resets_, 1);
+  ASSERT_TRUE(benchmark_info->GetExecutorStats().has_value());
+  EXPECT_EQ(benchmark_info->GetExecutorStats()->module_name, kLlmModuleName);
+  EXPECT_EQ(benchmark_info->GetExecutorStats()->plain_steps(), 1);
+
+  // Later turns keep accumulating: no reset, and the latest stats are copied.
+  executor.stats_.AccumulatePlainStep(absl::Milliseconds(10));
+  run_turn({2, 90});
+  EXPECT_EQ(executor.num_resets_, 1);
+  ASSERT_TRUE(benchmark_info->GetExecutorStats().has_value());
+  EXPECT_EQ(benchmark_info->GetExecutorStats()->plain_steps(), 2);
+}
+
+TEST_F(TasksTest, DecodeCancelledWithBenchmarkReportsExecutorStats) {
+  StatsFakeLlmExecutor executor(tokenizer_->GetVocabSize(),
+                                {{2, 90, 547, 58, 735, 210, 466, 2294}},
+                                {{224}, {2294}});
+  std::optional<BenchmarkInfo> benchmark_info(std::in_place,
+                                              proto::BenchmarkParams());
+
+  std::vector<int> prefill_token_ids = {2, 90, 547, 58, 735, 210, 466, 2294};
+  ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                       tokenizer_->TokenIdsToTensorBuffer(prefill_token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+  ASSERT_OK(Tasks::Prefill(executor, inputs, /*wait_for_completion=*/true,
+                           benchmark_info));
+
+  constexpr int kNumOutputCandidates = 1;
+  StopTokenDetector stop_token_detector(kNumOutputCandidates);
+  ASSERT_OK(stop_token_detector.AddStopTokenSequence({2294}));
+  absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback = nullptr;
+  // Cancel before the first step so that the decode loop takes the
+  // cancellation path deterministically.
+  std::atomic<bool> cancelled = true;
+  EXPECT_THAT(
+      Tasks::Decode(
+          executor, *tokenizer_, stop_token_detector, kNumOutputCandidates,
+          benchmark_info,
+          /*sampler=*/std::nullopt, RepetitionPenaltyConfig::Default(),
+          NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
+          /*constraint=*/nullptr, /*decoded_ids=*/std::nullopt,
+          /*callback=*/callback, &cancelled),
+      testing::status::StatusIs(absl::StatusCode::kCancelled));
+
+  EXPECT_EQ(executor.num_resets_, 1);
+  ASSERT_TRUE(benchmark_info->GetExecutorStats().has_value());
+  EXPECT_EQ(benchmark_info->GetExecutorStats()->module_name, kLlmModuleName);
+  EXPECT_EQ(benchmark_info->GetExecutorStats()->plain_steps(), 1);
+}
+
+TEST_F(TasksTest, DecodeWithoutBenchmarkDoesNotResetExecutorStats) {
+  StatsFakeLlmExecutor executor(
+      tokenizer_->GetVocabSize(), {{2, 90, 547, 58, 735, 210, 466, 2294}},
+      {{224}, {24}, {8}, {66}, {246}, {18}, {2295}, {2294}});
+  std::optional<BenchmarkInfo> benchmark_info;
+
+  std::vector<int> prefill_token_ids = {2, 90, 547, 58, 735, 210, 466, 2294};
+  ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                       tokenizer_->TokenIdsToTensorBuffer(prefill_token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+  ASSERT_OK(Tasks::Prefill(executor, inputs, /*wait_for_completion=*/true,
+                           benchmark_info));
+
+  constexpr int kNumOutputCandidates = 1;
+  StopTokenDetector stop_token_detector(kNumOutputCandidates);
+  ASSERT_OK(stop_token_detector.AddStopTokenSequence({2294}));
+  absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback = nullptr;
+  ASSERT_OK(Tasks::Decode(
+      executor, *tokenizer_, stop_token_detector, kNumOutputCandidates,
+      benchmark_info,
+      /*sampler=*/std::nullopt, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
+      /*constraint=*/nullptr, /*decoded_ids=*/std::nullopt,
+      /*callback=*/callback, /*cancelled=*/nullptr));
+
+  EXPECT_EQ(executor.num_resets_, 0);
+}
+
+TEST_F(TasksTest, DecodeForwardsSpeculativeDecodingMode) {
+  std::optional<BenchmarkInfo> benchmark_info;
+  std::vector<int> prefill_token_ids = {2, 90, 547, 58, 735, 210, 466, 2294};
+  ASSERT_OK_AND_ASSIGN(auto token_ids_buffer,
+                       tokenizer_->TokenIdsToTensorBuffer(prefill_token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+  ASSERT_OK(Tasks::Prefill(*executor_, inputs, /*wait_for_completion=*/true,
+                           benchmark_info));
+
+  constexpr int kNumOutputCandidates = 1;
+  StopTokenDetector stop_token_detector(kNumOutputCandidates);
+  ASSERT_OK(stop_token_detector.AddStopTokenSequence({2294}));
+  absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback = nullptr;
+
+  ASSERT_OK(Tasks::Decode(
+      *executor_, *tokenizer_, stop_token_detector, kNumOutputCandidates,
+      benchmark_info,
+      /*sampler=*/std::nullopt, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
+      /*constraint=*/nullptr, /*decoded_ids=*/std::nullopt,
+      /*callback=*/callback, /*cancelled=*/nullptr,
+      /*max_output_tokens=*/std::numeric_limits<int>::max(),
+      /*thinking_token_budget=*/std::nullopt,
+      /*thinking_end_token_ids=*/{}, /*thinking_start_token_ids=*/{},
+      /*speculative_decoding_config=*/
+      {.mode = SpeculativeDecodingMode::kAdaptive}));
+  EXPECT_EQ(executor_->last_decode_speculative_decoding_config().mode,
+            SpeculativeDecodingMode::kAdaptive);
 }
 
 TEST_F(TasksTest, DecodeWithCancellation) {
@@ -1010,6 +1279,57 @@ TEST_F(TasksTest, DecodeConsecutiveByteTokensWithNonByteTokens) {
   EXPECT_EQ(step_results[0], "k");
   EXPECT_EQ(step_results[1], "m");
   EXPECT_EQ(step_results[2], "²");
+}
+
+TEST_F(TasksTest, DecodeFullwidthCurrencyByteTokens) {
+  constexpr int kNumOutputCandidates = 1;
+  constexpr int kVocabSize = 262144;
+  std::vector<std::vector<int>> prefill_tokens = {{2}};
+  // <0xEF> (477), <0xBF> (429), <0xA1> (399) -> "￡" (U+FFE1)
+  // <0xEF> (477), <0xBF> (429), <0xA6> (404) -> "￦" (U+FFE6)
+  std::vector<std::vector<int>> decode_tokens = {{477}, {429}, {399}, {477},
+                                                 {429}, {404}, {0}};
+
+  auto executor = std::make_unique<FakeLlmExecutor>(
+      kVocabSize, prefill_tokens, decode_tokens, kNumOutputCandidates);
+
+  std::optional<BenchmarkInfo> benchmark_info;
+
+  std::vector<int> prefill_token_ids = {2};
+  ASSERT_OK_AND_ASSIGN(
+      auto token_ids_buffer,
+      gemma3_tokenizer_->TokenIdsToTensorBuffer(prefill_token_ids));
+  ExecutorTextData text_data(std::move(token_ids_buffer));
+  ExecutorInputs inputs(std::move(text_data), std::nullopt, std::nullopt);
+  ASSERT_OK(Tasks::Prefill(*executor, inputs, /*wait_for_completion=*/true,
+                           benchmark_info));
+
+  StopTokenDetector stop_token_detector(kNumOutputCandidates);
+  ASSERT_OK(stop_token_detector.AddStopTokenSequence({0}));
+
+  std::vector<std::string> step_results;
+  absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback =
+      [&](absl::StatusOr<Responses> responses) {
+        ASSERT_OK(responses);
+        if (responses->GetTaskState() == TaskState::kProcessing) {
+          ASSERT_EQ(responses->GetTexts().size(), 1);
+          step_results.push_back(responses->GetTexts()[0]);
+        }
+      };
+
+  auto task_responses = Tasks::Decode(
+      *executor, *gemma3_tokenizer_, stop_token_detector, kNumOutputCandidates,
+      benchmark_info, /*sampler=*/std::nullopt,
+      RepetitionPenaltyConfig::Default(), NoRepeatNgramConfig::Default(),
+      SuppressTokensConfig::Default(),
+      /*constraint=*/nullptr, /*decoded_ids=*/std::nullopt,
+      /*callback=*/callback, /*cancelled=*/nullptr);
+
+  ASSERT_OK(task_responses);
+
+  ASSERT_EQ(step_results.size(), 2);
+  EXPECT_EQ(step_results[0], "￡");
+  EXPECT_EQ(step_results[1], "￦");
 }
 
 TEST_F(TasksTest, DecodeConsecutiveByteTokensWithPartialBpeIgnored) {

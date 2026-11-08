@@ -33,11 +33,15 @@
 #include "litert/cc/internal/scoped_file.h"  // from @litert  // IWYU pragma: keep
 #include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/executor/executor_settings_base.h"
+#include "runtime/executor/llm_executor_settings.h"
+#include "runtime/executor/speculative_decoding_mode.h"
 #include "runtime/proto/engine.pb.h"
 #include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/llm_model_type.pb.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/proto/token.pb.h"
+#include "runtime/util/file_data_stream.h"
+#include "runtime/util/litert_lm_streaming_loader.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
 #include "support/tokenizer/tokenizer.h"
 
@@ -151,6 +155,18 @@ TEST(EngineSettingsTest, VisionExecutorSettingsNotSet) {
   auto settings = EngineSettings::CreateDefault(*model_assets, Backend::CPU);
   ASSERT_OK(settings);
   EXPECT_FALSE(settings->GetVisionExecutorSettings().has_value());
+  EXPECT_EQ(settings->GetMainExecutorSettings().GetMaxNumImages(),
+            kDefaultMaxNumImages);
+}
+
+TEST(EngineSettingsTest, CreateDefaultWithVisionSetsDefaultMaxNumImages) {
+  auto model_assets = ModelAssets::Create("test_model_path_1");
+  ASSERT_OK(model_assets);
+  auto settings =
+      EngineSettings::CreateDefault(*model_assets, Backend::CPU, Backend::GPU);
+  ASSERT_OK(settings);
+  EXPECT_EQ(settings->GetMainExecutorSettings().GetMaxNumImages(),
+            kDefaultMaxNumImages);
 }
 
 TEST(EngineSettingsTest, VisionExecutorSettingsSetAndGetBackend) {
@@ -776,6 +792,18 @@ TEST(EngineSettingsTest, MaxVisionTokensPerImage) {
   settings->SetMaxVisionTokensPerImage(200);
   EXPECT_TRUE(settings->GetMaxVisionTokensPerImage().has_value());
   EXPECT_EQ(settings->GetMaxVisionTokensPerImage().value(), 200);
+}
+
+TEST(EngineSettingsTest, MinVisionTokensPerImage) {
+  auto model_assets = ModelAssets::Create("test_model_path_1");
+  ASSERT_OK(model_assets);
+  auto settings = EngineSettings::CreateDefault(*model_assets);
+  ASSERT_OK(settings);
+
+  EXPECT_FALSE(settings->GetMinVisionTokensPerImage().has_value());
+
+  settings->SetMinVisionTokensPerImage(140);
+  EXPECT_EQ(settings->GetMinVisionTokensPerImage(), 140);
 }
 
 absl::Status IsExpectedLlmMetadata(const proto::LlmMetadata& llm_metadata) {
@@ -1491,6 +1519,35 @@ TEST(SessionConfigTest, SetAndGetSamplerBackend) {
   EXPECT_EQ(session_config.GetSamplerBackend(), Backend::CPU);
   session_config.SetSamplerBackend(Backend::GPU);
   EXPECT_EQ(session_config.GetSamplerBackend(), Backend::GPU);
+}
+
+TEST(SessionConfigTest, SetAndGetSpeculativeDecodingConfig) {
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  EXPECT_FALSE(session_config.GetSpeculativeDecodingConfig().mode.has_value());
+  {
+    std::stringstream oss;
+    oss << session_config;
+    EXPECT_THAT(
+        oss.str(),
+        ContainsRegex("  SpeculativeDecodingConfig: "
+                      "SpeculativeDecodingConfig\\{mode: Not set\\}\n"));
+  }
+
+  session_config.SetSpeculativeDecodingConfig(
+      {.mode = SpeculativeDecodingMode::kAdaptive});
+  EXPECT_EQ(session_config.GetSpeculativeDecodingConfig().mode,
+            SpeculativeDecodingMode::kAdaptive);
+  {
+    std::stringstream oss;
+    oss << session_config;
+    EXPECT_THAT(
+        oss.str(),
+        ContainsRegex("  SpeculativeDecodingConfig: "
+                      "SpeculativeDecodingConfig\\{mode: ADAPTIVE\\}\n"));
+  }
+
+  session_config.SetSpeculativeDecodingConfig({});
+  EXPECT_FALSE(session_config.GetSpeculativeDecodingConfig().mode.has_value());
 }
 
 TEST(SessionConfigTest,

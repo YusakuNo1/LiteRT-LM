@@ -36,12 +36,14 @@ object ExperimentalFlags {
   /**
    * Whether to enable speculative decoding.
    *
-   * If null, use the model's default. If true, enable speculative decoding; an error will be thrown
-   * if the model does not support it. If false, disable it.
+   * Deprecated: use [EngineConfig.speculativeDecodingConfig] instead. Read only when that config
+   * sets no mode: `true` is mode [SpeculativeDecodingMode.ON] and `false` is mode
+   * [SpeculativeDecodingMode.OFF]; `null` leaves the runtime default (off).
    *
    * Note: This flag is read only when a new [Engine] is created. Changing this value will not
    * affect any existing [Engine] or [Conversation] instances.
    */
+  @Deprecated("Use EngineConfig.speculativeDecodingConfig instead.")
   var enableSpeculativeDecoding: Boolean? = null
 
   /**
@@ -110,6 +112,20 @@ object ExperimentalFlags {
    *    engine's max visual tokens per image.
    */
   var visualTokenBudget: Int? = null
+
+  /**
+   * Whether YNNPACK should delegate supported CPU operations before XNNPACK.
+   *
+   * If null, use the engine's default. If true, force enable YNNPACK. If false, force disable
+   * YNNPACK.
+   *
+   * Note: This flag is read only when a new [Engine] is created or [benchmark] is called. Changing
+   * this value will not affect any existing [Engine], [Conversation], or [Session] instances.
+   *
+   * This feature requires build-time flag "--define=litert_enable_ynnpack=true". The release
+   * version might not have it.
+   */
+  var enableYnnpack: Boolean? = null
 }
 
 // Mark this annotation itself as requiring opt-in

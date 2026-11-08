@@ -50,12 +50,20 @@ class StageBase {
   virtual bool NeedSchedule() const = 0;
 
   // Schedules and executes jobs of this stage on the current calling thread.
-  // Returns absl::NotFoundError if there are no jobs to execute.
+  // Returns `absl::NotFoundError` if there are currently no jobs ready to
+  // execute (e.g., the stage is already running, or buffered streaming inputs
+  // are not yet sufficient to form a complete chunk before end-of-stream), or
+  // `absl::OutOfRangeError` if a source stage has reached the end of the input
+  // stream and has no more outputs to produce.
   virtual absl::Status Schedule() = 0;
 
   // Indicates whether the stage's output queue contains 1 or more outputs in a
   // thread-safe manner.
   virtual bool HasOutput() const = 0;
+
+  // Flushes any remaining buffered state into the stage's output queue at the
+  // end of a stream.
+  virtual absl::Status Flush() = 0;
 
   // Resets internal cached state and clears outputs for a new stream/session.
   virtual void Reset() = 0;
@@ -101,13 +109,9 @@ class SingleThreadedStageWithDeque : public Stage<T> {
   }
 
   absl::Status Schedule() override {
-    {
-      absl::MutexLock lock(mutex_);
-      if (state_ != State::kIdle) {
-        return absl::NotFoundError(
-            "This stage is already running or being scheduled.");
-      }
-      state_ = State::kScheduling;
+    if (!SetStateIfState(State::kIdle, State::kScheduling)) {
+      return absl::NotFoundError(
+          "This stage is already running or being scheduled.");
     }
     return ScheduleInternal();
   }
@@ -125,6 +129,13 @@ class SingleThreadedStageWithDeque : public Stage<T> {
     T item = std::move(outputs_.front());
     outputs_.pop_front();
     return item;
+  }
+
+  absl::Status Flush() override {
+    WaitForStateThenSetState(State::kIdle, State::kRunning);
+    absl::Status status = FlushInternal();
+    SetState(State::kIdle);
+    return status;
   }
 
   void Reset() override {
@@ -152,9 +163,21 @@ class SingleThreadedStageWithDeque : public Stage<T> {
   // This method is called by Schedule() on the calling thread.
   virtual absl::Status ScheduleInternal() = 0;
 
+  // Subclasses can override this method to flush subclass-specific state.
+  virtual absl::Status FlushInternal() { return absl::OkStatus(); }
+
   void SetState(State state) {
     absl::MutexLock lock(mutex_);
     state_ = state;
+  }
+
+  bool SetStateIfState(State expected_state, State new_state) {
+    absl::MutexLock lock(mutex_);
+    if (state_ != expected_state) {
+      return false;
+    }
+    state_ = new_state;
+    return true;
   }
 
   void WaitForStateThenSetState(State expected_state, State new_state) {

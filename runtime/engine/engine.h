@@ -31,6 +31,7 @@
 #include "runtime/components/model_resources.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/proto/llm_metadata.pb.h"
 #include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
@@ -323,6 +324,22 @@ class SessionInterface {
     return absl::UnimplementedError("RewindToCheckpoint not implemented.");
   }
 
+  // Save the current step and processed context with the name `label`. You can
+  // later restore to this context using `RestoreContext(label)`.
+  // Saved contexts are single-use and are consumed upon restore.
+  // If the label already exists, it will be overwritten.
+  virtual absl::Status SaveContext(absl::string_view label) {
+    return absl::UnimplementedError("SaveContext not implemented.");
+  }
+
+  // Restores the session to the given saved context, restoring and consuming
+  // the processed context. The saved context itself and any checkpoints after
+  // the restored step will be removed. Returns an error if the label does not
+  // exist.
+  virtual absl::Status RestoreContext(absl::string_view label) {
+    return absl::UnimplementedError("RestoreContext not implemented.");
+  }
+
   // Rewinds the session to a specific step number.
   virtual absl::Status RewindToStep(int step) {
     return absl::UnimplementedError("RewindToStep not implemented.");
@@ -387,13 +404,14 @@ class EngineT {
   // Get the reference to the tokenizer for the engine for a specific model
   // type. Defaults to GetTokenizer() for kTfLitePrefillDecode.
   virtual absl::StatusOr<const support::Tokenizer*> GetTokenizer(
-      ModelType model_type) const {
-    if (model_type == ModelType::kTfLitePrefillDecode) {
+      proto::LlmMetadata::TfLiteModelType model_type) const {
+    if (model_type == proto::LlmMetadata::TF_LITE_PREFILL_DECODE) {
       return &GetTokenizer();
     }
-    return absl::UnimplementedError(absl::StrCat("GetTokenizer for model type ",
-                                                 ModelTypeToString(model_type),
-                                                 " is not implemented."));
+    return absl::UnimplementedError(
+        absl::StrCat("GetTokenizer for model type ",
+                     proto::LlmMetadata::TfLiteModelType_Name(model_type),
+                     " is not implemented."));
   }
 
   // Get the audio model properties for the session. This is only available

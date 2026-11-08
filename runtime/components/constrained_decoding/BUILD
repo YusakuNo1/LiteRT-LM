@@ -41,6 +41,66 @@ cc_library(
 )
 
 cc_library(
+    name = "litert_logit_mask_runner",
+    srcs = ["litert_logit_mask_runner.cc"],
+    hdrs = ["litert_logit_mask_runner.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":logit_mask",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@litert//litert/cc:litert_common",
+        "@litert//litert/cc:litert_element_type",
+        "@litert//litert/cc:litert_environment",
+        "@litert//litert/cc:litert_event",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_options",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//litert/cc:litert_tensor_buffer_types",
+        "@litert//litert/cc/options:litert_gpu_options",
+        "@litert//tensor",
+        "@litert//tensor:arithmetic",
+        "@litert//tensor:buffer",
+        "@litert//tensor:datatypes",
+        "@litert//tensor/backends/tflite:arithmetic_tflite",
+        "@litert//tensor/runners/litert:lambda_model_runner",
+        "@litert//tensor/runners/litert:litert_buffer",
+        "//runtime/util:convert_tensor_buffer",
+        "//runtime/util:litert_status_util",
+        "@litert//tflite/types:half",
+    ],
+)
+
+cc_test(
+    name = "litert_logit_mask_runner_test",
+    srcs = ["litert_logit_mask_runner_test.cc"],
+    deps = [
+        ":litert_logit_mask_runner",
+        ":logit_mask",
+        ":repetition_penalty_constraint",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@litert//litert/cc:litert_common",
+        "@litert//litert/cc:litert_element_type",
+        "@litert//litert/cc:litert_environment",
+        "@litert//litert/cc:litert_layout",
+        "@litert//litert/cc:litert_ranked_tensor_type",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//litert/cc:litert_tensor_buffer_types",
+        "@litert//litert/test:matchers",
+        "//runtime/util:convert_tensor_buffer",
+        "//runtime/util:litert_status_util",
+        "//runtime/util:test_utils",
+        "@litert//tflite/types:half",
+    ],
+)
+
+cc_library(
     name = "constraint",
     srcs = ["constraint.cc"],
     hdrs = ["constraint.h"],
@@ -147,17 +207,19 @@ cc_library(
     ],
     deps = [
         ":constraint",
+        ":litert_logit_mask_runner",
+        ":logit_mask",
+        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
-        "@litert//litert/cc:litert_element_type",
-        "@litert//litert/cc:litert_layout",
+        "@litert//litert/cc:litert_common",
+        "@litert//litert/cc:litert_environment",
         "@litert//litert/cc:litert_macros",
         "@litert//litert/cc:litert_tensor_buffer",
-        "@litert//litert/cc:litert_tensor_buffer_types",
         "//runtime/util:convert_tensor_buffer",
         "//runtime/util:litert_status_util",
-        "@litert//tflite/types:half",
     ],
 )
 
@@ -251,10 +313,11 @@ cc_library(
         ":logit_mask",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
-        "@crate_index__llguidance-1.3.0//:llguidance_cc"
+        "@crate_index__llguidance-1.9.1//:llguidance_cc"
     ] + select({
         "@platforms//os:windows": [
             "//rust:alloc_defs",
@@ -284,7 +347,7 @@ cc_library(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/container:flat_hash_set",
         "//support/tokenizer",
-        "@crate_index__llguidance-1.3.0//:llguidance_cc"
+        "@crate_index__llguidance-1.9.1//:llguidance_cc"
     ] + select({
         "@platforms//os:windows": [
             "//rust:alloc_defs",
@@ -292,6 +355,21 @@ cc_library(
         ],
         "//conditions:default": [],
     }),
+)
+
+cc_library(
+    name = "llg_constraint_provider_noop",
+    srcs = ["llg_constraint_provider_noop.cc"],
+    hdrs = ["llg_constraint_provider.h"],
+    deps = [
+        ":constraint",
+        ":constraint_provider",
+        ":constraint_provider_config",
+        ":llg_constraint_config",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "//support/tokenizer",
+    ],
 )
 
 cc_library(
@@ -329,11 +407,13 @@ cc_library(
     ],
     deps = [
         ":tool_utils",
+        "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
         "@nlohmann_json//:json",
     ],
 )
@@ -368,6 +448,7 @@ cc_test(
     deps = [
         ":llguidance_schema_utils",
         "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/strings",
         "@nlohmann_json//:json",
     ],
 )
@@ -408,7 +489,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "//support/tokenizer",
         "//runtime/util:test_utils",
-        "@crate_index__llguidance-1.3.0//:llguidance_cc"
+        "@crate_index__llguidance-1.9.1//:llguidance_cc"
     ],
 )
 
@@ -450,19 +531,32 @@ cc_test(
 
 cc_library(
     name = "constraint_provider_factory",
-    srcs = ["constraint_provider_factory.cc"],
+    srcs = select({
+        "//build_config:disable_constrained_decoding": [
+            "constraint_provider_factory_noop.cc",
+        ],
+        "//conditions:default": ["constraint_provider_factory.cc"],
+    }),
     hdrs = ["constraint_provider_factory.h"],
     deps = [
         ":constraint_provider",
         ":constraint_provider_config",
-        ":external_constraint_config",
-        ":external_constraint_provider",
-        ":llg_constraint_config",
-        ":llg_constraint_provider",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "//support/tokenizer",
-    ],
+    ] + select({
+        "//build_config:disable_constrained_decoding": [],
+        "//conditions:default": [
+            ":external_constraint_config",
+            ":external_constraint_provider",
+            ":llg_constraint_config",
+        ],
+    }) + select({
+        "//build_config:disable_llguidance": [
+            ":llg_constraint_provider_noop",
+        ],
+        "//conditions:default": [":llg_constraint_provider"],
+    }),
 )
 
 cc_test(
@@ -484,6 +578,38 @@ cc_test(
 )
 
 cc_library(
+    name = "constraint_provider_factory_noop",
+    srcs = ["constraint_provider_factory_noop.cc"],
+    hdrs = ["constraint_provider_factory.h"],
+    deps = [
+        ":constraint_provider",
+        ":constraint_provider_config",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "//support/tokenizer",
+    ],
+)
+
+cc_test(
+    name = "constraint_provider_factory_noop_test",
+    srcs = ["constraint_provider_factory_noop_test.cc"],
+    deps = [
+        ":constraint_provider_config",
+        ":constraint_provider_factory_noop",
+        ":external_constraint_config",
+        ":llg_constraint_config",
+        ":llg_constraint_provider_noop",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+    ],
+)
+
+cc_library(
     name = "thinking_budget_constraint",
     srcs = ["thinking_budget_constraint.cc"],
     hdrs = ["thinking_budget_constraint.h"],
@@ -492,8 +618,12 @@ cc_library(
         ":bitmap",
         ":constraint",
         ":logit_mask",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
         "//runtime/util:litert_status_util",
+        "@litert//tflite/types:half",
     ],
 )
 
@@ -502,11 +632,19 @@ cc_test(
     srcs = ["thinking_budget_constraint_test.cc"],
     deps = [
         ":bitmap",
+        ":constraint",
+        ":constraint_provider",
         ":fake_constraint",
+        ":llg_constraint_config",
+        ":llg_constraint_provider",
         ":logit_mask",
         ":thinking_budget_constraint",
         "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         "//runtime/util:test_utils",
+        "//support/tokenizer",
     ],
 )
 

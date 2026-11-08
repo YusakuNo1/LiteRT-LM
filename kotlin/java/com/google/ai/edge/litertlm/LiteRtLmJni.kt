@@ -40,7 +40,8 @@ internal object LiteRtLmJni {
    *   the engine's default.
    * @param cacheDir The directory for cache files.
    * @param enableBenchmark Whether to enable benchmark or not.
-   * @param enableSpeculativeDecoding Whether to enable speculative decoding.
+   * @param enableSpeculativeDecoding Deprecated: whether to enable speculative decoding. Ignored
+   *   when [speculativeDecodingMode] is set.
    * @param mainNpuNativeLibraryDir The directory for the main backend NPU libraries.
    * @param visionNpuNativeLibraryDir The directory for the vision backend NPU libraries.
    * @param audioNpuNativeLibraryDir The directory for the audio backend NPU libraries.
@@ -50,6 +51,9 @@ internal object LiteRtLmJni {
    *   engine's default.
    * @param activationDataType The activation data type override for inference. When negative, use
    *   the engine's default.
+   * @param enableYnnpack Whether to enable YNNPACK. When null, use the engine's default.
+   * @param speculativeDecodingMode The [SpeculativeDecodingMode.value] of the engine's default
+   *   speculative decoding config, or null to leave unset.
    * @return A pointer to the native engine instance.
    */
   external fun nativeCreateEngine(
@@ -69,6 +73,8 @@ internal object LiteRtLmJni {
     audioBackendNumThreads: Int,
     maxVisionTokensPerImage: Int,
     activationDataType: Int = -1,
+    enableYnnpack: Boolean? = null,
+    speculativeDecodingMode: Int? = null,
   ): Long
 
   /**
@@ -76,21 +82,36 @@ internal object LiteRtLmJni {
    *
    * @param modelPath The path to the model file.
    * @param backend The backend to use for the engine.
+   * @param visionBackend The backend to use for the vision executor. If empty, the vision executor
+   *   will not be initialized.
+   * @param audioBackend The backend to use for the audio executor. If empty, the audio executor
+   *   will not be initialized.
    * @param prefillTokens The number of tokens to prefill.
    * @param decodeTokens The number of tokens to decode.
    * @param cacheDir The directory for cache files.
    * @param mainNpuNativeLibraryDir The directory for the main backend NPU libraries.
+   * @param visionNpuNativeLibraryDir The directory for the vision backend NPU libraries.
+   * @param audioNpuNativeLibraryDir The directory for the audio backend NPU libraries.
    * @param enableSpeculativeDecoding Whether to enable speculative decoding.
+   * @param enableYnnpack Whether to enable YNNPACK. When null, use the engine's default.
+   * @param maxNumTokens The maximum number of tokens to be processed by the engine. When
+   *   non-positive, use the engine's default.
    * @return A pointer to the native engine instance.
    */
   external fun nativeCreateBenchmark(
     modelPath: String,
     backend: String,
+    visionBackend: String,
+    audioBackend: String,
     prefillTokens: Int,
     decodeTokens: Int,
     cacheDir: String,
     mainNpuNativeLibraryDir: String,
+    visionNpuNativeLibraryDir: String,
+    audioNpuNativeLibraryDir: String,
     enableSpeculativeDecoding: Boolean?,
+    enableYnnpack: Boolean? = null,
+    maxNumTokens: Int = -1,
   ): Long
 
   /**
@@ -107,7 +128,10 @@ internal object LiteRtLmJni {
    * @param samplerConfig The sampler configuration.
    * @param loraPath Path to the LoRA weights file.
    * @param audioLoraPath Path to the Audio LoRA weights file.
-   * @param enableSpeculativeDecoding Whether to enable speculative decoding.
+   * @param enableSpeculativeDecoding Deprecated: whether to enable speculative decoding. Ignored
+   *   when [speculativeDecodingMode] is set.
+   * @param speculativeDecodingMode The [SpeculativeDecodingMode.value] of the session's speculative
+   *   decoding config, or null to inherit the engine's.
    * @return A pointer to the native session instance.
    */
   external fun nativeCreateSession(
@@ -116,6 +140,7 @@ internal object LiteRtLmJni {
     loraPath: String?,
     audioLoraPath: String?,
     enableSpeculativeDecoding: Boolean?,
+    speculativeDecodingMode: Int?,
   ): Long
 
   /**
@@ -124,6 +149,15 @@ internal object LiteRtLmJni {
    * @param sessionPointer A pointer to the native session instance.
    */
   external fun nativeDeleteSession(sessionPointer: Long)
+
+  /**
+   * Clones the LiteRT-LM session.
+   *
+   * @param sessionPointer A pointer to the native session instance.
+   * @return A pointer to the cloned native session instance.
+   * @throws LiteRtLmJniException if the underlying native method fails.
+   */
+  external fun nativeCloneSession(sessionPointer: Long): Long
 
   /**
    * Runs the prefill step for the given input data.
@@ -218,6 +252,10 @@ internal object LiteRtLmJni {
    *   (reasoning) tokens and the final response tokens count towards this limit. When non-positive,
    *   use the default.
    * @param thinkingConfig Configuration for thinking/reasoning generation.
+   * @param enableSpeculativeDecoding Deprecated: whether to enable speculative decoding. Ignored
+   *   when [speculativeDecodingMode] is set.
+   * @param speculativeDecodingMode The [SpeculativeDecodingMode.value] of the conversation's
+   *   speculative decoding config, or null to inherit the engine's.
    * @return A pointer to the native conversation instance.
    */
   external fun nativeCreateConversation(
@@ -237,6 +275,7 @@ internal object LiteRtLmJni {
     thinkingConfig: ThinkingConfig?,
     enableResponseFormat: Boolean,
     enableSpeculativeDecoding: Boolean?,
+    speculativeDecodingMode: Int?,
   ): Long
 
   /**
@@ -245,6 +284,15 @@ internal object LiteRtLmJni {
    * @param conversationPointer A pointer to the native conversation instance.
    */
   external fun nativeDeleteConversation(conversationPointer: Long)
+
+  /**
+   * Clones the LiteRT-LM conversation.
+   *
+   * @param conversationPointer A pointer to the native conversation instance.
+   * @return A pointer to the cloned native conversation instance.
+   * @throws LiteRtLmJniException if the underlying native method fails.
+   */
+  external fun nativeCloneConversation(conversationPointer: Long): Long
 
   /**
    * Send message from the given input data asynchronously.

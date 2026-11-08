@@ -114,6 +114,7 @@ pytype_strict_library(
     deps = [
         ":_ffi",
         ":interfaces",
+        ":utils",
     ],
 )
 
@@ -148,7 +149,11 @@ pytype_strict_library(
 py_test(
     name = "engine_test",
     srcs = ["engine_test.py"],
-    data = ["//runtime/testdata"],
+    data = [
+        "//models/gemma4:chat_template_e2b_e4b.jinja",
+        "//runtime/components/testdata",
+        "//runtime/testdata",
+    ],
     tags = ["nowindows"],
     deps = [
         ":litert_lm",
@@ -229,11 +234,13 @@ load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("//:version.bzl", "VERSION")
 load("//python/litert_lm:cc_runfiles.bzl", "cc_runfiles")
 
+# Prebuilt shared libraries staged alongside liblitert-lm.{so,dylib} so they can
+# be resolved via $ORIGIN / @loader_path at runtime.
 _PREBUILT_LIBS = [
     "libGemmaModelConstraintProvider",
     "libLiteRtWebGpuAccelerator",
-    "libLiteRtTopKWebGpuSampler",
     "libLiteRt",
+    "libwebgpu_dawn",
 ]
 
 genrule(

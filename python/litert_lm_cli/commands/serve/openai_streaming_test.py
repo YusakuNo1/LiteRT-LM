@@ -27,6 +27,7 @@ import litert_lm
 from litert_lm_cli import config as cli_config
 from litert_lm_cli import model
 from litert_lm_cli.commands.serve import openai_handler
+from litert_lm_cli.commands.serve import openai_models
 from litert_lm_cli.commands.serve import util
 
 
@@ -204,7 +205,7 @@ class ServeOpenAIStreamingTest(absltest.TestCase):
 
     self.enter_context(
         mock.patch.object(
-            openai_handler.os.path, "getmtime", return_value=123456789
+            openai_models.os.path, "getmtime", return_value=123456789
         )
     )
 
@@ -367,7 +368,8 @@ class ServeOpenAIStreamingTest(absltest.TestCase):
       self.assertEqual(
           usage["completion_tokens_details"], {"reasoning_tokens": 0}
       )
-      self.assertNotIn("prompt_tokens_details", usage)
+      self.assertIn("prompt_tokens_details", usage)
+      self.assertEqual(usage["prompt_tokens_details"], {"cached_tokens": 0})
 
   def test_openai_chat_completions_streaming_usage(self):
     mock_from_id = self.enter_context(
@@ -407,6 +409,8 @@ class ServeOpenAIStreamingTest(absltest.TestCase):
       self.assertIn("prompt_tokens", usage)
       self.assertIn("completion_tokens", usage)
       self.assertIn("total_tokens", usage)
+      self.assertIn("prompt_tokens_details", usage)
+      self.assertEqual(usage["prompt_tokens_details"], {"cached_tokens": 0})
       self.assertIn("completion_tokens_details", usage)
       self.assertEqual(
           usage["completion_tokens_details"], {"reasoning_tokens": 0}
@@ -427,15 +431,23 @@ class ServeOpenAIStreamingTest(absltest.TestCase):
     self.assertEqual(usage["prompt_tokens"], 15)
     self.assertEqual(usage["completion_tokens"], 10)
     self.assertEqual(usage["total_tokens"], 25)
+    self.assertEqual(usage["prompt_tokens_details"], {"cached_tokens": 0})
     self.assertEqual(
         usage["completion_tokens_details"], {"reasoning_tokens": 0}
     )
 
-    usage_with_reasoning = openai_handler._compute_token_usage(
+    mock_conv.token_count = 45
+    usage_with_cache = openai_handler._compute_token_usage(
         mock_conv, reasoning_tokens=4
     )
+    self.assertEqual(usage_with_cache["prompt_tokens"], 35)
+    self.assertEqual(usage_with_cache["completion_tokens"], 10)
+    self.assertEqual(usage_with_cache["total_tokens"], 45)
     self.assertEqual(
-        usage_with_reasoning["completion_tokens_details"],
+        usage_with_cache["prompt_tokens_details"], {"cached_tokens": 20}
+    )
+    self.assertEqual(
+        usage_with_cache["completion_tokens_details"],
         {"reasoning_tokens": 4},
     )
 
@@ -453,9 +465,9 @@ class ServeOpenAIStreamingTest(absltest.TestCase):
     mock_get_engine.return_value = mock_engine
 
     mock_conv.send_message_async.return_value = [
-        {"role": "assistant", "channels": {"thought": "Thinking..."}},
-        {"role": "assistant", "channels": {"thought": "more"}},
-        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+        litert_lm.Message.model(channels={"thought": "Thinking..."}),
+        litert_lm.Message.model(channels={"thought": "more"}),
+        litert_lm.Message.model(litert_lm.Contents.of("Hi")),
     ]
     mock_conv.get_benchmark_info.return_value = litert_lm.BenchmarkInfo(
         init_time_in_second=0.1,

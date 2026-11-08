@@ -15,6 +15,10 @@
 #include "runtime/framework/resource_management/execution_manager.h"
 
 #include <atomic>
+#include <cstdint>
+#include <filesystem>  // NOLINT
+#include <fstream>
+#include <ios>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,10 +49,12 @@
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/fake_llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
+#include "runtime/executor/llm_executor_settings.h"
 #include "runtime/framework/resource_management/serial_execution_manager.h"
 #include "runtime/framework/resource_management/threaded_execution_manager.h"
 #include "runtime/proto/token.pb.h"
 #include "runtime/util/convert_tensor_buffer.h"
+#include "runtime/util/scoped_file.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
 #include "runtime/util/test_utils.h"  // NOLINT
 #include "support/tokenizer/tokenizer.h"
@@ -117,13 +123,35 @@ class FakeAudioExecutor : public AudioExecutor {
     return std::make_unique<FakeAudioContext>();
   }
 
+  absl::StatusOr<std::unique_ptr<AudioContext>> CloneContext(
+      const AudioContext& audio_context) override {
+    return audio_context.Clone();
+  }
+
   absl::Status RestoreContext(
       std::unique_ptr<AudioContext> audio_context) override {
     return absl::OkStatus();
   }
 
+  absl::Status LoadLoRA(uint32_t lora_id,
+                        const ModelAssets& model_assets) override {
+    if (!load_lora_status_.ok()) {
+      return load_lora_status_;
+    }
+    loaded_lora_ids_.push_back(lora_id);
+    return absl::OkStatus();
+  }
+
+  absl::Status UseLoRA(std::optional<uint32_t> lora_id) override {
+    used_lora_ids_.push_back(lora_id);
+    return absl::OkStatus();
+  }
+
   bool reset_called_ = false;
   bool flush_called_ = false;
+  absl::Status load_lora_status_ = absl::OkStatus();
+  std::vector<uint32_t> loaded_lora_ids_;
+  std::vector<std::optional<uint32_t>> used_lora_ids_;
 };
 
 class NonStreamingFakeAudioExecutor : public AudioExecutor {
@@ -335,9 +363,10 @@ TEST_P(ExecutionManagerTest, AddPrefillTaskWithAudioModality) {
 
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create("test_model_path_2"));
-  ASSERT_OK_AND_ASSIGN(auto audio_settings,
-                       AudioExecutorSettings::CreateDefault(
-                           model_assets, 128, Backend::GPU_ARTISAN));
+  ASSERT_OK_AND_ASSIGN(
+      auto audio_settings,
+      AudioExecutorSettings::CreateDefault(
+          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
 
   CreateExecutionManager(
       std::move(fake_llm_executor),
@@ -375,9 +404,10 @@ TEST_P(ExecutionManagerTest, EncodeAudioWithSessionInfo) {
 
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create("test_model_path_2"));
-  ASSERT_OK_AND_ASSIGN(auto audio_settings,
-                       AudioExecutorSettings::CreateDefault(
-                           model_assets, 128, Backend::GPU_ARTISAN));
+  ASSERT_OK_AND_ASSIGN(
+      auto audio_settings,
+      AudioExecutorSettings::CreateDefault(
+          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
 
   auto fake_audio_executor = std::make_unique<FakeAudioExecutor>();
   auto* fake_audio_executor_ptr = fake_audio_executor.get();
@@ -419,9 +449,10 @@ TEST_P(ExecutionManagerTest, EncodeAudioWithNonStreamingAudioExecutor) {
 
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create("test_model_path_2"));
-  ASSERT_OK_AND_ASSIGN(auto audio_settings,
-                       AudioExecutorSettings::CreateDefault(
-                           model_assets, 128, Backend::GPU_ARTISAN));
+  ASSERT_OK_AND_ASSIGN(
+      auto audio_settings,
+      AudioExecutorSettings::CreateDefault(
+          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
 
   auto fake_audio_executor = std::make_unique<NonStreamingFakeAudioExecutor>();
   auto* fake_audio_executor_ptr = fake_audio_executor.get();
@@ -476,9 +507,10 @@ TEST_P(ExecutionManagerTest, AddPrefillTaskWithPrecomputedAudioEmbeddings) {
 
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create("test_model_path_2"));
-  ASSERT_OK_AND_ASSIGN(auto audio_settings,
-                       AudioExecutorSettings::CreateDefault(
-                           model_assets, 128, Backend::GPU_ARTISAN));
+  ASSERT_OK_AND_ASSIGN(
+      auto audio_settings,
+      AudioExecutorSettings::CreateDefault(
+          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
 
   CreateExecutionManager(
       std::move(fake_llm_executor),
@@ -1547,6 +1579,66 @@ TEST_P(ExecutionManagerTest, AddTextScoringTask) {
   EXPECT_FLOAT_EQ(scores[0], 0.0f);
 }
 
+TEST_P(ExecutionManagerTest, AddTextScoringTaskStepProgression) {
+  CreateExecutionManager(CreateDefaultFakeLlmExecutor());
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+  ASSERT_OK_AND_ASSIGN(auto session_info,
+                       execution_manager_->GetSessionInfo(session_id));
+
+  // Prefill 3 tokens.
+  std::vector<InputData> inputs;
+  ASSERT_OK_AND_ASSIGN(auto input_text,
+                       tokenizer_->TokenIdsToTensorBuffer({1, 2, 3}));
+  inputs.push_back(InputText(std::move(input_text)));
+  ASSERT_OK_AND_ASSIGN(const TaskId prefill_task_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddPrefillTask(
+      session_id, prefill_task_id, std::move(inputs),
+      /*dependency_task_ids=*/{},
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      /*callback=*/[](absl::StatusOr<Responses> responses) {}));
+  ASSERT_OK(
+      execution_manager_->WaitUntilDone(prefill_task_id, absl::Seconds(3)));
+
+  // After prefill, current step must be 3.
+  ASSERT_OK_AND_ASSIGN(int step_after_prefill,
+                       execution_manager_->GetCurrentStep(*session_info));
+  EXPECT_EQ(step_after_prefill, 3);
+
+  // Score candidate "45" (2 tokens: 4 and 5).
+  ASSERT_OK_AND_ASSIGN(const TaskId scoring_task_id,
+                       execution_manager_->GetNewTaskId());
+  const std::vector<absl::string_view> target_text = {"45"};
+  EXPECT_CALL(*tokenizer_, TextToTokenIds("45"))
+      .WillOnce(Return(std::vector<int>({4, 5})));
+
+  std::vector<float> scores;
+  ASSERT_OK(execution_manager_->AddTextScoringTask(
+      session_id, scoring_task_id,
+      /*dep_tasks=*/{}, target_text,
+      /*store_token_lengths=*/false,
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      [&scores](absl::StatusOr<Responses> responses) {
+        ASSERT_OK(responses);
+        if (!responses->GetScores().empty()) {
+          scores.push_back(responses->GetScores()[0]);
+        }
+      }));
+  EXPECT_OK(
+      execution_manager_->WaitUntilDone(scoring_task_id, absl::Seconds(3)));
+
+  ASSERT_EQ(scores.size(), 1);
+  EXPECT_FLOAT_EQ(scores[0], 0.0f);
+
+  // After scoring 2 tokens, current step must progress to 5 without
+  // double-rewind.
+  ASSERT_OK_AND_ASSIGN(int step_after_scoring,
+                       execution_manager_->GetCurrentStep(*session_info));
+  EXPECT_EQ(step_after_scoring, 5);
+}
+
 TEST_P(ExecutionManagerTest, GetCurrentStep) {
   CreateExecutionManager(CreateDefaultFakeLlmExecutor());
   ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
@@ -1689,6 +1781,116 @@ TEST_P(ExecutionManagerTest, ReleaseSessionCleansUpTasksAndQueue) {
 
   // WaitUntilAllDone should complete without error.
   EXPECT_OK(execution_manager_->WaitUntilAllDone(absl::Seconds(1)));
+}
+
+TEST_P(ExecutionManagerTest,
+       RegisterNewSessionDeduplicatesAudioScopedLoraFiles) {
+  const std::filesystem::path temp_dir(::testing::TempDir());
+  const std::filesystem::path lora_path_1 = temp_dir / "audio_lora_1.bin";
+  const std::filesystem::path lora_path_2 = temp_dir / "audio_lora_2.bin";
+  {
+    std::ofstream out1(lora_path_1, std::ios::binary);
+    out1 << "lora_weights_1";
+    std::ofstream out2(lora_path_2, std::ios::binary);
+    out2 << "lora_weights_2_different_size";
+  }
+
+  ASSERT_OK_AND_ASSIGN(auto scoped_lora_1,
+                       ScopedFile::Open(lora_path_1.string()));
+  ASSERT_OK_AND_ASSIGN(auto scoped_lora_1_dup, scoped_lora_1.Duplicate());
+  ASSERT_OK_AND_ASSIGN(auto scoped_lora_2,
+                       ScopedFile::Open(lora_path_2.string()));
+  auto shared_lora_1 = std::make_shared<ScopedFile>(std::move(scoped_lora_1));
+  auto shared_lora_1_dup =
+      std::make_shared<ScopedFile>(std::move(scoped_lora_1_dup));
+  auto shared_lora_2 = std::make_shared<ScopedFile>(std::move(scoped_lora_2));
+
+  auto fake_audio_executor = std::make_unique<FakeAudioExecutor>();
+  auto* fake_audio_executor_ptr = fake_audio_executor.get();
+  CreateExecutionManager(CreateDefaultFakeLlmExecutor(),
+                         /*audio_executor_settings=*/nullptr,
+                         std::move(fake_audio_executor));
+
+  ASSERT_OK_AND_ASSIGN(auto session_config_1, CreateDefaultSessionConfig());
+  session_config_1.SetAudioScopedLoraFile(shared_lora_1);
+  ASSERT_OK_AND_ASSIGN(
+      const SessionId session_1,
+      execution_manager_->RegisterNewSession(session_config_1));
+
+  // Second session sharing the same ScopedFile pointer should reuse lora_id 0
+  // without calling LoadLoRA again.
+  ASSERT_OK_AND_ASSIGN(
+      const SessionId session_2,
+      execution_manager_->RegisterNewSession(session_config_1));
+
+  // Third session with a distinct ScopedFile instance pointing to the same
+  // underlying file should also deduplicate to lora_id 0.
+  ASSERT_OK_AND_ASSIGN(auto session_config_1_dup, CreateDefaultSessionConfig());
+  session_config_1_dup.SetAudioScopedLoraFile(shared_lora_1_dup);
+  ASSERT_OK_AND_ASSIGN(
+      const SessionId session_3,
+      execution_manager_->RegisterNewSession(session_config_1_dup));
+
+  // Fourth session with a different underlying file should load a new LoRA
+  // with lora_id 1.
+  ASSERT_OK_AND_ASSIGN(auto session_config_2, CreateDefaultSessionConfig());
+  session_config_2.SetAudioScopedLoraFile(shared_lora_2);
+  ASSERT_OK_AND_ASSIGN(
+      const SessionId session_4,
+      execution_manager_->RegisterNewSession(session_config_2));
+
+  EXPECT_THAT(fake_audio_executor_ptr->loaded_lora_ids_, ElementsAre(0, 1));
+  EXPECT_THAT(
+      fake_audio_executor_ptr->used_lora_ids_,
+      ElementsAre(std::optional<uint32_t>(0), std::optional<uint32_t>(0),
+                  std::optional<uint32_t>(0), std::optional<uint32_t>(1)));
+
+  EXPECT_OK(execution_manager_->ReleaseSession(session_1));
+  EXPECT_OK(execution_manager_->ReleaseSession(session_2));
+  EXPECT_OK(execution_manager_->ReleaseSession(session_3));
+  EXPECT_OK(execution_manager_->ReleaseSession(session_4));
+}
+
+TEST_P(ExecutionManagerTest,
+       RegisterNewSessionRetriesAudioScopedLoraAfterLoadFailure) {
+  const std::filesystem::path lora_path =
+      std::filesystem::path(::testing::TempDir()) / "audio_lora_retry.bin";
+  {
+    std::ofstream out(lora_path, std::ios::binary);
+    out << "lora_weights_retry";
+  }
+
+  ASSERT_OK_AND_ASSIGN(auto scoped_lora, ScopedFile::Open(lora_path.string()));
+  auto shared_lora = std::make_shared<ScopedFile>(std::move(scoped_lora));
+
+  auto fake_audio_executor = std::make_unique<FakeAudioExecutor>();
+  auto* fake_audio_executor_ptr = fake_audio_executor.get();
+  fake_audio_executor_ptr->load_lora_status_ =
+      absl::InternalError("Simulated audio LoadLoRA failure");
+
+  CreateExecutionManager(CreateDefaultFakeLlmExecutor(),
+                         /*audio_executor_settings=*/nullptr,
+                         std::move(fake_audio_executor));
+
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
+  session_config.SetAudioScopedLoraFile(shared_lora);
+
+  // First session registration fails during LoadLoRA.
+  EXPECT_THAT(execution_manager_->RegisterNewSession(session_config),
+              testing::status::StatusIs(absl::StatusCode::kInternal));
+  EXPECT_TRUE(fake_audio_executor_ptr->loaded_lora_ids_.empty());
+  EXPECT_TRUE(fake_audio_executor_ptr->used_lora_ids_.empty());
+
+  // Subsequent session with the same ScopedFile must retry LoadLoRA rather
+  // than skipping LoadLoRA with a corrupted lora_hash_to_id_ entry.
+  fake_audio_executor_ptr->load_lora_status_ = absl::OkStatus();
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+  EXPECT_THAT(fake_audio_executor_ptr->loaded_lora_ids_, ElementsAre(0));
+  EXPECT_THAT(fake_audio_executor_ptr->used_lora_ids_,
+              ElementsAre(std::optional<uint32_t>(0)));
+
+  EXPECT_OK(execution_manager_->ReleaseSession(session_id));
 }
 
 INSTANTIATE_TEST_SUITE_P(

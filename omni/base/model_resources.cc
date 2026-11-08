@@ -18,6 +18,7 @@
 #include <string>
 #include <utility>
 
+#include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
@@ -25,10 +26,11 @@
 #include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
 #include "omni/base/litert_lm_runner.h"
+#include "runtime/components/model_resources.h"
 
 namespace litert::omni {
 
-ModelResources::ModelResources(std::shared_ptr<Environment> env)
+ModelResources::ModelResources(std::shared_ptr<Environment> absl_nullable env)
     : env_(std::move(env)) {}
 
 absl::Status ModelResources::AddCompiledModel(
@@ -79,7 +81,22 @@ bool ModelResources::HasLmRunner(absl::string_view key) const {
   return lm_runners_.contains(key);
 }
 
-void ModelResources::SetEnvironment(std::shared_ptr<Environment> env) {
+void ModelResources::SetLmModelResources(
+    std::shared_ptr<lm::ModelResources> absl_nullable lm_resources) {
+  lm_resources_ = std::move(lm_resources);
+}
+
+std::shared_ptr<lm::ModelResources> ModelResources::GetLmModelResources()
+    const {
+  return lm_resources_;
+}
+
+bool ModelResources::HasLmModelResources() const {
+  return lm_resources_ != nullptr;
+}
+
+void ModelResources::SetEnvironment(
+    std::shared_ptr<Environment> absl_nullable env) {
   env_ = std::move(env);
 }
 

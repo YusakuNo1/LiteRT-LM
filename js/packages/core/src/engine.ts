@@ -17,27 +17,19 @@
 import {Cleanup} from './cleanup.js';
 import {Conversation} from './conversation.js';
 import {ConversationConfig} from './conversation_config.js';
-import {EngineSettings, fillWasmEngineSettingsFromEngineSettings, wasmEngineSettingsToEngineSettings} from './engine_settings.js';
-import {getGlobalLiteRtLm} from './global_litertlm.js';
+import {EngineSettings, fillWasmEngineSettingsFromEngineSettings, GpuArtisanConfig, ResolvedEngineSettings, wasmEngineSettingsToEngineSettings} from './engine_settings.js';
 import {getOrLoadGlobalLiteRtLm} from './load_litertlm.js';
 import {Mutex} from './mutex.js';
-import {ReadableStreamDataStreamWrapper} from './readable_stream_data_stream_wrapper.js';
 import {Session} from './session.js';
-import {sessionConfigToWasmSessionConfig} from './session_config.js';
-import {RecursiveRequired} from './types.js';
-import {Backend, ConversationConfig as WasmConversationConfig, Deletable, Engine as WasmEngine, LiteRtLmWasm, ModelAssets, SessionConfig as WasmSessionConfig} from './wasm_binding_types.js';
-
-/**
- * Global index to avoid writing to the sane VFS path.
- */
-// TODO: b/477709280 - Remove this when streaming loading works.
-let modelPathIndex = 0;
+import {SessionConfig, sessionConfigToWasmSessionConfig} from './session_config.js';
+import {createStreamingModelAssets} from './stream_utils.js';
+import {Backend, ConversationConfig as WasmConversationConfig, Deletable, Engine as WasmEngine, LiteRtLmWasm, SessionConfig as WasmSessionConfig} from './wasm_binding_types.js';
 
 /**
  * LiteRT-LM Engine
  */
 export class Engine implements Deletable {
-  readonly settings: RecursiveRequired<EngineSettings>;
+  readonly settings: ResolvedEngineSettings;
   private mutexes = {
     executor: new Mutex(),
   };
@@ -62,57 +54,35 @@ export class Engine implements Deletable {
       Promise<Engine> {
     const litertlm = await getOrLoadGlobalLiteRtLm();
     const wasm = litertlm.liteRtLmWasm;
-    // TODO: b/477709280 - Support other formats like .task.
-    const dstPath = `/model_${modelPathIndex++}.litertlm`;
-
-    // Default to GPU_ARTISAN if not specified.
-    const backend = engineSettings.backend ?? Backend.GPU_ARTISAN;
+    // Default to GPU if not specified.
+    const backend = engineSettings.backend ?? Backend.GPU;
     engineSettings = {...engineSettings, backend};
 
     const samplerBackend = engineSettings.mainExecutorSettings?.samplerBackend;
+    const visionBackend = engineSettings.visionBackend;
+    const audioBackend = engineSettings.audioBackend;
     if (backend === Backend.GPU || backend === Backend.GPU_ARTISAN ||
         samplerBackend === Backend.GPU ||
-        samplerBackend === Backend.GPU_ARTISAN) {
+        samplerBackend === Backend.GPU_ARTISAN ||
+        visionBackend === Backend.GPU || audioBackend === Backend.GPU) {
       await litertlm.setupDefaultWebGpuDevice();
     }
 
     const cleanup = new Cleanup();
 
-    const modelStream = await modelToStream(engineSettings.model);
     let engine: WasmEngine;
     try {
-      let modelAssets: ModelAssets;
-      const isStreaming = backend === Backend.GPU_ARTISAN;
-
-      if (isStreaming) {
-        // GPU Artisan supports streamed loading.
-        const streamWrapper =
-            new ReadableStreamDataStreamWrapper(modelStream, () => wasm.HEAPU8);
-        const dataStream = wasm.ReadableStreamDataStream.create(streamWrapper);
-        cleanup.add(() => {
-          dataStream.delete();
-        });
-        modelAssets = wasm.ModelAssets.createStreaming(dataStream);
-      } else {
-        // Other backends must be fully loaded into Wasm memory first.
-        await loadModelToVfs(wasm, modelStream, dstPath);
-        cleanup.add(() => {
-          try {
-            wasm.FS.unlink(dstPath);
-          } catch (e) {
-            console.error(`Error removing file from VFS:`, e);
-          }
-        });
-
-        modelAssets = wasm.ModelAssets.create(dstPath);
-      }
-
-      const cleanupModelAssets = cleanup.add(() => {
-        modelAssets.delete();
-      });
+      const {modelAssets, cleanupModelAssets} =
+          await createStreamingModelAssets(engineSettings.model, wasm, cleanup);
 
       const wasmEngineSettings =
-          wasm.EngineSettings.createDefault(modelAssets, {value: backend});
+          visionBackend === undefined && audioBackend === undefined ?
+          await wasm.EngineSettings.createDefault(
+              modelAssets, {value: backend}) :
+          await wasm.EngineSettings.createDefaultMultimodal(
+              modelAssets, {value: backend},
+              visionBackend === undefined ? undefined : {value: visionBackend},
+              audioBackend === undefined ? undefined : {value: audioBackend});
       // Delete our copy of the ModelAssets object (not the underlying file).
       cleanupModelAssets();
 
@@ -120,17 +90,31 @@ export class Engine implements Deletable {
         wasmEngineSettings.delete();
       });
 
+      const resolvedBackend =
+          wasmEngineSettings.getMutableMainExecutorSettings().getBackend().value;
+
       fillWasmEngineSettingsFromEngineSettings(
-          wasmEngineSettings, engineSettings, backend, wasm);
+          wasmEngineSettings, engineSettings, resolvedBackend, wasm);
       wasmEngineSettings.setParallelFileSectionLoading(false);
       wasmEngineSettings.setSingleThreadedExecution(true);
 
-      if (isStreaming) {
-        engine = await wasm.Engine.createStreaming(
-            wasmEngineSettings, inputPromptAsHint);
-      } else {
-        engine = await wasm.Engine.createEngine(
-            wasmEngineSettings, inputPromptAsHint);
+      try {
+        if (resolvedBackend === Backend.GPU_ARTISAN) {
+          engine = await wasm.Engine.createLegacyEngine(
+              wasmEngineSettings, inputPromptAsHint);
+        } else {
+          engine = await wasm.Engine.createEngine(
+              wasmEngineSettings, inputPromptAsHint);
+        }
+      } finally {
+        if (resolvedBackend === Backend.GPU || visionBackend === Backend.GPU ||
+            audioBackend === Backend.GPU) {
+          try {
+            await wasm.clearStoredWeightsStreams();
+          } catch (cleanupError) {
+            console.error('Error clearing stored weights streams:', cleanupError);
+          }
+        }
       }
       cleanupWasmEngineSettings();
 
@@ -145,10 +129,27 @@ export class Engine implements Deletable {
     }
   }
 
-  async createSession(sessionConfig = {}): Promise<Session> {
+  /**
+   * Returns `sessionConfig` with modalities supported by this engine enabled
+   * unless they were explicitly configured.
+   */
+  private withDefaultModalities(sessionConfig: SessionConfig): SessionConfig {
+    const result = {...sessionConfig};
+    if (this.settings.visionBackend !== undefined &&
+        result.visionModalityEnabled === undefined) {
+      result.visionModalityEnabled = true;
+    }
+    if (this.settings.audioBackend !== undefined &&
+        result.audioModalityEnabled === undefined) {
+      result.audioModalityEnabled = true;
+    }
+    return result;
+  }
+
+  async createSession(sessionConfig: SessionConfig = {}): Promise<Session> {
     return this.mutexes.executor.acquireAndRun(() => {
-      const wasmSessionConfig =
-          sessionConfigToWasmSessionConfig(sessionConfig, this.wasm);
+      const wasmSessionConfig = sessionConfigToWasmSessionConfig(
+          this.withDefaultModalities(sessionConfig), this.wasm);
 
       const wasmSession = this.engine.createSession(wasmSessionConfig);
       wasmSessionConfig.delete();
@@ -157,19 +158,34 @@ export class Engine implements Deletable {
   }
 
   async createConversation(config?: ConversationConfig): Promise<Conversation> {
+    if (!config &&
+        (this.settings.visionBackend !== undefined ||
+         this.settings.audioBackend !== undefined)) {
+      // A custom config is needed to enable the vision and audio modalities.
+      // Match the C++ ConversationConfig defaults.
+      config = {filterChannelContentFromKvCache: true};
+    }
     return this.mutexes.executor.acquireAndRun(async () => {
       let wasmConfig: WasmConversationConfig;
       let wasmSessionConfig: WasmSessionConfig|undefined;
 
       if (config) {
         wasmSessionConfig = sessionConfigToWasmSessionConfig(
-            config.sessionConfig || {}, this.wasm);
+            this.withDefaultModalities(config.sessionConfig || {}), this.wasm);
         const prefaceJson =
             config.preface ? JSON.stringify(config.preface) : '';
+        const usesAutosizedRingbuffers =
+            this.settings.backend === Backend.GPU_ARTISAN &&
+            Boolean(
+                (this.settings.mainExecutorSettings?.backendConfig as
+                 GpuArtisanConfig | undefined)
+                    ?.use_autosized_ringbuffers);
+        const filterChannelContentFromKvCache =
+            config.filterChannelContentFromKvCache ?? usesAutosizedRingbuffers;
         wasmConfig = this.wasm.ConversationConfig.createCustom(
             this.engine, wasmSessionConfig, !!config.enableConstrainedDecoding,
-            !!config.prefillPrefaceOnInit,
-            !!config.filterChannelContentFromKvCache, prefaceJson);
+            !!config.prefillPrefaceOnInit, filterChannelContentFromKvCache,
+            prefaceJson);
       } else {
         wasmConfig = this.wasm.ConversationConfig.createDefault(this.engine);
       }
@@ -182,7 +198,9 @@ export class Engine implements Deletable {
         wasmSessionConfig.delete();
       }
 
-      return new Conversation(wasmConversation, this.engine, this.mutexes);
+      return new Conversation(
+          wasmConversation, this.engine, this.mutexes,
+          this.settings.maxVisionTokensPerImage ?? 0);
     });
   }
 
@@ -193,55 +211,3 @@ export class Engine implements Deletable {
   }
 }
 
-async function modelToStream(model: EngineSettings['model']):
-    Promise<ReadableStream<Uint8Array>> {
-  if (model instanceof ReadableStream) {
-    return model;
-  }
-  if (model instanceof Blob) {
-    return model.stream();
-  }
-
-  const modelUrl = model;
-  const response = await fetch(modelUrl, {
-    credentials: 'same-origin',
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch model file from ${modelUrl}`);
-  }
-  return response.body!;
-}
-
-// TODO: b/477709280 - Remove this when streaming loading works.
-async function loadModelToVfs(
-    module: LiteRtLmWasm,
-    modelStream: ReadableStream<Uint8Array>,
-    dstPath: string,
-) {
-  let fileContent: Uint8Array;
-
-  const reader = modelStream.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalLength = 0;
-  while (true) {
-    const {done, value} = await reader.read();
-    if (done) break;
-    if (value) {
-      chunks.push(value);
-      totalLength += value.length;
-    }
-  }
-  fileContent = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    fileContent.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  try {
-    module.FS.writeFile(dstPath, fileContent);
-  } catch (e) {
-    console.error(`Error writing file to VFS:`, e);
-    throw e;
-  }
-}

@@ -26,13 +26,13 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "nlohmann/json_fwd.hpp"  // from @nlohmann_json
-#include "runtime/components/prompt_template.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/generic_data_processor_config.h"
 #include "runtime/conversation/model_data_processor/model_data_processor.h"
 #include "support/preprocessor/audio_preprocessor.h"
 #include "support/preprocessor/image_preprocessor.h"
 #include "support/util/io_types.h"
+#include "re2/re2.h"  // from @com_googlesource_code_re2
 
 namespace litert::lm {
 
@@ -45,33 +45,51 @@ class GenericDataProcessor
                                         GenericDataProcessorArguments> {
  public:
   static absl::StatusOr<std::unique_ptr<ModelDataProcessor>> Create(
-      GenericDataProcessorConfig config = GenericDataProcessorConfig());
+      GenericDataProcessorConfig config = GenericDataProcessorConfig(),
+      std::optional<Preface> preface = std::nullopt);
 
-  // Renders a single turn template for the given message and history. Only the
-  // prompt template supporting single turn is valid for this method.
-  absl::StatusOr<SingleTurnTemplateRenderResult> RenderSingleTurnTemplate(
-      std::vector<Message>& history, const Preface& preface,
-      const Message& message, const PromptTemplate& prompt_template,
-      bool current_is_appending_message, bool append_message,
-      std::optional<nlohmann::ordered_json> extra_context) const override;
+  // Validates a ToolCallConfig proto (fences, syntax_config, and regexes).
+  static absl::Status ValidateToolCallConfig(
+      const proto::ToolCallConfig& tool_call_config);
 
   // Returns the config of the model data processor.
   const GenericDataProcessorConfig& GetConfig() const override {
     return config_;
   }
 
+  absl::string_view CodeFenceStart() const override {
+    return config_.tool_call_config.has_value()
+               ? config_.tool_call_config->fence_start()
+               : absl::string_view();
+  }
+
+  absl::string_view CodeFenceEnd() const override {
+    return config_.tool_call_config.has_value()
+               ? config_.tool_call_config->fence_end()
+               : absl::string_view();
+  }
+
  private:
   explicit GenericDataProcessor(
-      GenericDataProcessorConfig config,
+      GenericDataProcessorConfig config, std::optional<Preface> preface,
       std::unique_ptr<ImagePreprocessor> image_preprocessor = nullptr,
-      std::unique_ptr<AudioPreprocessor> audio_preprocessor = nullptr)
-      : config_(config),
+      std::unique_ptr<AudioPreprocessor> audio_preprocessor = nullptr,
+      std::unique_ptr<RE2> tool_call_re = nullptr,
+      std::unique_ptr<RE2> argument_re = nullptr)
+      : config_(std::move(config)),
+        preface_(std::move(preface)),
         image_preprocessor_(std::move(image_preprocessor)),
-        audio_preprocessor_(std::move(audio_preprocessor)) {};
+        audio_preprocessor_(std::move(audio_preprocessor)),
+        tool_call_re_(std::move(tool_call_re)),
+        argument_re_(std::move(argument_re)) {};
 
   absl::StatusOr<std::vector<InputData>> ToInputDataVectorImpl(
       const std::string& rendered_template_prompt,
       const nlohmann::ordered_json& messages,
+      const GenericDataProcessorArguments& args) const override;
+
+  absl::StatusOr<Message> ToMessageImpl(
+      const Responses& responses,
       const GenericDataProcessorArguments& args) const override;
 
   absl::Status CloneStateImpl(
@@ -80,8 +98,11 @@ class GenericDataProcessor
       override;
 
   GenericDataProcessorConfig config_;
+  std::optional<Preface> preface_;
   std::unique_ptr<ImagePreprocessor> image_preprocessor_;
   std::unique_ptr<AudioPreprocessor> audio_preprocessor_;
+  std::unique_ptr<RE2> tool_call_re_;
+  std::unique_ptr<RE2> argument_re_;
 };
 
 }  // namespace litert::lm

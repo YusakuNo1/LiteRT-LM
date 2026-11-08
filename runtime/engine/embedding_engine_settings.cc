@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/match.h"  // from @com_google_absl
@@ -54,10 +55,11 @@ absl::StatusOr<EmbeddingEngineSettings> EmbeddingEngineSettings::CreateDefault(
   }
   std::optional<AudioExecutorSettings> audio_executor_settings;
   if (audio_backend.has_value()) {
-    LITERT_ASSIGN_OR_RETURN(
-        audio_executor_settings,
-        AudioExecutorSettings::CreateDefault(
-            model_assets, /*max_sequence_length=*/30, *audio_backend));
+    LITERT_ASSIGN_OR_RETURN(audio_executor_settings,
+                            AudioExecutorSettings::CreateDefault(
+                                model_assets, /*max_sequence_length=*/30,
+                                /*encoder_backend=*/*audio_backend,
+                                /*adapter_backend=*/Backend::CPU));
   }
   return EmbeddingEngineSettings(std::move(embedding_executor_settings),
                                  std::move(vision_executor_settings),
@@ -175,6 +177,9 @@ namespace {
 // 1. User settings in code (takes priority if already set).
 // 2. prefer_activation_type from model metadata / TOML (if provided).
 // 3. FLOAT16 fallback if the backend is GPU.
+//
+// TODO(b/563394685): Not idempotent. Precedences 2 and 3 write the field
+// precedence 1 reads, so whichever fires first wins on every later call.
 absl::Status ResolveActivationDataType(
     ExecutorSettingsBase& executor_settings,
     const std::optional<std::string>& prefer_activation_type) {
@@ -237,12 +242,48 @@ absl::Status ValidateCacheDir(absl::string_view cache_dir) {
   return absl::OkStatus();
 }
 
+absl::Status ValidateInputLengths(std::optional<int> min_input_length,
+                                  std::optional<int> max_input_length) {
+  if (max_input_length.has_value() && *max_input_length <= 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "max_input_length must be positive, got: ", *max_input_length));
+  }
+  if (min_input_length.has_value() && *min_input_length < 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "min_input_length must be non-negative, got: ", *min_input_length));
+  }
+  if (min_input_length.has_value() && max_input_length.has_value() &&
+      *min_input_length > *max_input_length) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "min_input_length (", *min_input_length,
+        ") cannot be greater than max_input_length (", *max_input_length, ")"));
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 absl::Status EmbeddingEngineSettings::ResolveDefaults(
+    const proto::EmbeddingMetadata* absl_nullable metadata_from_file,
     const std::optional<std::string>& text_prefer_activation_type,
     const std::optional<std::string>& vision_prefer_activation_type,
     const std::optional<std::string>& audio_prefer_activation_type) {
+  // Unlike the LLM engine, metadata supplied by the caller wins over the
+  // model's.
+  if (metadata_from_file != nullptr && !metadata_.has_value()) {
+    metadata_ = *metadata_from_file;
+  }
+
+  // Default the input length bounds from metadata when not set in code.
+  if (metadata_.has_value()) {
+    if (!min_input_length_.has_value() && metadata_->has_min_input_length()) {
+      min_input_length_ = metadata_->min_input_length();
+    }
+    if (!max_input_length_.has_value() && metadata_->has_max_input_length()) {
+      max_input_length_ = metadata_->max_input_length();
+    }
+  }
+
   LITERT_RETURN_IF_ERROR(ResolveActivationDataType(
       main_executor_settings_, text_prefer_activation_type));
   if (vision_executor_settings_.has_value()) {
@@ -281,6 +322,9 @@ absl::Status EmbeddingEngineSettings::Validate(
     LITERT_RETURN_IF_ERROR(
         ValidateCacheDir(audio_executor_settings_->GetCacheDir()));
   }
+
+  LITERT_RETURN_IF_ERROR(
+      ValidateInputLengths(min_input_length_, max_input_length_));
 
   return absl::OkStatus();
 }

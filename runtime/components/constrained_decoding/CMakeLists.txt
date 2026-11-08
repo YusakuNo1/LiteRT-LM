@@ -123,6 +123,72 @@ target_include_directories(runtime_components_constrained_decoding_fst_constrain
 )
 
 # ==============================================================================
+# LiteRT Logit Mask Runner
+# ==============================================================================
+# LiteRT's tensor/backends/tflite sources include
+# "tflite/schema/mutable/schema_generated.h", which Bazel generates via
+# //tflite/schema:schema_fbs_with_mutable. Generate the equivalent here, after
+# tflite_external has fetched schema.fbs.
+set(LITERTLM_TFLITE_MUTABLE_SCHEMA_GEN_DIR
+  "${CMAKE_BINARY_DIR}/generated/tflite_mutable_schema")
+set(LITERTLM_TFLITE_MUTABLE_SCHEMA_H
+  "${LITERTLM_TFLITE_MUTABLE_SCHEMA_GEN_DIR}/tflite/schema/mutable/schema_generated.h")
+set(LITERTLM_TFLITE_SCHEMA_FBS
+  "${LITERTLM_TENSORFLOW_SRC_DIR}/tensorflow/compiler/mlir/lite/schema/schema.fbs")
+if(DEFINED LITERTLM_HOST_FLATC)
+  set(_litertlm_mutable_schema_flatc "${LITERTLM_HOST_FLATC}")
+else()
+  set(_litertlm_mutable_schema_flatc "${LITERTLM_FLATC_EXECUTABLE}")
+endif()
+
+add_custom_command(
+  OUTPUT "${LITERTLM_TFLITE_MUTABLE_SCHEMA_H}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+    "${LITERTLM_TFLITE_MUTABLE_SCHEMA_GEN_DIR}/tflite/schema/mutable"
+  COMMAND "${_litertlm_mutable_schema_flatc}" -c
+    --gen-mutable --gen-object-api
+    -o "${LITERTLM_TFLITE_MUTABLE_SCHEMA_GEN_DIR}/tflite/schema/mutable/"
+    "${LITERTLM_TFLITE_SCHEMA_FBS}"
+  DEPENDS tflite_external
+  COMMENT "[LiteRTLM] Generating tflite/schema/mutable/schema_generated.h"
+  VERBATIM
+)
+add_custom_target(litertlm_tflite_mutable_schema
+  DEPENDS "${LITERTLM_TFLITE_MUTABLE_SCHEMA_H}")
+
+add_litertlm_library(runtime_components_constrained_decoding_litert_logit_mask_runner STATIC
+  litert_logit_mask_runner.cc
+  ${LITERTLM_LITERT_SRC_DIR}/../tensor/buffer.cc
+  ${LITERTLM_LITERT_SRC_DIR}/../tensor/tensor.cc
+  ${LITERTLM_LITERT_SRC_DIR}/../tensor/backends/tflite/arithmetic_tflite.cc
+  ${LITERTLM_LITERT_SRC_DIR}/../tensor/backends/tflite/tflite_flatbuffer_conversion.cc
+  ${LITERTLM_LITERT_SRC_DIR}/../tensor/internal/graph.cc
+  ${LITERTLM_LITERT_SRC_DIR}/../tensor/internal/graph_probe.cc
+  ${LITERTLM_LITERT_SRC_DIR}/../tensor/internal/graph_traversal.cc
+  ${LITERTLM_LITERT_SRC_DIR}/../tensor/internal/shape.cc
+)
+add_library(LiteRTLM::Runtime::Components::ConstrainedDecoding::LiteRtLogitMaskRunner
+  ALIAS runtime_components_constrained_decoding_litert_logit_mask_runner)
+
+add_dependencies(runtime_components_constrained_decoding_litert_logit_mask_runner
+  litertlm_tflite_mutable_schema)
+
+target_include_directories(runtime_components_constrained_decoding_litert_logit_mask_runner
+  PUBLIC
+    ${PKG_ROOT}
+    ${LITERTLM_INCLUDE_PATHS}
+    ${LITERTLM_LITERT_INCLUDE_PATHS}
+    ${LITERTLM_TFLITE_MUTABLE_SCHEMA_GEN_DIR}
+)
+
+target_link_libraries(runtime_components_constrained_decoding_litert_logit_mask_runner
+  PUBLIC
+    LiteRTLM::Runtime::Util
+    LiteRTLM::Runtime::Components::ConstrainedDecoding::LogitMask
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
 # Constraint Decoder
 # ==============================================================================
 add_litertlm_library(runtime_components_constrained_decoding_constrained_decoder STATIC
@@ -141,15 +207,22 @@ target_link_libraries(runtime_components_constrained_decoding_constrained_decode
   PUBLIC
     LiteRTLM::Runtime::Util
     LiteRTLM::Runtime::Components::ConstrainedDecoding::ConstraintInterface
+    LiteRTLM::Runtime::Components::ConstrainedDecoding::LiteRtLogitMaskRunner
     LITERTLM_DEPS
 )
 
 # ==============================================================================
 # Constraint Provider Factory
 # ==============================================================================
-add_litertlm_library(runtime_components_constrained_decoding_constraint_provider_factory STATIC
-  constraint_provider_factory.cc
-)
+if(LITERT_LM_ENABLE_CONSTRAINED_DECODING)
+  add_litertlm_library(runtime_components_constrained_decoding_constraint_provider_factory STATIC
+    constraint_provider_factory.cc
+  )
+else()
+  add_litertlm_library(runtime_components_constrained_decoding_constraint_provider_factory STATIC
+    constraint_provider_factory_noop.cc
+  )
+endif()
 add_library(LiteRTLM::Runtime::Components::ConstrainedDecoding::Factory
   ALIAS runtime_components_constrained_decoding_constraint_provider_factory)
 
@@ -160,6 +233,24 @@ target_include_directories(runtime_components_constrained_decoding_constraint_pr
 )
 
 target_link_libraries(runtime_components_constrained_decoding_constraint_provider_factory
+  PUBLIC
+    LiteRTLM::Runtime::Components::ConstrainedDecoding::ConstraintInterface
+    LITERTLM_DEPS
+)
+
+add_litertlm_library(runtime_components_constrained_decoding_constraint_provider_factory_noop STATIC
+  constraint_provider_factory_noop.cc
+)
+add_library(LiteRTLM::Runtime::Components::ConstrainedDecoding::FactoryNoop
+  ALIAS runtime_components_constrained_decoding_constraint_provider_factory_noop)
+
+target_include_directories(runtime_components_constrained_decoding_constraint_provider_factory_noop
+  PRIVATE
+    ${LITERTLM_INCLUDE_PATHS}
+    ${LITERT_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_components_constrained_decoding_constraint_provider_factory_noop
   PUBLIC
     LiteRTLM::Runtime::Components::ConstrainedDecoding::ConstraintInterface
     LITERTLM_DEPS
@@ -231,9 +322,15 @@ target_link_libraries(runtime_components_constrained_decoding_llg_constraint
 # ==============================================================================
 # LLG Provider
 # ==============================================================================
-add_litertlm_library(runtime_components_constrained_decoding_llg_constraint_provider STATIC
-  llg_constraint_provider.cc
-)
+if(LITERT_LM_ENABLE_CONSTRAINED_DECODING AND LITERT_LM_ENABLE_LLGUIDANCE)
+  add_litertlm_library(runtime_components_constrained_decoding_llg_constraint_provider STATIC
+    llg_constraint_provider.cc
+  )
+else()
+  add_litertlm_library(runtime_components_constrained_decoding_llg_constraint_provider STATIC
+    llg_constraint_provider_noop.cc
+  )
+endif()
 add_library(LiteRTLM::Runtime::Components::ConstrainedDecoding::LlgConstraintProvider 
   ALIAS runtime_components_constrained_decoding_llg_constraint_provider)
 
@@ -248,6 +345,23 @@ target_link_libraries(runtime_components_constrained_decoding_llg_constraint_pro
     LiteRTLM::Runtime::Components::ConstrainedDecoding::Bitmap
     LiteRTLM::Runtime::Components::ConstrainedDecoding::ConstraintInterface
     LiteRTLM::Runtime::Components::ConstrainedDecoding::LlgConstraint
+)
+
+add_litertlm_library(runtime_components_constrained_decoding_llg_constraint_provider_noop STATIC
+  llg_constraint_provider_noop.cc
+)
+add_library(LiteRTLM::Runtime::Components::ConstrainedDecoding::LlgConstraintProviderNoop
+  ALIAS runtime_components_constrained_decoding_llg_constraint_provider_noop)
+
+target_include_directories(runtime_components_constrained_decoding_llg_constraint_provider_noop
+  PRIVATE
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_components_constrained_decoding_llg_constraint_provider_noop
+  PUBLIC
+    LiteRTLM::Runtime::Components::ConstrainedDecoding::ConstraintInterface
+    LITERTLM_DEPS
 )
 
 # ==============================================================================
@@ -537,6 +651,7 @@ add_library(LiteRTLM::Runtime::Components::ConstrainedDecoding
 target_link_libraries(runtime_components_constrained_decoding_libs INTERFACE
   LiteRTLM::Runtime::Components::ConstrainedDecoding::Bitmap
   LiteRTLM::Runtime::Components::ConstrainedDecoding::LogitMask
+  LiteRTLM::Runtime::Components::ConstrainedDecoding::LiteRtLogitMaskRunner
   LiteRTLM::Runtime::Components::ConstrainedDecoding::ConstraintInterface
   LiteRTLM::Runtime::Components::ConstrainedDecoding::ConstraintConfig
   LiteRTLM::Runtime::Components::ConstrainedDecoding::FstConstraint

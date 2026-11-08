@@ -58,6 +58,7 @@
 #include "runtime/executor/llm_executor_processed_tokens.h"
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/executor/npu/llm_litert_npu_compiled_model_executor_utils.h"
+#include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/util/status_macros.h"
 #include "tflite/types/half.h"  // from @litert
 
@@ -298,7 +299,7 @@ absl::Status HWPerLayerEmbeddingLookup(
     row_float.resize(ple_embedding_dim);
   }
 
-  int row_size_bytes = 0;
+  size_t row_size_bytes = 0;
   if (ple_table_element_type == litert::ElementType::Int4) {
     row_size_bytes = ple_embedding_dim / 2;
   } else if (ple_table_element_type == litert::ElementType::Int8) {
@@ -310,9 +311,9 @@ absl::Status HWPerLayerEmbeddingLookup(
   }
 
   for (int t = 0; t < num_tokens; ++t) {
-    int id = token_ids[t];
-    if (id < 0 || id >= kVocabSize) {
-      id = 0;  // Default to 0 as in model
+    size_t id = 0;  // Default to 0 as in model
+    if (token_ids[t] >= 0 && token_ids[t] < kVocabSize) {
+      id = static_cast<size_t>(token_ids[t]);
     }
 
     size_t row_offset = id * row_size_bytes;
@@ -491,8 +492,9 @@ absl::StatusOr<NpuEmbedder> NpuEmbedder::Create(
     absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
         text_decoder_verify_input_buffers,
     bool has_per_layer_embeddings) {
-  LITERT_ASSIGN_OR_RETURN(auto embedder_lrt_model,
-                          resources.GetTFLiteModel(ModelType::kTfLiteEmbedder));
+  LITERT_ASSIGN_OR_RETURN(
+      auto embedder_lrt_model,
+      resources.GetTFLiteModel(proto::LlmMetadata::TF_LITE_EMBEDDER));
   LITERT_ASSIGN_OR_RETURN(
       auto embedder_context,
       CreateEmbedderContext(
@@ -502,24 +504,27 @@ absl::StatusOr<NpuEmbedder> NpuEmbedder::Create(
 
   std::unique_ptr<EmbeddingLookupManager> embedding_lookup_manager = nullptr;
   const bool has_vision_or_audio =
-      resources.GetTFLiteModel(ModelType::kTfLiteVisionEncoder).ok() ||
-      resources.GetTFLiteModel(ModelType::kTfLiteAudioEncoderHw).ok();
+      resources.GetTFLiteModel(proto::LlmMetadata::TF_LITE_VISION_ENCODER)
+          .ok() ||
+      resources.GetTFLiteModel(proto::LlmMetadata::TF_LITE_AUDIO_ENCODER_HW)
+          .ok();
 
   if (has_per_layer_embeddings || has_vision_or_audio) {
     absl::flat_hash_map<int, const Model*> end_of_multi_modal_embedding_models;
-    auto add_multi_modal_end_model = [&](ModelType type, int token) {
-      auto model_buffer = resources.GetTFLiteModelBuffer(type);
-      if (model_buffer.ok() && !model_buffer->empty()) {
-        auto model = resources.GetTFLiteModel(type);
-        if (model.ok()) {
-          end_of_multi_modal_embedding_models[token] = *model;
-        }
-      }
-    };
+    auto add_multi_modal_end_model =
+        [&](proto::LlmMetadata::TfLiteModelType type, int token) {
+          auto model_buffer = resources.GetTFLiteModelBuffer(type);
+          if (model_buffer.ok() && !model_buffer->empty()) {
+            auto model = resources.GetTFLiteModel(type);
+            if (model.ok()) {
+              end_of_multi_modal_embedding_models[token] = *model;
+            }
+          }
+        };
 
-    add_multi_modal_end_model(ModelType::kTfLiteEndOfAudio,
+    add_multi_modal_end_model(proto::LlmMetadata::TF_LITE_END_OF_AUDIO,
                               litert::lm::ExecutorAudioData::kEndToken);
-    add_multi_modal_end_model(ModelType::kTfLiteEndOfVision,
+    add_multi_modal_end_model(proto::LlmMetadata::TF_LITE_END_OF_VISION,
                               litert::lm::ExecutorVisionData::kEndToken);
 
     LITERT_ASSIGN_OR_RETURN(
@@ -537,7 +542,8 @@ absl::StatusOr<NpuEmbedder> NpuEmbedder::Create(
   if (has_per_layer_embeddings) {
     LITERT_ASSIGN_OR_RETURN(
         embedder_per_layer_model,
-        resources.GetTFLiteModel(ModelType::kTfLitePerLayerEmbedder));
+        resources.GetTFLiteModel(
+            proto::LlmMetadata::TF_LITE_PER_LAYER_EMBEDDER));
 
     bool use_hw_ple_for_npu = false;
     auto npu_config_status = executor_settings.GetBackendConfig<NpuConfig>();

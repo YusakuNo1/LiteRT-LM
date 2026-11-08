@@ -19,9 +19,9 @@ from absl.testing import absltest
 from absl.testing import parameterized
 
 import litert_lm
-from litert_lm_builder import litertlm_builder
 from litert_lm_cli import config
 from litert_lm_cli import model
+from runtime.proto import llm_metadata_pb2
 
 
 class ModelTest(parameterized.TestCase):
@@ -103,42 +103,42 @@ class ModelTest(parameterized.TestCase):
   @parameterized.named_parameters(
       (
           "artisan_always_gpu",
-          litertlm_builder.TfLiteModelType.ARTISAN_TEXT_DECODER.value,
+          "tf_lite_artisan_text_decoder",
           None,
           "gpu",
           None,
       ),
       (
           "artisan_always_gpu_uppercase",
-          litertlm_builder.TfLiteModelType.ARTISAN_TEXT_DECODER.value.upper(),
+          "TF_LITE_ARTISAN_TEXT_DECODER",
           None,
           "gpu",
           None,
       ),
       (
           "prefill_decode_gpu",
-          litertlm_builder.TfLiteModelType.PREFILL_DECODE.value,
+          "tf_lite_prefill_decode",
           "gpu",
           "gpu",
           None,
       ),
       (
           "prefill_decode_gpu_uppercase",
-          litertlm_builder.TfLiteModelType.PREFILL_DECODE.value.upper(),
+          "TF_LITE_PREFILL_DECODE",
           "gpu",
           "gpu",
           None,
       ),
       (
           "prefill_decode_cpu",
-          litertlm_builder.TfLiteModelType.PREFILL_DECODE.value,
+          "tf_lite_prefill_decode",
           "cpu",
           "cpu",
           None,
       ),
       (
           "prefill_decode_none",
-          litertlm_builder.TfLiteModelType.PREFILL_DECODE.value,
+          "tf_lite_prefill_decode",
           None,
           "cpu",
           None,
@@ -146,42 +146,42 @@ class ModelTest(parameterized.TestCase):
       ("other_model_gpu_ignored", "other_model", "gpu", "cpu", None),
       (
           "prefill_decode_multi",
-          litertlm_builder.TfLiteModelType.PREFILL_DECODE.value,
+          "tf_lite_prefill_decode",
           "gpu,npu",
           "gpu",
           None,
       ),
       (
           "audio_encoder_hw_cpu",
-          litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW.value,
+          "tf_lite_audio_encoder_hw",
           "cpu",
           "cpu",
-          {litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW.value},
+          {llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW},
       ),
       (
           "audio_encoder_hw_gpu",
-          litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW.value,
+          "tf_lite_audio_encoder_hw",
           "gpu",
           "gpu",
-          {litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW.value},
+          {llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW},
       ),
       (
           "vision_encoder_cpu",
-          litertlm_builder.TfLiteModelType.VISION_ENCODER.value,
+          "tf_lite_vision_encoder",
           "cpu",
           "cpu",
-          {litertlm_builder.TfLiteModelType.VISION_ENCODER.value},
+          {llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER},
       ),
       (
           "vision_encoder_gpu",
-          litertlm_builder.TfLiteModelType.VISION_ENCODER.value,
+          "tf_lite_vision_encoder",
           "gpu",
           "gpu",
-          {litertlm_builder.TfLiteModelType.VISION_ENCODER.value},
+          {llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER},
       ),
       (
           "audio_encoder_hw_ignored_for_main",
-          litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW.value,
+          "tf_lite_audio_encoder_hw",
           "gpu",
           "cpu",
           None,
@@ -227,6 +227,77 @@ class ModelTest(parameterized.TestCase):
           "dummy_path", target_model_types=target_model_types
       )
     self.assertEqual(result, expected_backend)
+
+  @parameterized.named_parameters(
+      (
+          "artisan_gpu_artisan",
+          "tf_lite_artisan_text_decoder",
+          "GPU_ARTISAN",
+          True,
+      ),
+      ("artisan_no_constraint", "tf_lite_artisan_text_decoder", None, True),
+      (
+          "artisan_uppercase_type",
+          "TF_LITE_ARTISAN_TEXT_DECODER",
+          "gpu_artisan",
+          True,
+      ),
+      (
+          "artisan_google_tensor",
+          "tf_lite_artisan_text_decoder",
+          "google_tensor_artisan",
+          False,
+      ),
+      ("prefill_decode_gpu", "tf_lite_prefill_decode", "gpu", False),
+  )
+  @mock.patch.object(model, "litertlm_peek")
+  def test_is_gpu_artisan_model(
+      self, model_type, backend_constraint, expected, mock_peek
+  ):
+    mock_metadata = mock.Mock()
+    mock_peek.read_litertlm_header.return_value = mock_metadata
+    mock_section_metadata = mock.Mock()
+    mock_metadata.SectionMetadata.return_value = mock_section_metadata
+    mock_section = mock.Mock()
+    mock_section_metadata.ObjectsLength.return_value = 1
+    mock_section_metadata.Objects.return_value = mock_section
+    mock_peek.get_model_type.return_value = model_type
+    if backend_constraint is not None:
+      mock_section.ItemsLength.return_value = 1
+      mock_section.Items.return_value = mock.Mock()
+      mock_peek.kvp_to_dict.return_value = {
+          "key": "backend_constraint",
+          "value": backend_constraint,
+          "value_type": "String",
+      }
+    else:
+      mock_section.ItemsLength.return_value = 0
+
+    self.assertEqual(model.is_gpu_artisan_model("dummy_path"), expected)
+
+  @mock.patch.object(model, "litertlm_peek")
+  def test_is_gpu_artisan_model_unreadable_header(self, mock_peek):
+    mock_peek.read_litertlm_header.side_effect = OSError("unreadable")
+
+    self.assertFalse(model.is_gpu_artisan_model("dummy_path"))
+
+  @parameterized.named_parameters(
+      ("explicit_true_non_artisan", True, False, True),
+      ("explicit_false_artisan", False, True, False),
+      ("unset_artisan", None, True, True),
+      ("unset_non_artisan", None, False, None),
+  )
+  @mock.patch.object(model, "is_gpu_artisan_model")
+  def test_resolve_ringbuffers_local_attention(
+      self, value, is_artisan, expected, mock_is_gpu_artisan_model
+  ):
+    mock_is_gpu_artisan_model.return_value = is_artisan
+    mock_model = mock.Mock(spec=model.Model)
+    mock_model.model_path = "dummy_path"
+
+    self.assertEqual(
+        model.resolve_ringbuffers_local_attention(value, mock_model), expected
+    )
 
 
 class ParseBackendWithConfigTest(parameterized.TestCase):
@@ -341,7 +412,9 @@ class ParseBackendWithConfigTest(parameterized.TestCase):
     result = model.parse_backend(
         backend=None,
         model_obj=mock_model,
-        target_model_types={"vision_encoder"},  # Auxiliary type
+        target_model_types={
+            llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER
+        },  # Auxiliary type
         label="vision",
     )
     self.assertIsInstance(result, litert_lm.Backend.CPU)
@@ -354,7 +427,9 @@ class ParseBackendWithConfigTest(parameterized.TestCase):
     result = model.parse_backend(
         backend=None,
         model_obj=mock_model,
-        target_model_types={"audio_encoder_hw"},  # Auxiliary type
+        target_model_types={
+            llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW
+        },  # Auxiliary type
         label="audio",
     )
     self.assertIsInstance(result, litert_lm.Backend.CPU)
@@ -377,7 +452,9 @@ class ParseBackendWithConfigTest(parameterized.TestCase):
     vision_result = model.parse_backend(
         backend=None,
         model_obj=mock_model,
-        target_model_types={"vision_encoder"},
+        target_model_types={
+            llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER
+        },
         label="vision",
     )
     self.assertIsInstance(vision_result, litert_lm.Backend.GPU)
@@ -385,7 +462,9 @@ class ParseBackendWithConfigTest(parameterized.TestCase):
     audio_result = model.parse_backend(
         backend=None,
         model_obj=mock_model,
-        target_model_types={"audio_encoder_hw"},
+        target_model_types={
+            llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW
+        },
         label="audio",
     )
     self.assertIsInstance(audio_result, litert_lm.Backend.CPU)
@@ -395,6 +474,20 @@ class ParseBackendWithConfigTest(parameterized.TestCase):
     m1 = model.Model.from_model_path(path)
     self.assertEqual(m1.model_id, "gemma4/2b")
     self.assertEqual(m1.model_path, path)
+
+  @parameterized.named_parameters(
+      ("on", "on", litert_lm.SpeculativeDecodingMode.ON),
+      ("off", "off", litert_lm.SpeculativeDecodingMode.OFF),
+      ("adaptive", "adaptive", litert_lm.SpeculativeDecodingMode.ADAPTIVE),
+  )
+  def test_speculative_decoding_config_from_mode(self, mode, expected):
+    self.assertEqual(
+        model.speculative_decoding_config_from_mode(mode),
+        litert_lm.SpeculativeDecodingConfig(mode=expected),
+    )
+
+  def test_speculative_decoding_config_from_mode_none(self):
+    self.assertIsNone(model.speculative_decoding_config_from_mode(None))
 
   @mock.patch.object(config, "get_model_config")
   def test_resolve_config_option(self, mock_get_model_config):

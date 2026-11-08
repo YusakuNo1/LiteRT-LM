@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>  // NOLINT: Required for path manipulation.
 #include <fstream>
 #include <functional>
@@ -25,18 +26,26 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>  // NOLINT
 #include <utility>
-#include <variant>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+#include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/memory/memory.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/ascii.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "litert/c/options/litert_gpu_options.h"  // from @litert
+#include "litert/cc/litert_buffer_ref.h"  // from @litert
 #include "litert/cc/litert_common.h"  // from @litert
 #include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_element_type.h"  // from @litert
@@ -47,8 +56,11 @@
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "litert/cc/options/litert_cpu_options.h"  // from @litert
 #include "litert/cc/options/litert_gpu_options.h"  // from @litert
+#include "litert/experimental/custom_ops/bidirectional_lstm/bidirectional_lstm_custom_op.h"  // from @litert
 #include "omni/base/litert_lm_engine_runner.h"
 #include "omni/base/litert_lm_runner.h"
+#include "omni/base/model_cache.h"
+#include "omni/omni_engine.h"
 #include "runtime/components/model_resources.h"
 #include "runtime/components/model_resources_litert_lm.h"
 #include "runtime/components/model_resources_task.h"
@@ -60,11 +72,13 @@
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/executor/llm_litert_compiled_model_executor_factory.h"
+#include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/token.pb.h"
 #include "runtime/util/file_format_util.h"
 #include "runtime/util/litert_lm_loader.h"
 #include "runtime/util/model_asset_bundle_resources.h"
 #include "runtime/util/scoped_file.h"
+#include "support/tokenizer/huggingface_tokenizer.h"
 #include "support/tokenizer/tokenizer.h"
 #include "support/util/convert_tensor_buffer.h"
 
@@ -82,16 +96,16 @@ class TfLiteModelResources : public lm::ModelResources {
   }
 
   absl::StatusOr<const Model*> GetTFLiteModel(
-      lm::ModelType model_type) override {
-    if (model_type == lm::ModelType::kTfLitePrefillDecode ||
-        model_type == lm::ModelType::kTfLiteMtpDrafter) {
+      lm::proto::LlmMetadata::TfLiteModelType model_type) override {
+    if (model_type == lm::proto::LlmMetadata::TF_LITE_PREFILL_DECODE ||
+        model_type == lm::proto::LlmMetadata::TF_LITE_MTP_DRAFTER) {
       return &model_;
     }
     return absl::UnimplementedError("Unsupported model type");
   }
 
   absl::StatusOr<absl::string_view> GetTFLiteModelBuffer(
-      lm::ModelType model_type) override {
+      lm::proto::LlmMetadata::TfLiteModelType model_type) override {
     return absl::UnimplementedError("GetTFLiteModelBuffer not implemented.");
   }
 
@@ -109,12 +123,12 @@ class TfLiteModelResources : public lm::ModelResources {
   }
 
   std::optional<std::string> GetTFLiteModelBackendConstraint(
-      lm::ModelType model_type) override {
+      lm::proto::LlmMetadata::TfLiteModelType model_type) override {
     return std::nullopt;
   }
 
   std::optional<std::string> GetTFLiteModelPreferActivationType(
-      lm::ModelType model_type) override {
+      lm::proto::LlmMetadata::TfLiteModelType model_type) override {
     return std::nullopt;
   }
 
@@ -124,12 +138,12 @@ class TfLiteModelResources : public lm::ModelResources {
   }
 
   absl::StatusOr<std::pair<size_t, size_t>> GetWeightsSectionOffset(
-      lm::ModelType model_type) override {
+      lm::proto::LlmMetadata::TfLiteModelType model_type) override {
     return absl::UnimplementedError("GetWeightsSectionOffset not implemented.");
   }
 
   absl::StatusOr<lm::FileRegion> GetTFLiteModelSectionFileRegion(
-      lm::ModelType model_type) override {
+      lm::proto::LlmMetadata::TfLiteModelType model_type) override {
     return absl::UnimplementedError(
         "GetTFLiteModelSectionFileRegion not implemented.");
   }
@@ -183,6 +197,59 @@ std::string JoinPath(absl::string_view dir, absl::string_view filename) {
 
 }  // namespace
 
+absl::StatusOr<OmniEngine::Settings::Backend> ParseOmniBackend(
+    absl::string_view backend_str) {
+  const std::string lower = absl::AsciiStrToLower(backend_str);
+  if (lower == "cpu") {
+    return OmniEngine::Settings::Backend::kCpu;
+  }
+  if (lower == "gpu") {
+    return OmniEngine::Settings::Backend::kGpu;
+  }
+  if (lower == "npu") {
+    return OmniEngine::Settings::Backend::kNpu;
+  }
+  return absl::InvalidArgumentError(
+      absl::StrCat("Unsupported backend: ", backend_str));
+}
+
+lm::Backend ToLmBackend(OmniEngine::Settings::Backend backend) {
+  switch (backend) {
+    case OmniEngine::Settings::Backend::kGpu:
+      return lm::Backend::GPU;
+    case OmniEngine::Settings::Backend::kNpu:
+      return lm::Backend::NPU;
+    case OmniEngine::Settings::Backend::kCpu:
+    default:
+      return lm::Backend::CPU;
+  }
+}
+
+ModelOptions ToLmModelOptions(const OmniEngine::Settings& settings) {
+  ModelOptions lm_options;
+  lm_options.backend = ToLmBackend(settings.backend);
+  lm_options.num_threads = settings.num_threads > 0 ? settings.num_threads : 4;
+  lm_options.cache_dir = settings.cache_dir.empty() ? std::string(kNoCacheDir)
+                                                    : settings.cache_dir;
+  lm_options.force_fp32_on_gpu = settings.force_fp32_on_gpu;
+  return lm_options;
+}
+
+absl::StatusOr<std::unique_ptr<::litert::support::Tokenizer>> CreateTokenizer(
+    lm::ModelResources* absl_nullable lm_resources,
+    absl::string_view tokenizer_path) {
+  if (lm_resources != nullptr) {
+    return lm_resources->GetTokenizer();
+  }
+  if (tokenizer_path.empty()) {
+    return absl::InvalidArgumentError(
+        "Tokenizer path must be provided when not using a .litertlm model.");
+  }
+  ABSL_RETURN_IF_ERROR(CheckFileReadable(tokenizer_path));
+  return ::litert::support::HuggingFaceTokenizer::CreateFromFile(
+      tokenizer_path);
+}
+
 absl::Status CheckFileReadable(absl::string_view path) {
   std::string path_str(path);
   std::ifstream in(path_str);
@@ -215,51 +282,171 @@ absl::StatusOr<std::string> LoadFile(absl::string_view model_dir,
   return LoadFile(JoinPath(model_dir, filename));
 }
 
-absl::StatusOr<CompiledModel> CreateCompiledModel(
-    Environment& env, const ModelOptions& options,
-    absl::string_view model_filename) {
+absl::Status DownloadFileWithCurl(absl::string_view url,
+                                  absl::string_view target_path) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  (void)url;
+  (void)target_path;
+  return absl::UnimplementedError(
+      "DownloadFileWithCurl is not supported on iOS.");
+#else
+  ABSL_LOG(INFO) << "Downloading " << url << " to " << target_path;
+  std::string cmd =
+      absl::StrCat("mkdir -p $(dirname \"", target_path,
+                   "\") && curl -L -s -o \"", target_path, "\" \"", url, "\"");
+  int ret = std::system(cmd.c_str());
+  if (ret != 0) {
+    return absl::InternalError(
+        absl::StrCat("Failed to download from ", url, " to ", target_path));
+  }
+  return absl::OkStatus();
+#endif
+}
+
+std::string ResolveLitertLmPath(absl::string_view model_folder) {
+  constexpr absl::string_view kLitertLmExtension = ".litertlm";
+  std::filesystem::path path{std::string(model_folder)};
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(path, ec) &&
+      path.extension().string() == kLitertLmExtension) {
+    return path.string();
+  }
+  if (std::filesystem::is_directory(path, ec)) {
+    for (const auto& entry : std::filesystem::directory_iterator(path, ec)) {
+      if (entry.is_regular_file(ec) &&
+          entry.path().extension().string() == kLitertLmExtension) {
+        return entry.path().string();
+      }
+    }
+  }
+  return "";
+}
+
+absl::StatusOr<std::shared_ptr<lm::ModelResources>> CreateLmModelResources(
+    absl::string_view model_path) {
+  ABSL_RETURN_IF_ERROR(CheckFileReadable(model_path));
+  ABSL_ASSIGN_OR_RETURN(auto scoped_file, lm::ScopedFile::Open(model_path));
+  ABSL_ASSIGN_OR_RETURN(auto loader,
+                        lm::LitertLmLoader::Create(std::move(scoped_file)));
+  ABSL_ASSIGN_OR_RETURN(auto resources,
+                        lm::ModelResourcesLitertLm::Create(std::move(loader)));
+  return std::shared_ptr<lm::ModelResources>(std::move(resources));
+}
+
+namespace {
+
+// `model_path` is the file the model weights are read from; it only feeds the
+// on-disk cache key so caches are invalidated when that file changes.
+absl::StatusOr<Options> CreateCompilationOptions(const ModelOptions& options,
+                                                 absl::string_view model_name,
+                                                 absl::string_view model_path) {
   LITERT_ASSIGN_OR_RETURN(auto comp_options, Options::Create());
   bool target_gpu = options.backend == lm::Backend::GPU;
+  ABSL_ASSIGN_OR_RETURN(
+      const ModelCacheConfig cache,
+      ResolveModelCache(model_name, model_path, options.cache_dir));
 
   if (target_gpu) {
     LITERT_ASSIGN_OR_RETURN(auto& gpu_compilation_options,
                             comp_options.GetOptions<::litert::GpuOptions>());
     gpu_compilation_options.EnableInfiniteFloatCapping(true);
-    gpu_compilation_options.SetPrecision(GpuOptions::Precision::kFp32);
+    gpu_compilation_options.SetPrecision(options.force_fp32_on_gpu
+                                             ? GpuOptions::Precision::kFp32
+                                             : GpuOptions::Precision::kFp16);
 #if defined(__APPLE__)
     // Metal argument buffers setting.
+    gpu_compilation_options.SetPreferTextureWeights(false);
     gpu_compilation_options.SetUseMetalArgumentBuffers(true);
-#endif  // !__APPLE__
+#elif defined(__ANDROID__)
+    gpu_compilation_options.SetPreferTextureWeights(true);
+#endif
     gpu_compilation_options.EnableConstantTensorSharing(true);
     gpu_compilation_options.SetMadviseOriginalSharedTensors(true);
     gpu_compilation_options.SetConvertWeightsOnGpu(true);
     gpu_compilation_options.SetHintFullyDelegatedToSingleDelegate(true);
+    LrtSetGpuOptionsUseIrModel(gpu_compilation_options.Get(), false);
     for (const auto& pattern : options.external_tensor_patterns) {
       gpu_compilation_options.AddExternalTensorPattern(pattern.c_str());
       gpu_compilation_options.AddBufferStorageTensorPattern(pattern.c_str());
     }
+    ABSL_RETURN_IF_ERROR(
+        ConfigureGpuModelCache(model_name, cache, gpu_compilation_options));
     comp_options.SetHardwareAccelerators(HwAccelerators::kGpu);
   } else {
     comp_options.SetHardwareAccelerators(HwAccelerators::kCpu);
     LITERT_ASSIGN_OR_RETURN(auto& cpu_options,
                             comp_options.GetOptions<::litert::CpuOptions>());
     ABSL_RETURN_IF_ERROR(lm::SetCpuOptions(cpu_options, options.num_threads));
-
-    if (!options.cache_dir.empty()) {
-      std::string cache_path = JoinPath(
-          options.cache_dir, absl::StrCat(model_filename, ".xnnpack_cache"));
-      absl::StatusOr<std::variant<std::string, std::shared_ptr<lm::ScopedFile>>>
-          cache_variant(cache_path);
-      ABSL_RETURN_IF_ERROR(
-          lm::SetCpuCacheOptions(cache_variant, model_filename, cpu_options));
-    }
+    ABSL_RETURN_IF_ERROR(
+        ConfigureCpuModelCache(model_name, cache, cpu_options));
   }
 
+  // Register custom bidirectional LSTM op.
+  // Must happen before CompiledModel::Create: the op resolver is built there,
+  // so a kernel added afterwards is never seen.
+  LITERT_RETURN_IF_ERROR(
+      litert::custom_ops::RegisterBidirectionalLstmCustomOp(comp_options));
+  return comp_options;
+}
+
+}  // namespace
+
+absl::StatusOr<CompiledModel> CreateCompiledModel(
+    Environment& env, const ModelOptions& options,
+    absl::string_view model_filename) {
   std::string path = JoinPath(options.model_dir, model_filename);
+  ABSL_ASSIGN_OR_RETURN(
+      auto comp_options,
+      CreateCompilationOptions(options, model_filename, /*model_path=*/path));
+  bool target_gpu = options.backend == lm::Backend::GPU;
   ABSL_RETURN_IF_ERROR(CheckFileReadable(path));
   LITERT_ASSIGN_OR_RETURN(auto compiled_model,
                           CompiledModel::Create(env, path, comp_options));
   ABSL_VLOG(2) << absl::StrCat("Compiled model created successfully with ",
+                               target_gpu ? "GPU" : "CPU", " backend");
+  return std::move(compiled_model);
+}
+
+absl::StatusOr<std::unique_ptr<CompiledModel>> CreateCompiledModel(
+    const OmniEngine::Settings& settings, Environment& env, Options& options,
+    lm::ModelResources* absl_nullable lm_resources,
+    absl::string_view model_type) {
+  if (lm_resources != nullptr) {
+    ABSL_ASSIGN_OR_RETURN(absl::string_view model_buffer,
+                          lm_resources->GetTFLiteModelBuffer(model_type));
+    LITERT_ASSIGN_OR_RETURN(
+        auto comp_model,
+        CompiledModel::Create(
+            env,
+            BufferRef<uint8_t>(
+                reinterpret_cast<const uint8_t*>(model_buffer.data()),
+                model_buffer.size()),
+            options));
+    return std::make_unique<CompiledModel>(std::move(comp_model));
+  }
+
+  ABSL_RETURN_IF_ERROR(CheckFileReadable(settings.model_path));
+  LITERT_ASSIGN_OR_RETURN(
+      auto comp_model,
+      CompiledModel::Create(env, settings.model_path, options));
+  return std::make_unique<CompiledModel>(std::move(comp_model));
+}
+
+absl::StatusOr<CompiledModel> CreateCompiledModelFromBuffer(
+    Environment& env, const ModelOptions& options,
+    absl::string_view model_buffer, absl::string_view model_name) {
+  // The buffer is a section of the `.litertlm` container at `model_dir`.
+  ABSL_ASSIGN_OR_RETURN(
+      auto comp_options,
+      CreateCompilationOptions(options, model_name,
+                               ResolveLitertLmPath(options.model_dir)));
+  bool target_gpu = options.backend == lm::Backend::GPU;
+  BufferRef<uint8_t> buffer_ref(
+      reinterpret_cast<const uint8_t*>(model_buffer.data()),
+      model_buffer.size());
+  LITERT_ASSIGN_OR_RETURN(auto compiled_model,
+                          CompiledModel::Create(env, buffer_ref, comp_options));
+  ABSL_VLOG(2) << absl::StrCat("Compiled model created from buffer with ",
                                target_gpu ? "GPU" : "CPU", " backend");
   return std::move(compiled_model);
 }
@@ -298,14 +485,23 @@ absl::StatusOr<std::unique_ptr<LiteRtLmRunner>> CreateLmRunner(
   auto shared_scoped_file =
       std::make_shared<lm::ScopedFile>(std::move(scoped_file));
   ABSL_ASSIGN_OR_RETURN(auto model_assets,
-                        lm::ModelAssets::Create(shared_scoped_file));
+                        lm::ModelAssets::Create(shared_scoped_file, path));
+  // `LiteRtLmRunner` exposes `DecodeLogits()` for CPU-side decoding, so keep
+  // `sampler_backend` on CPU to preserve the model's FP32 output logits buffer
+  // even when `options.backend == lm::Backend::GPU` uses FP16 precision.
   ABSL_ASSIGN_OR_RETURN(auto executor_settings,
                         lm::LlmExecutorSettings::CreateDefault(
-                            std::move(model_assets), options.backend));
+                            std::move(model_assets), options.backend,
+                            /*sampler_backend=*/lm::Backend::CPU));
   if (options.backend == lm::Backend::CPU && options.num_threads > 0) {
     lm::CpuConfig cpu_config;
     cpu_config.number_of_threads = options.num_threads;
     executor_settings.SetBackendConfig(cpu_config);
+  }
+  if (options.backend == lm::Backend::GPU) {
+    executor_settings.SetActivationDataType(
+        options.force_fp32_on_gpu ? lm::ActivationDataType::FLOAT32
+                                  : lm::ActivationDataType::FLOAT16);
   }
   if (!options.cache_dir.empty()) {
     executor_settings.SetCacheDir(options.cache_dir);
@@ -328,7 +524,7 @@ absl::StatusOr<std::unique_ptr<LiteRtLmEngineRunner>> CreateLmEngineRunner(
   auto shared_scoped_file =
       std::make_shared<lm::ScopedFile>(std::move(scoped_file));
   ABSL_ASSIGN_OR_RETURN(auto model_assets,
-                        lm::ModelAssets::Create(shared_scoped_file));
+                        lm::ModelAssets::Create(shared_scoped_file, path));
   ABSL_ASSIGN_OR_RETURN(auto engine_settings,
                         lm::EngineSettings::CreateDefault(
                             std::move(model_assets), options.backend,
@@ -339,6 +535,17 @@ absl::StatusOr<std::unique_ptr<LiteRtLmEngineRunner>> CreateLmEngineRunner(
     cpu_config.number_of_threads = options.num_threads;
     engine_settings.GetMutableMainExecutorSettings().SetBackendConfig(
         cpu_config);
+  }
+  if (options.backend == lm::Backend::GPU) {
+    const auto activation_type = options.force_fp32_on_gpu
+                                     ? lm::ActivationDataType::FLOAT32
+                                     : lm::ActivationDataType::FLOAT16;
+    engine_settings.GetMutableMainExecutorSettings().SetActivationDataType(
+        activation_type);
+    if (engine_settings.GetMutableAudioExecutorSettings().has_value()) {
+      engine_settings.GetMutableAudioExecutorSettings()->SetActivationDataType(
+          activation_type);
+    }
   }
   if (!options.cache_dir.empty()) {
     engine_settings.GetMutableMainExecutorSettings().SetCacheDir(

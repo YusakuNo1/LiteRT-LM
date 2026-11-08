@@ -44,6 +44,14 @@ std::string AnySectionDataTypeToString(AnySectionDataType value) {
       return "AnySectionDataType_EmbeddingMetadataProto";
     case AnySectionDataType_ExecutorMetadataProto:
       return "AnySectionDataType_ExecutorMetadataProto";
+    case AnySectionDataType_Text2SpeechMetadataProto:
+      return "AnySectionDataType_Text2SpeechMetadataProto";
+    case AnySectionDataType_Speech2TextMetadataProto:
+      return "AnySectionDataType_Speech2TextMetadataProto";
+    case AnySectionDataType_Text2ImageMetadataProto:
+      return "AnySectionDataType_Text2ImageMetadataProto";
+    case AnySectionDataType_Any2AnyMetadataProto:
+      return "AnySectionDataType_Any2AnyMetadataProto";
     default:
       // Handle cases for MIN/MAX or potentially invalid values.
       return "Unknown AnySectionDataType value";

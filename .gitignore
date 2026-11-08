@@ -4,3 +4,6 @@ build-puget-voice-macos-arm64/
 
 /MODULE.bazel.lock
 /bazel-*
+/js/packages/core/wasm/
+/js/packages/core/spec_dist/
+node_modules/
